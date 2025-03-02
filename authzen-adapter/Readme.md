@@ -1,4 +1,4 @@
-Below is a straightforward set of commands to build your authzen-pdp image from a Dockerfile, tag it, and push it to the existing ECR repository (586794481579.dkr.ecr.ap-southeast-2.amazonaws.com/idpartners/authzen-pdp) referenced in your CloudFormation template. You can adapt the same approach for any other images (like pingauthorize) you need to build and push.
+Below is a straightforward set of commands to build your authzen-pdp image from a Dockerfile, tag it, and push it to the existing ECR repository referenced in your CloudFormation template. You can adapt the same approach for any other images  you need to build and push.
 
 1. Ensure You Have a Dockerfile
 
@@ -36,12 +36,12 @@ This produces a local Docker image named authzen-pdp:latest.
 
 3. Log In to ECR
 
-Use the AWS CLI to authenticate Docker to your ECR registry. Since your region is ap-southeast-2 and your account ID is 586794481579, run:
+Use the AWS CLI to authenticate Docker to your ECR registry. Since your region is ap-southeast-2 and your account ID is 000000000000, run:
 
 aws ecr get-login-password --region ap-southeast-2 \
 | docker login \
   --username AWS \
-  --password-stdin 586794481579.dkr.ecr.ap-southeast-2.amazonaws.com
+  --password-stdin xxxxxxxxxx.dkr.ecr.ap-southeast-2.amazonaws.com
 
 You should see Login Succeeded if it worked.
 
@@ -50,7 +50,7 @@ You should see Login Succeeded if it worked.
 Now tag your locally built image (authzen-pdp:latest) to match the ECR repository address shown in your CloudFormation template:
 
 docker tag authzen-pdp:latest \
-  586794481579.dkr.ecr.ap-southeast-2.amazonaws.com/idpartners/authzen-pdp:latest
+  xxxxxxxxxx.dkr.ecr.ap-southeast-2.amazonaws.com/idpartners/authzen-pdp:latest
 
 5. Push the Image to ECR
 
