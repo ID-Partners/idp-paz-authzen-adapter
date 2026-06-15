@@ -5,13 +5,13 @@ This project is an authorization proxy service that integrates with Ping Authori
 
 This implementation conforms to the [AuthZen Interop Specification](https://authzen-interop.net/docs/intro/), ensuring interoperability with authorization frameworks and standardized access control mechanisms.
 
-It also supports the **AuthZEN Profile for Model Context Protocol Tool Authorization (COAZ)**, which maps Model Context Protocol (MCP) operations onto the AuthZEN Subject-Action-Resource-Context model. See [MCP Profile Support](#mcp-profile-support-coaz) below.
+It also implements the **Default AuthZEN Mappings for MCP JSON-RPC Messages** (MCP Specification 2025-11-25) and the **AuthZEN Profile for Model Context Protocol Tool Authorization (COAZ)**, mapping Model Context Protocol (MCP) operations onto the AuthZEN Subject-Action-Resource-Context model. See [MCP Support](#mcp-support) below.
 
 ## Features
 - **Authorization Evaluation API**: Evaluates access requests based on subject, action, resource, and context.
 - **Subject Search API**: Retrieves subjects matching a given action-resource pair.
 - **Resource Search API**: Retrieves resources matching a given subject-action pair.
-- **MCP Profile Support (COAZ)**: Recognizes MCP resource types and method actions, and resolves `x-coaz-mapping` tool mappings into AuthZEN evaluation requests.
+- **MCP Support**: Maps MCP JSON-RPC messages onto AuthZEN requests via the default mappings, and resolves `x-coaz-mapping` tool mappings (COAZ) into AuthZEN evaluation requests.
 - **Ping Authorize Integration**: Queries Ping Authorize for policy decisions.
 - **Environment Configuration**: Uses environment variables for configuration.
 - **Secure API Key Authentication**: Validates API requests with Bearer token authentication.
@@ -38,62 +38,85 @@ It also supports the **AuthZEN Profile for Model Context Protocol Tool Authoriza
 **Method:** `POST`  
 **Description:** Searches for resources that match the given subject and action.
 
+### MCP JSON-RPC Mapping
+**Endpoint:** `/access/v1/mcp/evaluate`  
+**Method:** `POST`  
+**Description:** Maps an MCP JSON-RPC message onto an AuthZEN evaluation request using the default mappings, optionally evaluating it against the PDP. See [MCP Support](#mcp-support).
+
 ### COAZ Mapping Resolution
 **Endpoint:** `/access/v1/coaz/resolve`  
 **Method:** `POST`  
-**Description:** Resolves an MCP tool's `x-coaz-mapping` into an AuthZEN evaluation request, optionally evaluating it against the PDP. See [MCP Profile Support](#mcp-profile-support-coaz).
+**Description:** Resolves an MCP tool's `x-coaz-mapping` into an AuthZEN evaluation request, optionally evaluating it against the PDP. See [MCP Support](#mcp-support).
 
 ### Health Check
 **Endpoint:** `/health`  
 **Method:** `GET`  
 **Description:** Returns `200 OK` to indicate service health.
 
-## MCP Profile Support (COAZ)
+## MCP Support
 
-The adapter supports the [AuthZEN Profile for Model Context Protocol Tool Authorization (COAZ)](https://openid.net/wg/authzen/specifications/), which lets an MCP server/gateway act as a Policy Enforcement Point (PEP) and externalize fine-grained, parameter-level authorization to an AuthZEN PDP.
+The adapter implements the **Default AuthZEN Mappings for MCP JSON-RPC Messages** (MCP Specification 2025-11-25) and the [AuthZEN Profile for Model Context Protocol Tool Authorization (COAZ)](https://openid.net/wg/authzen/specifications/). Together these let an MCP server/gateway act as a Policy Enforcement Point (PEP) and externalize authorization to an AuthZEN PDP.
 
-### Resource types and actions
+### Default mappings
 
-The profile defines three resource types and maps MCP method names directly onto `action.name`:
+Each MCP JSON-RPC method maps onto the AuthZEN Subject-Action-Resource-Context (SARC) model. Common defaults:
 
-| MCP resource type | Purpose            |
-|-------------------|--------------------|
-| `mcp-tool`        | Tool invocations   |
-| `mcp-resource`    | Resource access    |
-| `mcp-prompt`      | Prompt retrieval   |
+- `subject.type` = `identity` (the identity on whose behalf the agent acts), `subject.id` = JWT `sub` claim
+- `action.name` = the JSON-RPC method name (for `tools/call`, the **tool name**)
+- `context.agent` = JWT `client_id` claim (the AI agent / MCP client)
 
-| MCP method        | `action.name`     |
-|-------------------|-------------------|
-| `tools/call`      | `tools/call`      |
-| `tools/list`      | `tools/list`      |
-| `resources/read`  | `resources/read`  |
-| `resources/list`  | `resources/list`  |
-| `prompts/get`     | `prompts/get`     |
-| `prompts/list`    | `prompts/list`    |
+`resource` varies by method:
 
-MCP-profile evaluation requests are handled by the standard `/access/v1/evaluation` (and batch `/access/v1/evaluations`) endpoints. List/discovery operations (`tools/list`, `resources/list`, `prompts/list`) enumerate accessible resources and therefore do **not** require a specific `resource.id`; for all other operations a `resource.id` is still required.
+| MCP method(s)                                                                 | `resource.type` | `resource.id`        |
+|-------------------------------------------------------------------------------|-----------------|----------------------|
+| `tools/call`                                                                  | `tool`          | tool name            |
+| `resources/read`, `resources/subscribe`, `resources/unsubscribe`             | `resource`      | resource URI         |
+| `prompts/get`                                                                 | `prompt`        | prompt name          |
+| `tasks/get`, `tasks/result`, `tasks/cancel`                                   | `task`          | task id              |
+| `completion/complete`                                                         | `ref/prompt` or `ref/resource` | prompt name or URI |
+| `*/list`, `initialize`, `ping`, `sampling/createMessage`, `elicitation/create`, `logging/setLevel`, `roots/list`, notifications | `mcp_server` | JWT `aud` claim |
 
-Example MCP `tools/call` evaluation request:
+Method-specific context is also added where applicable (e.g. `max_tokens` for `sampling/createMessage`, `mode`/`elicitation_id`/`url` for `elicitation/create`, `level` for `logging/setLevel`, `protocol_version` for `initialize`, `task_ttl` for task-augmented `tools/call`). Per the spec, `prompts/get` uses `subject.type` = `user`.
+
+Use the `/access/v1/mcp/evaluate` endpoint to map a JSON-RPC message and token claims into an AuthZEN request:
+
+```sh
+curl -X POST "http://localhost:8080/access/v1/mcp/evaluate" \
+  -H "Authorization: Bearer <API_KEY>" \
+  -H "Content-Type: application/json" \
+  -d '{
+        "message": {
+          "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+          "params": { "name": "fintech_approve_expense", "arguments": { "expense_id": "exp-123", "amount": 5000 } }
+        },
+        "token": { "sub": "1234567890", "aud": "https://mcp.example.com", "client_id": "agent-app" },
+        "evaluate": false
+      }'
+```
+
+This yields the AuthZEN request:
 
 ```json
 {
-  "subject": {
-    "type": "user",
-    "identity": "1234567890",
-    "properties": { "roles": ["analyst"], "tenant": "finance-dept", "acr": "inherence", "amr": ["passkeys"] }
-  },
-  "action": { "name": "tools/call" },
-  "resource": {
-    "type": "mcp-tool",
-    "id": "fintech_approve_expense",
-    "properties": { "arguments": { "expense_id": "exp-123", "amount": 5000 } }
-  },
-  "context": {
-    "client": { "name": "Claude Desktop", "version": "1.0.0" },
-    "connection": { "session_id": "session-abc123" }
-  }
+  "subject": { "type": "identity", "id": "1234567890" },
+  "action": { "name": "fintech_approve_expense" },
+  "resource": { "type": "tool", "id": "fintech_approve_expense" },
+  "context": { "agent": "agent-app" }
 }
 ```
+
+Request fields:
+
+| Field          | Description                                                                   |
+|----------------|-------------------------------------------------------------------------------|
+| `message`      | The MCP JSON-RPC message (`method` + `params`). Alternatively pass `method`/`params` directly. |
+| `token`        | Decoded OAuth/JWT claims (`sub`, `aud`, `client_id`, ...).                     |
+| `coaz_mapping` | Optional `x-coaz-mapping` for the called tool; overrides the default for `tools/call`. |
+| `evaluate`     | If `true`, the mapped request is forwarded to the PDP and the decision is returned. |
+
+The response contains the mapped `evaluation_request`, plus the `decision` (and any `context`) when `evaluate` is `true`. For tools that declare `coaz: true`, supply the tool's `x-coaz-mapping` in `coaz_mapping` to override the default `tools/call` mapping.
+
+> Note: the standard `/access/v1/evaluation` endpoint decodes the AuthZEN subject id from the `identity` field (a Ping Authorize convention). The MCP mapping endpoints emit canonical AuthZEN `subject.id`; when feeding a mapped request to a generic AuthZEN PDP this is correct, but route MCP traffic through `/access/v1/mcp/evaluate` (with `evaluate: true`) to have this adapter perform the decision.
 
 ### Resolving `x-coaz-mapping`
 

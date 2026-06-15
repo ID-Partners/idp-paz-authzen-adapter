@@ -16,37 +16,42 @@ import (
 )
 
 // ------------------------------
-// AuthZEN MCP Profile (COAZ)
+// AuthZEN MCP Profile + Default Mappings
 // ------------------------------
 //
-// The AuthZEN "Profile for Model Context Protocol Tool Authorization" (COAZ)
-// maps Model Context Protocol (MCP) operations onto the AuthZEN
-// Subject-Action-Resource-Context model so that an MCP server/gateway acting
-// as a Policy Enforcement Point (PEP) can externalize fine-grained
-// authorization to an AuthZEN-compliant PDP.
+// Based on the "Default AuthZEN Mappings for MCP JSON-RPC Messages"
+// (MCP Specification 2025-11-25). Each MCP JSON-RPC method maps onto the
+// AuthZEN Subject-Action-Resource-Context (SARC) model so that an MCP
+// server/gateway acting as a Policy Enforcement Point (PEP) can externalize
+// authorization to an AuthZEN PDP.
 //
-// Resource types defined by the profile.
+// Resource types reflect the MCP primitive being accessed.
 const (
-	ResourceTypeMCPTool     = "mcp-tool"
-	ResourceTypeMCPResource = "mcp-resource"
-	ResourceTypeMCPPrompt   = "mcp-prompt"
+	ResourceTypeTool      = "tool"
+	ResourceTypeResource  = "resource"
+	ResourceTypePrompt    = "prompt"
+	ResourceTypeTask      = "task"
+	ResourceTypeMCPServer = "mcp_server"
 )
 
-// MCP method names that the profile maps directly onto action.name.
+// MCP discovery/list methods. In the default mapping these are scoped to the
+// MCP server (resource.type = mcp_server, resource.id = the JWT aud claim)
+// rather than to a specific instance.
 const (
-	ActionToolsCall     = "tools/call"
-	ActionToolsList     = "tools/list"
-	ActionResourcesRead = "resources/read"
-	ActionResourcesList = "resources/list"
-	ActionPromptsGet    = "prompts/get"
-	ActionPromptsList   = "prompts/list"
+	ActionToolsList             = "tools/list"
+	ActionResourcesList         = "resources/list"
+	ActionResourceTemplatesList = "resources/templates/list"
+	ActionPromptsList           = "prompts/list"
+	ActionTasksList             = "tasks/list"
+	ActionRootsList             = "roots/list"
 )
 
 // isMCPResourceType reports whether the resource type is one defined by the
-// AuthZEN MCP profile.
+// AuthZEN default mappings for MCP.
 func isMCPResourceType(t string) bool {
 	switch t {
-	case ResourceTypeMCPTool, ResourceTypeMCPResource, ResourceTypeMCPPrompt:
+	case ResourceTypeTool, ResourceTypeResource, ResourceTypePrompt,
+		ResourceTypeTask, ResourceTypeMCPServer:
 		return true
 	default:
 		return false
@@ -54,11 +59,12 @@ func isMCPResourceType(t string) bool {
 }
 
 // isMCPListAction reports whether the action is an MCP discovery/list method.
-// List operations enumerate the resources a subject may access and therefore
-// do not target a specific resource id.
+// List operations enumerate items a subject may access; when a PEP omits a
+// resource id for them the adapter does not require one.
 func isMCPListAction(name string) bool {
 	switch name {
-	case ActionToolsList, ActionResourcesList, ActionPromptsList:
+	case ActionToolsList, ActionResourcesList, ActionResourceTemplatesList,
+		ActionPromptsList, ActionTasksList, ActionRootsList:
 		return true
 	default:
 		return false
@@ -1092,6 +1098,236 @@ func setActionName(resolved map[string]interface{}, name string) {
 	resolved["action"] = map[string]interface{}{"name": name}
 }
 
+// ------------------------------
+// AuthZEN Default Mappings for MCP JSON-RPC Messages
+// ------------------------------
+
+// JSONRPCMessage is the subset of an MCP JSON-RPC message used for mapping.
+type JSONRPCMessage struct {
+	JSONRPC string                 `json:"jsonrpc,omitempty"`
+	ID      interface{}            `json:"id,omitempty"`
+	Method  string                 `json:"method"`
+	Params  map[string]interface{} `json:"params,omitempty"`
+}
+
+// MCPEvaluateRequest maps an MCP JSON-RPC message onto an AuthZEN request.
+// Either an embedded "message" or explicit "method"/"params" may be supplied.
+type MCPEvaluateRequest struct {
+	Message     *JSONRPCMessage        `json:"message,omitempty"`      // the MCP JSON-RPC message
+	Method      string                 `json:"method,omitempty"`       // method override / alternative to message
+	Params      map[string]interface{} `json:"params,omitempty"`       // params override / alternative to message
+	Token       map[string]interface{} `json:"token,omitempty"`        // decoded OAuth/JWT claims (sub, aud, client_id, ...)
+	CoazMapping map[string]interface{} `json:"coaz_mapping,omitempty"` // x-coaz-mapping for the called tool (tools/call only)
+	Evaluate    bool                   `json:"evaluate,omitempty"`     // if true, forward to the PDP and include the decision
+}
+
+// MCPEvaluateResponse returns the mapped AuthZEN request and, optionally, the PDP decision.
+type MCPEvaluateResponse struct {
+	EvaluationRequest map[string]interface{} `json:"evaluation_request"`
+	Decision          *bool                  `json:"decision,omitempty"`
+	Context           *Context               `json:"context,omitempty"`
+}
+
+// toMap returns v as a JSON object, or nil if it is not one.
+func toMap(v interface{}) map[string]interface{} {
+	if m, ok := v.(map[string]interface{}); ok {
+		return m
+	}
+	return nil
+}
+
+// getStr returns m[key] coerced to a string, or "" when absent.
+func getStr(m map[string]interface{}, key string) string {
+	if m == nil {
+		return ""
+	}
+	if v, ok := m[key]; ok {
+		return toStringValue(v)
+	}
+	return ""
+}
+
+// audienceString returns the JWT "aud" claim as a string, taking the first
+// element when the claim is an array (as permitted by RFC 7519).
+func audienceString(claims map[string]interface{}) string {
+	if claims == nil {
+		return ""
+	}
+	switch a := claims["aud"].(type) {
+	case nil:
+		return ""
+	case string:
+		return a
+	case []interface{}:
+		if len(a) > 0 {
+			return toStringValue(a[0])
+		}
+		return ""
+	default:
+		return toStringValue(a)
+	}
+}
+
+// buildMCPEvaluationRequest projects an MCP JSON-RPC method+params and the
+// caller's token claims onto an AuthZEN evaluation request using the default
+// mappings. For tools/call, a non-nil coazMapping (the tool's x-coaz-mapping)
+// overrides the default subject/resource/action/context.
+func buildMCPEvaluationRequest(method string, params, claims, coazMapping map[string]interface{}) (map[string]interface{}, error) {
+	sub := getStr(claims, "sub")
+	aud := audienceString(claims)
+	agent := getStr(claims, "client_id")
+
+	subject := map[string]interface{}{"type": "identity", "id": sub}
+	context := map[string]interface{}{"agent": agent}
+
+	// Default: scoped to the MCP server. Covers list/discovery methods,
+	// lifecycle (initialize, ping), notifications, and any unrecognized method.
+	req := map[string]interface{}{
+		"subject":  subject,
+		"action":   map[string]interface{}{"name": method},
+		"resource": map[string]interface{}{"type": ResourceTypeMCPServer, "id": aud},
+		"context":  context,
+	}
+	setAction := func(name string) { req["action"] = map[string]interface{}{"name": name} }
+	setResource := func(typ, id string) { req["resource"] = map[string]interface{}{"type": typ, "id": id} }
+
+	switch method {
+	case "tools/call":
+		toolName := getStr(params, "name")
+		setAction(toolName)
+		setResource(ResourceTypeTool, toolName)
+		// Task-augmented invocation carries a task object in params.
+		if task := toMap(params["task"]); task != nil {
+			if v, ok := task["ttl"]; ok {
+				context["task_ttl"] = v
+			}
+		}
+		// COAZ override: the tool's x-coaz-mapping replaces the defaults.
+		if coazMapping != nil {
+			sources := map[string]interface{}{
+				"properties": coalesceMap(toMap(params["arguments"])),
+				"token":      coalesceMap(claims),
+			}
+			resolvedAny, err := resolveCoazValue(coazMapping, sources)
+			if err != nil {
+				return nil, fmt.Errorf("coaz override: %w", err)
+			}
+			if resolved, ok := resolvedAny.(map[string]interface{}); ok {
+				for _, k := range []string{"subject", "resource", "action", "context"} {
+					if v, present := resolved[k]; present {
+						req[k] = v
+					}
+				}
+			}
+		}
+
+	case "resources/read", "resources/subscribe", "resources/unsubscribe":
+		setResource(ResourceTypeResource, getStr(params, "uri"))
+
+	case "prompts/get":
+		// Per the spec's per-method mapping, prompts/get uses subject.type "user".
+		subject["type"] = "user"
+		setResource(ResourceTypePrompt, getStr(params, "name"))
+
+	case "completion/complete":
+		ref := toMap(params["ref"])
+		refID := getStr(ref, "name")
+		if refID == "" {
+			refID = getStr(ref, "uri")
+		}
+		setResource(getStr(ref, "type"), refID)
+		context["argument_name"] = getStr(toMap(params["argument"]), "name")
+
+	case "tasks/get", "tasks/result", "tasks/cancel":
+		setResource(ResourceTypeTask, getStr(params, "taskId"))
+
+	case "sampling/createMessage":
+		if v, ok := params["maxTokens"]; ok {
+			context["max_tokens"] = v
+		}
+
+	case "elicitation/create":
+		mode := getStr(params, "mode")
+		if mode == "" {
+			mode = "form"
+		}
+		context["mode"] = mode
+		if mode == "url" {
+			context["elicitation_id"] = getStr(params, "elicitationId")
+			context["url"] = getStr(params, "url")
+		}
+
+	case "logging/setLevel":
+		context["level"] = getStr(params, "level")
+
+	case "initialize":
+		context["protocol_version"] = getStr(params, "protocolVersion")
+	}
+
+	return req, nil
+}
+
+// handleMCPEvaluateRequest maps an MCP JSON-RPC message to an AuthZEN request
+// using the default mappings, and optionally evaluates it against the PDP.
+func handleMCPEvaluateRequest(w http.ResponseWriter, r *http.Request) {
+	if !requireAPIKey(w, r) {
+		return
+	}
+
+	var req MCPEvaluateRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request payload", http.StatusBadRequest)
+		return
+	}
+
+	method := req.Method
+	params := req.Params
+	if req.Message != nil {
+		method = req.Message.Method
+		params = req.Message.Params
+	}
+	if method == "" {
+		http.Error(w, "Missing MCP method", http.StatusBadRequest)
+		return
+	}
+
+	mapped, err := buildMCPEvaluationRequest(method, params, req.Token, req.CoazMapping)
+	if err != nil {
+		log.Printf("ERROR: failed to map MCP message: %v", err)
+		http.Error(w, fmt.Sprintf("Failed to map MCP message: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	resp := MCPEvaluateResponse{EvaluationRequest: mapped}
+
+	if req.Evaluate {
+		evalReq := evaluationRequestFromResolved(mapped)
+		pdpPayload, err := buildPdpDecisionPayload(evalReq)
+		if err != nil {
+			log.Printf("ERROR: failed to build PDP payload from MCP mapping: %v", err)
+			http.Error(w, fmt.Sprintf("Error building PDP payload: %v", err), http.StatusBadRequest)
+			return
+		}
+		decisions, err := makeAuthorizationDecisionRequest(pdpPayload)
+		if err != nil {
+			log.Printf("ERROR: MCP authorization decision request failed: %v", err)
+			http.Error(w, "Error making authorization decision request", http.StatusInternalServerError)
+			return
+		}
+		if len(decisions) > 0 {
+			d := decisions[0].Decision
+			resp.Decision = &d
+			resp.Context = decisions[0].Context
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(resp); err != nil {
+		log.Printf("ERROR: failed to encode MCP evaluate response: %v", err)
+		http.Error(w, "Failed to encode response", http.StatusInternalServerError)
+	}
+}
+
 func main() {
 	godotenv.Load()
 	http.HandleFunc("/access/v1/evaluation", handleEvaluationRequest)
@@ -1099,6 +1335,7 @@ func main() {
 	http.HandleFunc("/access/v1/subjectsearch", handleSubjectSearchRequest)
 	http.HandleFunc("/access/v1/resourcesearch", handleResourceSearchRequest)
 	http.HandleFunc("/access/v1/coaz/resolve", handleCoazResolveRequest)
+	http.HandleFunc("/access/v1/mcp/evaluate", handleMCPEvaluateRequest)
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprintln(w, "OK")
