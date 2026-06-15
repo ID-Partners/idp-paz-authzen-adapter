@@ -7,6 +7,13 @@ This implementation conforms to the [AuthZen Interop Specification](https://auth
 
 It also implements the **Default AuthZEN Mappings for MCP JSON-RPC Messages** (MCP Specification 2025-11-25) and the **AuthZEN Profile for Model Context Protocol Tool Authorization (COAZ)**, mapping Model Context Protocol (MCP) operations onto the AuthZEN Subject-Action-Resource-Context model. See [MCP Support](#mcp-support) below.
 
+## Components
+
+This repository contains two components:
+
+- **`authzen-adapter/`** — the AuthZEN PDP-side adapter described in this document. It exposes AuthZEN APIs and translates them to Ping Authorize, and includes helper endpoints for the MCP default mappings and COAZ resolution.
+- **`mcp-gateway/`** — a standalone reverse-proxy **gateway / PEP** that sits in front of an MCP server, enforces AuthZEN authorization on MCP JSON-RPC requests by calling an AuthZEN PDP, and returns JSON-RPC `-32401` on denial. See [`mcp-gateway/README.md`](mcp-gateway/README.md).
+
 ## Features
 - **Authorization Evaluation API**: Evaluates access requests based on subject, action, resource, and context.
 - **Subject Search API**: Retrieves subjects matching a given action-resource pair.
