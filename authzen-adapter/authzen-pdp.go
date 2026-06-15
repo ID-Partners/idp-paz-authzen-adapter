@@ -9,10 +9,61 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/joho/godotenv"
 )
+
+// ------------------------------
+// AuthZEN MCP Profile (COAZ)
+// ------------------------------
+//
+// The AuthZEN "Profile for Model Context Protocol Tool Authorization" (COAZ)
+// maps Model Context Protocol (MCP) operations onto the AuthZEN
+// Subject-Action-Resource-Context model so that an MCP server/gateway acting
+// as a Policy Enforcement Point (PEP) can externalize fine-grained
+// authorization to an AuthZEN-compliant PDP.
+//
+// Resource types defined by the profile.
+const (
+	ResourceTypeMCPTool     = "mcp-tool"
+	ResourceTypeMCPResource = "mcp-resource"
+	ResourceTypeMCPPrompt   = "mcp-prompt"
+)
+
+// MCP method names that the profile maps directly onto action.name.
+const (
+	ActionToolsCall     = "tools/call"
+	ActionToolsList     = "tools/list"
+	ActionResourcesRead = "resources/read"
+	ActionResourcesList = "resources/list"
+	ActionPromptsGet    = "prompts/get"
+	ActionPromptsList   = "prompts/list"
+)
+
+// isMCPResourceType reports whether the resource type is one defined by the
+// AuthZEN MCP profile.
+func isMCPResourceType(t string) bool {
+	switch t {
+	case ResourceTypeMCPTool, ResourceTypeMCPResource, ResourceTypeMCPPrompt:
+		return true
+	default:
+		return false
+	}
+}
+
+// isMCPListAction reports whether the action is an MCP discovery/list method.
+// List operations enumerate the resources a subject may access and therefore
+// do not target a specific resource id.
+func isMCPListAction(name string) bool {
+	switch name {
+	case ActionToolsList, ActionResourcesList, ActionPromptsList:
+		return true
+	default:
+		return false
+	}
+}
 
 // Structures updated to conform to the specification
 
@@ -138,6 +189,29 @@ func init() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile) // Include timestamps and file line numbers in logs
 }
 
+// requireAPIKey validates the Bearer API key on a request. It writes the
+// appropriate error response and returns false when the request is not
+// authorized, otherwise it returns true.
+func requireAPIKey(w http.ResponseWriter, r *http.Request) bool {
+	expectedAPIKey := os.Getenv("API_KEY")
+	if expectedAPIKey == "" {
+		log.Println("API key not set in environment")
+		http.Error(w, "Server configuration error", http.StatusInternalServerError)
+		return false
+	}
+
+	authHeader := r.Header.Get("Authorization")
+	if authHeader == "" || !strings.HasPrefix(authHeader, "Bearer ") {
+		http.Error(w, "Unauthorized: Missing or invalid Authorization header", http.StatusUnauthorized)
+		return false
+	}
+	if strings.TrimPrefix(authHeader, "Bearer ") != expectedAPIKey {
+		http.Error(w, "Unauthorized: Invalid API key", http.StatusUnauthorized)
+		return false
+	}
+	return true
+}
+
 // handleSubjectSearchRequest handles HTTP requests for searching subjects.
 // It decodes the incoming JSON request payload into a SubjectSearchRequest struct,
 // builds a subject search query request, and encodes the response as JSON.
@@ -151,21 +225,7 @@ func init() {
 //   - r: *http.Request containing the HTTP request.
 func handleSubjectSearchRequest(w http.ResponseWriter, r *http.Request) {
 
-	expectedAPIKey := os.Getenv("API_KEY")
-	if expectedAPIKey == "" {
-		log.Println("API key not set in environment")
-		http.Error(w, "Server configuration error", http.StatusInternalServerError)
-		return
-	}
-
-	authHeader := r.Header.Get("Authorization")
-	if authHeader == "" || !strings.HasPrefix(authHeader, "Bearer ") {
-		http.Error(w, "Unauthorized: Missing or invalid Authorization header", http.StatusUnauthorized)
-		return
-	}
-	providedAPIKey := strings.TrimPrefix(authHeader, "Bearer ")
-	if providedAPIKey != expectedAPIKey {
-		http.Error(w, "Unauthorized: Invalid API key", http.StatusUnauthorized)
+	if !requireAPIKey(w, r) {
 		return
 	}
 
@@ -207,21 +267,7 @@ func handleSubjectSearchRequest(w http.ResponseWriter, r *http.Request) {
 //   - w: http.ResponseWriter to write the HTTP response.
 //   - r: *http.Request containing the HTTP request.
 func handleResourceSearchRequest(w http.ResponseWriter, r *http.Request) {
-	expectedAPIKey := os.Getenv("API_KEY")
-	if expectedAPIKey == "" {
-		log.Println("API key not set in environment")
-		http.Error(w, "Server configuration error", http.StatusInternalServerError)
-		return
-	}
-
-	authHeader := r.Header.Get("Authorization")
-	if authHeader == "" || !strings.HasPrefix(authHeader, "Bearer ") {
-		http.Error(w, "Unauthorized: Missing or invalid Authorization header", http.StatusUnauthorized)
-		return
-	}
-	providedAPIKey := strings.TrimPrefix(authHeader, "Bearer ")
-	if providedAPIKey != expectedAPIKey {
-		http.Error(w, "Unauthorized: Invalid API key", http.StatusUnauthorized)
+	if !requireAPIKey(w, r) {
 		return
 	}
 
@@ -368,8 +414,14 @@ func buildPdpDecisionPayload(evalRequest EvaluationRequest) (*PdpPayload, error)
 		pdpDomainPrefix, pdpAttributePrefix, service, action)
 	log.Printf("EvaluationRequest: %+v\n", evalRequest)
 
+	// MCP discovery/list operations (tools/list, resources/list, prompts/list)
+	// enumerate accessible resources and so are not bound to a specific
+	// resource id. For every other request a resource id remains required.
+	requireResourceID := !isMCPListAction(evalRequest.Action.Name)
+
 	if evalRequest.Subject.ID == "" ||
-		evalRequest.Action.Name == "" || evalRequest.Resource.Type == "" || evalRequest.Resource.ID == "" {
+		evalRequest.Action.Name == "" || evalRequest.Resource.Type == "" ||
+		(requireResourceID && evalRequest.Resource.ID == "") {
 		log.Println("Error: subject, resource, and action are requiredX")
 		return nil, errors.New("subject, resource, and action are required")
 	}
@@ -394,7 +446,10 @@ func buildPdpDecisionPayload(evalRequest EvaluationRequest) (*PdpPayload, error)
 	log.Println("Building resource object")
 	resource := map[string]interface{}{
 		"type": evalRequest.Resource.Type,
-		"id":   evalRequest.Resource.ID,
+	}
+	// Omit the id for MCP list operations, which do not target a specific resource.
+	if evalRequest.Resource.ID != "" {
+		resource["id"] = evalRequest.Resource.ID
 	}
 	if evalRequest.Resource.Properties != nil {
 		resource["properties"] = evalRequest.Resource.Properties
@@ -748,12 +803,302 @@ func handleEvaluationBatchRequests(evalRequests []EvaluationRequest) ([]Evaluati
 	return results, nil
 }
 
+// ------------------------------
+// AuthZEN MCP Profile: coazMapping resolution
+// ------------------------------
+//
+// The COAZ profile lets an MCP tool declare an "x-coaz-mapping" (a.k.a.
+// coazMapping) object inside its inputSchema. The mapping describes how to
+// project a tool invocation onto the AuthZEN Subject-Action-Resource-Context
+// model, using JSONPath-style references:
+//
+//   $.properties[...]  -> the tool-call arguments (inputSchema properties)
+//   $.token[...]       -> claims from the caller's (JWT) OAuth access token
+//
+// This endpoint resolves such a mapping against a concrete set of arguments
+// and token claims, producing a ready-to-send AuthZEN evaluation request. When
+// "evaluate" is set it additionally forwards the request to the PDP and
+// returns the decision, so an MCP gateway can perform parameter-level
+// authorization in a single call.
+
+// CoazResolveRequest is the payload accepted by the coazMapping resolver.
+type CoazResolveRequest struct {
+	Mapping    map[string]interface{} `json:"mapping"`              // the tool's x-coaz-mapping object (REQUIRED)
+	Tool       string                 `json:"tool,omitempty"`       // tool name; default action.name when the mapping omits one
+	Properties map[string]interface{} `json:"properties,omitempty"` // resolved tool-call arguments ($.properties)
+	Token      map[string]interface{} `json:"token,omitempty"`      // decoded OAuth/JWT claims ($.token)
+	Action     string                 `json:"action,omitempty"`     // optional MCP method override for action.name
+	Evaluate   bool                   `json:"evaluate,omitempty"`   // if true, forward to the PDP and include the decision
+}
+
+// CoazResolveResponse returns the resolved AuthZEN request and, optionally, the
+// PDP decision.
+type CoazResolveResponse struct {
+	EvaluationRequest map[string]interface{} `json:"evaluation_request"`
+	Decision          *bool                  `json:"decision,omitempty"`
+	Context           *Context               `json:"context,omitempty"`
+}
+
+// resolveCoazValue walks an arbitrary mapping value, replacing any string that
+// begins with "$." with the value referenced from sources. Objects and arrays
+// are resolved recursively; all other values pass through unchanged.
+func resolveCoazValue(v interface{}, sources map[string]interface{}) (interface{}, error) {
+	switch val := v.(type) {
+	case string:
+		if strings.HasPrefix(val, "$.") {
+			return resolveCoazRef(val, sources)
+		}
+		return val, nil
+	case map[string]interface{}:
+		out := make(map[string]interface{}, len(val))
+		for k, item := range val {
+			r, err := resolveCoazValue(item, sources)
+			if err != nil {
+				return nil, err
+			}
+			out[k] = r
+		}
+		return out, nil
+	case []interface{}:
+		out := make([]interface{}, len(val))
+		for i, item := range val {
+			r, err := resolveCoazValue(item, sources)
+			if err != nil {
+				return nil, err
+			}
+			out[i] = r
+		}
+		return out, nil
+	default:
+		return v, nil
+	}
+}
+
+// tokenizeCoazPath splits a "$.root.a['b'][0]" reference into its path
+// segments (e.g. ["root", "a", "b", "0"]). It supports dot notation,
+// quoted/unquoted bracket notation, and numeric array indices.
+func tokenizeCoazPath(expr string) ([]string, error) {
+	path := strings.TrimPrefix(expr, "$.")
+	var segs []string
+	i := 0
+	for i < len(path) {
+		switch path[i] {
+		case '.':
+			i++
+		case '[':
+			j := strings.IndexByte(path[i:], ']')
+			if j < 0 {
+				return nil, fmt.Errorf("unterminated '[' in coaz reference %q", expr)
+			}
+			inner := strings.TrimSpace(path[i+1 : i+j])
+			inner = strings.Trim(inner, `'"`)
+			segs = append(segs, inner)
+			i += j + 1
+		default:
+			j := i
+			for j < len(path) && path[j] != '.' && path[j] != '[' {
+				j++
+			}
+			segs = append(segs, path[i:j])
+			i = j
+		}
+	}
+	return segs, nil
+}
+
+// resolveCoazRef resolves a single "$..." reference against sources. The first
+// path segment selects the source ("properties" or "token"); the remaining
+// segments traverse nested objects and arrays.
+func resolveCoazRef(expr string, sources map[string]interface{}) (interface{}, error) {
+	segs, err := tokenizeCoazPath(expr)
+	if err != nil {
+		return nil, err
+	}
+	if len(segs) == 0 {
+		return nil, fmt.Errorf("empty coaz reference %q", expr)
+	}
+
+	cur, ok := sources[segs[0]]
+	if !ok {
+		return nil, fmt.Errorf("unknown coaz reference root %q in %q (expected one of: properties, token)", segs[0], expr)
+	}
+
+	for _, seg := range segs[1:] {
+		switch node := cur.(type) {
+		case map[string]interface{}:
+			next, ok := node[seg]
+			if !ok {
+				return nil, fmt.Errorf("coaz reference %q: key %q not found", expr, seg)
+			}
+			cur = next
+		case []interface{}:
+			idx, err := strconv.Atoi(seg)
+			if err != nil || idx < 0 || idx >= len(node) {
+				return nil, fmt.Errorf("coaz reference %q: invalid array index %q", expr, seg)
+			}
+			cur = node[idx]
+		default:
+			return nil, fmt.Errorf("coaz reference %q: cannot traverse into segment %q", expr, seg)
+		}
+	}
+	return cur, nil
+}
+
+// toStringValue coerces a resolved JSON value into a string for the typed
+// fields of an EvaluationRequest.
+func toStringValue(v interface{}) string {
+	switch s := v.(type) {
+	case nil:
+		return ""
+	case string:
+		return s
+	case bool:
+		return strconv.FormatBool(s)
+	case float64:
+		return strconv.FormatFloat(s, 'f', -1, 64)
+	default:
+		b, _ := json.Marshal(v)
+		return string(b)
+	}
+}
+
+// evaluationRequestFromResolved converts a resolved AuthZEN request (generic
+// map) into the typed EvaluationRequest used to build the PDP payload.
+func evaluationRequestFromResolved(resolved map[string]interface{}) EvaluationRequest {
+	var er EvaluationRequest
+
+	if s, ok := resolved["subject"].(map[string]interface{}); ok {
+		er.Subject.Type = toStringValue(s["type"])
+		if v, ok := s["id"]; ok {
+			er.Subject.ID = toStringValue(v)
+		} else {
+			er.Subject.ID = toStringValue(s["identity"])
+		}
+		if p, ok := s["properties"].(map[string]interface{}); ok {
+			er.Subject.Properties = p
+		}
+	}
+
+	if res, ok := resolved["resource"].(map[string]interface{}); ok {
+		er.Resource.Type = toStringValue(res["type"])
+		er.Resource.ID = toStringValue(res["id"])
+		if p, ok := res["properties"].(map[string]interface{}); ok {
+			er.Resource.Properties = p
+		}
+	}
+
+	if a, ok := resolved["action"].(map[string]interface{}); ok {
+		er.Action.Name = toStringValue(a["name"])
+		if p, ok := a["properties"].(map[string]interface{}); ok {
+			er.Action.Properties = p
+		}
+	}
+
+	if c, ok := resolved["context"].(map[string]interface{}); ok {
+		ctx := Context(c)
+		er.Context = &ctx
+	}
+
+	return er
+}
+
+// handleCoazResolveRequest resolves an MCP tool's x-coaz-mapping into an
+// AuthZEN evaluation request, optionally evaluating it against the PDP.
+func handleCoazResolveRequest(w http.ResponseWriter, r *http.Request) {
+	if !requireAPIKey(w, r) {
+		return
+	}
+
+	var req CoazResolveRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request payload", http.StatusBadRequest)
+		return
+	}
+	if req.Mapping == nil {
+		http.Error(w, "Missing required 'mapping' (x-coaz-mapping) object", http.StatusBadRequest)
+		return
+	}
+
+	sources := map[string]interface{}{
+		"properties": coalesceMap(req.Properties),
+		"token":      coalesceMap(req.Token),
+	}
+
+	resolvedAny, err := resolveCoazValue(req.Mapping, sources)
+	if err != nil {
+		log.Printf("ERROR: failed to resolve coaz mapping: %v", err)
+		http.Error(w, fmt.Sprintf("Failed to resolve coaz mapping: %v", err), http.StatusBadRequest)
+		return
+	}
+	resolved, ok := resolvedAny.(map[string]interface{})
+	if !ok {
+		http.Error(w, "Resolved coaz mapping is not an object", http.StatusBadRequest)
+		return
+	}
+
+	// action.name: an explicit override wins; otherwise the mapping's value is
+	// kept; otherwise it defaults to the tool name (per the COAZ profile).
+	if req.Action != "" {
+		setActionName(resolved, req.Action)
+	} else if _, present := resolved["action"]; !present && req.Tool != "" {
+		setActionName(resolved, req.Tool)
+	}
+
+	resp := CoazResolveResponse{EvaluationRequest: resolved}
+
+	if req.Evaluate {
+		evalReq := evaluationRequestFromResolved(resolved)
+		pdpPayload, err := buildPdpDecisionPayload(evalReq)
+		if err != nil {
+			log.Printf("ERROR: failed to build PDP payload from coaz mapping: %v", err)
+			http.Error(w, fmt.Sprintf("Error building PDP payload: %v", err), http.StatusBadRequest)
+			return
+		}
+		decisions, err := makeAuthorizationDecisionRequest(pdpPayload)
+		if err != nil {
+			log.Printf("ERROR: coaz authorization decision request failed: %v", err)
+			http.Error(w, "Error making authorization decision request", http.StatusInternalServerError)
+			return
+		}
+		if len(decisions) > 0 {
+			d := decisions[0].Decision
+			resp.Decision = &d
+			resp.Context = decisions[0].Context
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(resp); err != nil {
+		log.Printf("ERROR: failed to encode coaz response: %v", err)
+		http.Error(w, "Failed to encode response", http.StatusInternalServerError)
+	}
+}
+
+// coalesceMap returns a non-nil map so reference resolution never dereferences nil.
+func coalesceMap(m map[string]interface{}) map[string]interface{} {
+	if m == nil {
+		return map[string]interface{}{}
+	}
+	return m
+}
+
+// setActionName sets action.name on a resolved request, creating the action
+// object if it is missing.
+func setActionName(resolved map[string]interface{}, name string) {
+	if a, ok := resolved["action"].(map[string]interface{}); ok {
+		a["name"] = name
+		return
+	}
+	resolved["action"] = map[string]interface{}{"name": name}
+}
+
 func main() {
 	godotenv.Load()
 	http.HandleFunc("/access/v1/evaluation", handleEvaluationRequest)
 	http.HandleFunc("/access/v1/evaluations", handleEvaluationRequest)
 	http.HandleFunc("/access/v1/subjectsearch", handleSubjectSearchRequest)
 	http.HandleFunc("/access/v1/resourcesearch", handleResourceSearchRequest)
+	http.HandleFunc("/access/v1/coaz/resolve", handleCoazResolveRequest)
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprintln(w, "OK")

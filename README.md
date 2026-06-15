@@ -5,10 +5,13 @@ This project is an authorization proxy service that integrates with Ping Authori
 
 This implementation conforms to the [AuthZen Interop Specification](https://authzen-interop.net/docs/intro/), ensuring interoperability with authorization frameworks and standardized access control mechanisms.
 
+It also supports the **AuthZEN Profile for Model Context Protocol Tool Authorization (COAZ)**, which maps Model Context Protocol (MCP) operations onto the AuthZEN Subject-Action-Resource-Context model. See [MCP Profile Support](#mcp-profile-support-coaz) below.
+
 ## Features
 - **Authorization Evaluation API**: Evaluates access requests based on subject, action, resource, and context.
 - **Subject Search API**: Retrieves subjects matching a given action-resource pair.
 - **Resource Search API**: Retrieves resources matching a given subject-action pair.
+- **MCP Profile Support (COAZ)**: Recognizes MCP resource types and method actions, and resolves `x-coaz-mapping` tool mappings into AuthZEN evaluation requests.
 - **Ping Authorize Integration**: Queries Ping Authorize for policy decisions.
 - **Environment Configuration**: Uses environment variables for configuration.
 - **Secure API Key Authentication**: Validates API requests with Bearer token authentication.
@@ -26,19 +29,110 @@ This implementation conforms to the [AuthZen Interop Specification](https://auth
 **Description:** Processes multiple evaluation requests in a single batch.
 
 ### Subject Search
-**Endpoint:** `/access/v1/search/subject`  
+**Endpoint:** `/access/v1/subjectsearch`  
 **Method:** `POST`  
 **Description:** Searches for subjects that match the given action and resource.
 
 ### Resource Search
-**Endpoint:** `/access/v1/search/resource`  
+**Endpoint:** `/access/v1/resourcesearch`  
 **Method:** `POST`  
 **Description:** Searches for resources that match the given subject and action.
+
+### COAZ Mapping Resolution
+**Endpoint:** `/access/v1/coaz/resolve`  
+**Method:** `POST`  
+**Description:** Resolves an MCP tool's `x-coaz-mapping` into an AuthZEN evaluation request, optionally evaluating it against the PDP. See [MCP Profile Support](#mcp-profile-support-coaz).
 
 ### Health Check
 **Endpoint:** `/health`  
 **Method:** `GET`  
 **Description:** Returns `200 OK` to indicate service health.
+
+## MCP Profile Support (COAZ)
+
+The adapter supports the [AuthZEN Profile for Model Context Protocol Tool Authorization (COAZ)](https://openid.net/wg/authzen/specifications/), which lets an MCP server/gateway act as a Policy Enforcement Point (PEP) and externalize fine-grained, parameter-level authorization to an AuthZEN PDP.
+
+### Resource types and actions
+
+The profile defines three resource types and maps MCP method names directly onto `action.name`:
+
+| MCP resource type | Purpose            |
+|-------------------|--------------------|
+| `mcp-tool`        | Tool invocations   |
+| `mcp-resource`    | Resource access    |
+| `mcp-prompt`      | Prompt retrieval   |
+
+| MCP method        | `action.name`     |
+|-------------------|-------------------|
+| `tools/call`      | `tools/call`      |
+| `tools/list`      | `tools/list`      |
+| `resources/read`  | `resources/read`  |
+| `resources/list`  | `resources/list`  |
+| `prompts/get`     | `prompts/get`     |
+| `prompts/list`    | `prompts/list`    |
+
+MCP-profile evaluation requests are handled by the standard `/access/v1/evaluation` (and batch `/access/v1/evaluations`) endpoints. List/discovery operations (`tools/list`, `resources/list`, `prompts/list`) enumerate accessible resources and therefore do **not** require a specific `resource.id`; for all other operations a `resource.id` is still required.
+
+Example MCP `tools/call` evaluation request:
+
+```json
+{
+  "subject": {
+    "type": "user",
+    "identity": "1234567890",
+    "properties": { "roles": ["analyst"], "tenant": "finance-dept", "acr": "inherence", "amr": ["passkeys"] }
+  },
+  "action": { "name": "tools/call" },
+  "resource": {
+    "type": "mcp-tool",
+    "id": "fintech_approve_expense",
+    "properties": { "arguments": { "expense_id": "exp-123", "amount": 5000 } }
+  },
+  "context": {
+    "client": { "name": "Claude Desktop", "version": "1.0.0" },
+    "connection": { "session_id": "session-abc123" }
+  }
+}
+```
+
+### Resolving `x-coaz-mapping`
+
+A COAZ-aware tool declares an `x-coaz-mapping` object inside its `inputSchema`, projecting tool arguments and OAuth token claims onto the AuthZEN model using JSONPath-style references:
+
+- `$.properties[...]` — the tool-call arguments (the `inputSchema` properties)
+- `$.token[...]` — claims from the caller's (JWT) OAuth access token
+
+The `/access/v1/coaz/resolve` endpoint resolves a mapping against concrete arguments and token claims:
+
+```sh
+curl -X POST "http://localhost:8080/access/v1/coaz/resolve" \
+  -H "Authorization: Bearer <API_KEY>" \
+  -H "Content-Type: application/json" \
+  -d '{
+        "tool": "get_customer",
+        "mapping": {
+          "resource": { "id": "$.properties['id']", "type": "customer" },
+          "subject":  { "type": "user", "id": "$.token['sub']" },
+          "context":  { "agent": "$.token['client_id']", "case": "$.properties['case']" }
+        },
+        "properties": { "id": "cust-1", "case": "case-42" },
+        "token": { "sub": "u-9", "client_id": "agent-app" },
+        "evaluate": false
+      }'
+```
+
+Request fields:
+
+| Field        | Description                                                                 |
+|--------------|-----------------------------------------------------------------------------|
+| `mapping`    | The tool's `x-coaz-mapping` object (required).                              |
+| `tool`       | Tool name; used as the default `action.name` when the mapping omits one.    |
+| `properties` | The resolved tool-call arguments (`$.properties` source).                   |
+| `token`      | Decoded OAuth/JWT claims (`$.token` source).                                |
+| `action`     | Optional override for `action.name` (e.g. `tools/call`).                    |
+| `evaluate`   | If `true`, the resolved request is forwarded to the PDP and the decision is returned. |
+
+The response contains the resolved `evaluation_request`, plus the `decision` (and any `context`) when `evaluate` is `true`.
 
 ## Environment Variables
 | Variable               | Description                                      |
