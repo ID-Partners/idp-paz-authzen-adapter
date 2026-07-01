@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Northwind Bank · AI Agent + Ping Authorize (AuthZEN)</title>
+<style>
+  :root {
+    --bg:#0d1117; --panel:#161b22; --border:#2d333b; --text:#e6edf3;
+    --muted:#9198a1; --accent:#4493f8; --ok:#3fb950; --deny:#f85149; --tool:#d29922;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;
+         background:var(--bg); color:var(--text); }
+  header { padding:16px 24px; border-bottom:1px solid var(--border); display:flex;
+           align-items:center; gap:12px; }
+  header h1 { font-size:16px; margin:0; font-weight:600; }
+  header .tag { font-size:12px; color:var(--muted); }
+  .wrap { max-width:920px; margin:0 auto; padding:24px; }
+  .arch { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:20px; font-size:12px; }
+  .arch span { background:var(--panel); border:1px solid var(--border); border-radius:6px;
+               padding:4px 10px; color:var(--muted); }
+  .arch b { color:var(--text); }
+  .examples { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:16px; }
+  .examples button { background:var(--panel); color:var(--text); border:1px solid var(--border);
+                     border-radius:8px; padding:8px 12px; cursor:pointer; font-size:13px; }
+  .examples button:hover { border-color:var(--accent); }
+  form { display:flex; gap:8px; margin-bottom:20px; }
+  input[type=text] { flex:1; background:var(--panel); border:1px solid var(--border);
+                     border-radius:8px; padding:12px; color:var(--text); font-size:14px; }
+  button.send { background:var(--accent); color:#fff; border:none; border-radius:8px;
+                padding:0 20px; cursor:pointer; font-weight:600; }
+  button.send:disabled { opacity:.5; cursor:default; }
+  .transcript { display:flex; flex-direction:column; gap:10px; }
+  .step { border:1px solid var(--border); border-radius:10px; padding:12px 14px;
+          background:var(--panel); }
+  .step .label { font-size:11px; text-transform:uppercase; letter-spacing:.5px;
+                 color:var(--muted); margin-bottom:6px; }
+  .step.agent .label { color:var(--accent); }
+  .step.tool_call .label { color:var(--tool); }
+  .step.connect { border-style:dashed; }
+  .step pre { margin:6px 0 0; background:#0b0f14; border-radius:6px; padding:10px;
+              overflow:auto; font-size:12px; color:#c9d1d9; }
+  .decision { display:inline-flex; align-items:center; gap:6px; font-weight:600;
+              font-size:13px; padding:2px 8px; border-radius:20px; }
+  .decision.allow { color:var(--ok); background:rgba(63,185,80,.12); }
+  .decision.deny { color:var(--deny); background:rgba(248,81,73,.12); }
+  .reason { color:var(--muted); font-size:13px; margin-top:6px; }
+  .final { border:1px solid var(--accent); }
+  .spinner { color:var(--muted); font-size:13px; }
+  code { color:#79c0ff; }
+</style>
+</head>
+<body>
+<header>
+  <h1>🏦 Northwind Bank — AI Account Assistant</h1>
+  <span class="tag">AWS AgentCore-shaped agent · MCP tools · Ping Authorize via AuthZEN PDP</span>
+</header>
+<div class="wrap">
+  <div class="arch">
+    <span><b>Agent</b> (AgentCore /invocations · Claude)</span>
+    <span>→ <b>MCP</b> Bank service</span>
+    <span>→ <b>AuthZEN PDP</b> adapter</span>
+    <span>→ <b>Ping Authorize</b></span>
+  </div>
+
+  <div class="examples">
+    <button data-prompt="I'd like to open a new savings account and move $500 into it from my checking account.">Open savings + fund $500</button>
+    <button data-prompt="Please open a savings account and transfer $9,000 from my checking account into it.">Open savings + fund $9,000</button>
+    <button data-prompt="What accounts do I have and what are their balances?">List my accounts</button>
+  </div>
+
+  <form id="chat">
+    <input id="prompt" type="text" autocomplete="off"
+           placeholder="Ask the agent to open an account and make a payment…" />
+    <button class="send" type="submit">Send</button>
+  </form>
+
+  <div id="transcript" class="transcript"></div>
+</div>
+
+<script>
+const form = document.getElementById('chat');
+const input = document.getElementById('prompt');
+const out = document.getElementById('transcript');
+const sendBtn = form.querySelector('button.send');
+
+document.querySelectorAll('.examples button').forEach(b => {
+  b.addEventListener('click', () => { input.value = b.dataset.prompt; input.focus(); });
+});
+
+function el(cls, html) {
+  const d = document.createElement('div');
+  d.className = cls;
+  d.innerHTML = html;
+  return d;
+}
+function esc(s){ return String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+function pretty(o){ return esc(typeof o === 'string' ? o : JSON.stringify(o, null, 2)); }
+
+function render(steps) {
+  for (const s of steps) {
+    if (s.type === 'connect') {
+      out.appendChild(el('step connect', `<div class="label">MCP connect</div>${esc(s.detail)}`));
+    } else if (s.type === 'agent') {
+      out.appendChild(el('step agent', `<div class="label">Agent</div>${esc(s.text)}`));
+    } else if (s.type === 'tool_call') {
+      out.appendChild(el('step tool_call',
+        `<div class="label">Tool call → ${esc(s.name)}</div><pre>${pretty(s.input)}</pre>`));
+    } else if (s.type === 'tool_result') {
+      const allowed = s.authorized;
+      let badge = '';
+      if (allowed === true) badge = `<span class="decision allow">✔ Ping Authorize: PERMIT</span>`;
+      else if (allowed === false) badge = `<span class="decision deny">✘ Ping Authorize: DENY</span>`;
+      const reason = s.policy_reason ? `<div class="reason">Policy reason: ${esc(s.policy_reason)}</div>` : '';
+      out.appendChild(el('step tool_result',
+        `<div class="label">Result ← ${esc(s.name)}</div>${badge}${reason}<pre>${pretty(s.result)}</pre>`));
+    }
+    out.scrollIntoView({behavior:'smooth', block:'end'});
+  }
+}
+
+form.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const prompt = input.value.trim();
+  if (!prompt) return;
+  out.appendChild(el('step agent', `<div class="label">You</div>${esc(prompt)}`));
+  input.value = '';
+  sendBtn.disabled = true;
+  const spin = el('step spinner', 'Agent is working (connecting to MCP, calling tools, checking Ping Authorize policy)…');
+  out.appendChild(spin);
+  try {
+    const res = await fetch('/invocations', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ prompt, session_id: 'web-demo' })
+    });
+    const data = await res.json();
+    spin.remove();
+    if (data.error) {
+      out.appendChild(el('step tool_result', `<div class="label">Error</div><pre>${esc(data.error)}</pre>`));
+    } else {
+      render(data.transcript || []);
+      out.appendChild(el('step final agent', `<div class="label">Agent — final answer</div>${esc(data.final)}`));
+    }
+  } catch (err) {
+    spin.remove();
+    out.appendChild(el('step tool_result', `<div class="label">Error</div><pre>${esc(err)}</pre>`));
+  } finally {
+    sendBtn.disabled = false;
+  }
+});
+</script>
+</body>
+</html>

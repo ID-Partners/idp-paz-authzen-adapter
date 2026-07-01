@@ -1,0 +1,48 @@
+# Local run of the full demo stack.
+#   docker compose up --build
+# Then open http://localhost:8000
+#
+# Set ANTHROPIC_API_KEY in your shell (or a .env file next to this compose file).
+# Point the AuthZEN adapter at your Ping Authorize with PDP_URL / PDP_SECRET.
+
+services:
+  authzen-adapter:
+    build: ../authzen-adapter
+    environment:
+      PORT: "8080"
+      API_KEY: "${AUTHZEN_API_KEY:-Password1}"
+      PDP_DOMAIN_PREFIX: "idpartners"
+      PDP_ATTRIBUTE_PREFIX: "AuthZEN"
+      PDP_SERVICE: "AuthZEN"
+      PDP_ACTION: "authorize"
+      PDP_URL: "${PDP_URL:-https://host.docker.internal:1443/governance-engine}"
+      QUERY_URL: "${QUERY_URL:-https://host.docker.internal:1443/governance-engine/query}"
+      PDP_SECRET_HEADER: "${PDP_SECRET_HEADER:-CLIENT_TOKEN}"
+      PDP_SECRET: "${PDP_SECRET:-2FederateM0re}"
+    ports:
+      - "8080:8080"
+
+  bank-mcp:
+    build: ./mcp-server
+    environment:
+      PORT: "8090"
+      AUTHZEN_PDP_URL: "http://authzen-adapter:8080"
+      AUTHZEN_API_KEY: "${AUTHZEN_API_KEY:-Password1}"
+      AGENT_ID: "bank-account-opening-agent"
+      PDP_FAIL_CLOSED: "true"
+    ports:
+      - "8090:8090"
+    depends_on:
+      - authzen-adapter
+
+  bank-agent:
+    build: ./agent
+    environment:
+      PORT: "8000"
+      MCP_SERVER_URL: "http://bank-mcp:8090/mcp"
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY}"
+      ANTHROPIC_MODEL: "${ANTHROPIC_MODEL:-claude-sonnet-4-5}"
+    ports:
+      - "8000:8000"
+    depends_on:
+      - bank-mcp
