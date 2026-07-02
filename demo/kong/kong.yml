@@ -1,0 +1,50 @@
+# Kong OSS declarative (DB-less) config for the agentic-banking demo.
+#
+# One Kong proxy fronts BOTH governed surfaces, each with its own PEP:
+#
+#   PEP #1  agent  -> kong:8000/mcp        -> bank-mcp:8090/mcp   (MCP edge, coarse)
+#   PEP #2  mcp     -> kong:8000/bank/...   -> bank-api:8070/...    (Resource Server, fine)
+#
+# Both routes run the custom `authzen-pdp` plugin, which calls the Go
+# authzen-adapter (Ping Authorize) for every request.
+#
+# require_dpop is false here so the pipeline can be brought up and tested with
+# plain bearer tokens; flip both to true once the agent presents DPoP-bound
+# tokens to enforce the sender-constraint at the gateway.
+
+_format_version: "3.0"
+
+services:
+  - name: bank-mcp-svc
+    url: http://bank-mcp:8090
+    routes:
+      - name: mcp-route
+        paths:
+          - /mcp
+        strip_path: false
+    plugins:
+      - name: authzen-pdp
+        config:
+          authzen_url: "{vault://env/authzen-url}"
+          authzen_api_key: "{vault://env/authzen-api-key}"
+          pep_label: "PEP#1 (MCP edge)"
+          style: "mcp"
+          require_token: true
+          require_dpop: false
+
+  - name: bank-api-svc
+    url: http://bank-api:8070
+    routes:
+      - name: bank-route
+        paths:
+          - /bank
+        strip_path: true
+    plugins:
+      - name: authzen-pdp
+        config:
+          authzen_url: "{vault://env/authzen-url}"
+          authzen_api_key: "{vault://env/authzen-api-key}"
+          pep_label: "PEP#2 (Bank API edge)"
+          style: "rest"
+          require_token: true
+          require_dpop: false

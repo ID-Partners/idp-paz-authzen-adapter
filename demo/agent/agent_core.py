@@ -16,6 +16,7 @@ decisions.
 """
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import os
@@ -25,12 +26,16 @@ import anthropic
 from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
 
+from auth import acquire_delegated_token
+
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(name)s %(message)s")
 logger = logging.getLogger("bank-agent")
 
+# The MCP endpoint the agent connects to. In the governed demo this points at
+# the Kong gateway's /mcp route (PEP #1), not the MCP server directly.
 MCP_SERVER_URL = os.environ.get("MCP_SERVER_URL", "http://localhost:8090/mcp")
-ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-5")
+ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-5")
 MAX_TURNS = int(os.environ.get("AGENT_MAX_TURNS", "12"))
 
 SYSTEM_PROMPT = """\
@@ -93,15 +98,34 @@ async def run_agent(prompt: str, session_id: str = "demo") -> dict[str, Any]:
     transcript: list[dict[str, Any]] = []
     client = _anthropic_client()
 
-    logger.info("Connecting to MCP server at %s", MCP_SERVER_URL)
-    async with streamablehttp_client(MCP_SERVER_URL) as (read, write, _):
+    # 1) Establish the agent's authority: authenticate and obtain a delegated,
+    #    DPoP-bound token via token exchange (sub=principal, act.sub=agent).
+    cred = acquire_delegated_token()
+    transcript.extend(cred.steps)
+
+    # 2) Present the token (DPoP-bound) on every MCP request to Kong (PEP #1).
+    #    Prefer per-request DPoP proofs via httpx auth; fall back to a static
+    #    Authorization header if the installed MCP SDK lacks an `auth` param.
+    client_kwargs: dict[str, Any] = {}
+    if "auth" in inspect.signature(streamablehttp_client).parameters:
+        client_kwargs["auth"] = cred.httpx_auth()
+        dpop_note = "per-request DPoP proofs"
+    else:
+        proof = cred._dpop_proof("POST", MCP_SERVER_URL)
+        client_kwargs["headers"] = {
+            "Authorization": f"DPoP {cred.access_token}", "DPoP": proof}
+        dpop_note = "static DPoP header (SDK has no auth hook)"
+
+    logger.info("Connecting to MCP server at %s (%s)", MCP_SERVER_URL, dpop_note)
+    async with streamablehttp_client(MCP_SERVER_URL, **client_kwargs) as (read, write, _):
         async with ClientSession(read, write) as session:
             await session.initialize()
             listed = await session.list_tools()
             tools = _mcp_tools_to_anthropic(listed.tools)
             transcript.append({
                 "type": "connect",
-                "detail": f"Connected to MCP service '{MCP_SERVER_URL}'. "
+                "detail": f"Connected via Kong gateway (PEP #1) to MCP service "
+                          f"'{MCP_SERVER_URL}' using {dpop_note}. "
                           f"Discovered tools: {', '.join(t['name'] for t in tools)}.",
             })
 

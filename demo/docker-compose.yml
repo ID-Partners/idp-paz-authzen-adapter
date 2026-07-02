@@ -4,6 +4,11 @@
 #
 # Set ANTHROPIC_API_KEY in your shell (or a .env file next to this compose file).
 # Point the AuthZEN adapter at your Ping Authorize with PDP_URL / PDP_SECRET.
+#
+# Topology (two policy-enforcement points on one Kong gateway):
+#   bank-agent ──DPoP──▶ kong:/mcp  (PEP #1) ──▶ bank-mcp
+#   bank-mcp   ──token─▶ kong:/bank (PEP #2) ──▶ bank-api
+#   both PEPs ──AuthZEN──▶ authzen-adapter ──▶ Ping Authorize
 
 services:
   authzen-adapter:
@@ -22,27 +27,55 @@ services:
     ports:
       - "8080:8080"
 
+  bank-api:
+    build: ./bank-api
+    environment:
+      PORT: "8070"
+    expose:
+      - "8070"
+
+  kong:
+    build: ./kong
+    environment:
+      # consumed by the authzen-pdp plugin via Kong's env vault
+      AUTHZEN_URL: "http://authzen-adapter:8080"
+      AUTHZEN_API_KEY: "${AUTHZEN_API_KEY:-Password1}"
+    ports:
+      - "8002:8000"   # proxy on host:8002 (agent/mcp reach it internally as kong:8000)
+      - "8001:8001"   # admin (debug only)
+    depends_on:
+      - authzen-adapter
+      - bank-api
+      - bank-mcp
+
   bank-mcp:
     build: ./mcp-server
     environment:
       PORT: "8090"
-      AUTHZEN_PDP_URL: "http://authzen-adapter:8080"
-      AUTHZEN_API_KEY: "${AUTHZEN_API_KEY:-Password1}"
-      AGENT_ID: "bank-account-opening-agent"
-      PDP_FAIL_CLOSED: "true"
-    ports:
-      - "8090:8090"
-    depends_on:
-      - authzen-adapter
+      # MCP tools call the Bank API through Kong (PEP #2)
+      BANK_API_BASE_URL: "http://kong:8000/bank"
+      AGENT_ID: "urn:agent:northwind-onboarding:v1"
+    expose:
+      - "8090"
 
   bank-agent:
     build: ./agent
     environment:
       PORT: "8000"
-      MCP_SERVER_URL: "http://bank-mcp:8090/mcp"
+      # agent connects to the MCP service through Kong (PEP #1)
+      MCP_SERVER_URL: "http://kong:8000/mcp"
+      # identity / token exchange
+      TOKEN_MODE: "${TOKEN_MODE:-local}"
+      OIDC_ISSUER: "${OIDC_ISSUER:-https://pingfederate-production.up.railway.app}"
+      AGENT_ID: "urn:agent:northwind-onboarding:v1"
+      AGENT_CLIENT_ID: "${AGENT_CLIENT_ID:-bank-agent}"
+      AGENT_CLIENT_SECRET: "${AGENT_CLIENT_SECRET:-}"
+      PRINCIPAL_SUB: "cust-alice"
+      RS_AUDIENCE: "${RS_AUDIENCE:-https://api.northwind.example/bank}"
+      # model
       ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY}"
-      ANTHROPIC_MODEL: "${ANTHROPIC_MODEL:-claude-sonnet-4-5}"
+      ANTHROPIC_MODEL: "${ANTHROPIC_MODEL:-claude-sonnet-5}"
     ports:
       - "8000:8000"
     depends_on:
-      - bank-mcp
+      - kong

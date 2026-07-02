@@ -1,0 +1,292 @@
+"""
+Agent identity, token exchange, and DPoP for the banking agent.
+
+This module is where the agent obtains the authority it uses to call the bank.
+It demonstrates the real agentic-identity mechanics:
+
+  1. The agent is a distinct identity from both the human Principal and the
+     Agent Operator (the OAuth client). See `AGENT_ID` vs `AGENT_CLIENT_ID`.
+  2. It obtains a delegated token via RFC 8693 Token Exchange so the token
+     carries the Principal as `sub` AND the agent as `act.sub` — DELEGATION,
+     not impersonation. (The agent never presents the Principal's identity as
+     its own.)
+  3. Every call to a protected resource is sender-constrained with DPoP
+     (RFC 9449): the token's `cnf.jkt` is the thumbprint of the agent's key,
+     and each request carries a fresh DPoP proof signed by that key.
+
+Two modes (TOKEN_MODE):
+
+  * "pingfederate" — perform the genuine flow against the deployed PingFederate:
+      client-credentials (actor token) + subject token → RFC 8693 exchange,
+      DPoP-bound. Requires PF to be configured with the agent-operator client and
+      a token-exchange processor policy (see demo/README.md).
+
+  * "local" (default) — self-issue an equivalently-shaped DPoP-bound delegated
+      token signed by a local key, so the demo runs end-to-end before PF is
+      configured. The wire format (claims, act chain, cnf.jkt, DPoP proofs) is
+      identical, so the agent, Kong, and Bank API code paths are unchanged.
+"""
+from __future__ import annotations
+
+import base64
+import hashlib
+import logging
+import os
+import time
+import uuid
+from dataclasses import dataclass, field
+from typing import Any, Generator
+
+import httpx
+import jwt  # PyJWT
+from cryptography.hazmat.primitives.asymmetric import ec
+
+logger = logging.getLogger("bank-agent.auth")
+
+# --- identities (three distinct parties; see module docstring) ---
+PRINCIPAL_SUB = os.environ.get("PRINCIPAL_SUB", "cust-alice")        # the human
+AGENT_ID = os.environ.get("AGENT_ID", "urn:agent:northwind-onboarding:v1")  # act.sub
+AGENT_CLIENT_ID = os.environ.get("AGENT_CLIENT_ID", "bank-agent")    # Agent Operator (client_id)
+AGENT_CLIENT_SECRET = os.environ.get("AGENT_CLIENT_SECRET", "")
+
+# --- token shape ---
+TOKEN_MODE = os.environ.get("TOKEN_MODE", "local").lower()
+OIDC_ISSUER = os.environ.get("OIDC_ISSUER", "https://pingfederate-production.up.railway.app")
+RS_AUDIENCE = os.environ.get("RS_AUDIENCE", "https://api.northwind.example/bank")
+DEFAULT_SCOPE = os.environ.get(
+    "AGENT_SCOPE",
+    "bank:accounts.read bank:accounts.write bank:payments.initiate",
+)
+RAR_TYPE = os.environ.get(
+    "RAR_TYPE", "https://schemas.idpartners.com.au/agentic/payment_initiation/v1")
+TOKEN_TTL = int(os.environ.get("TOKEN_TTL", "900"))
+
+
+def _b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+def _int_to_b64url(n: int) -> str:
+    length = (n.bit_length() + 7) // 8
+    return _b64url(n.to_bytes(length, "big"))
+
+
+@dataclass
+class AgentCredential:
+    """A delegated, DPoP-bound access token plus the key that constrains it."""
+    access_token: str
+    principal_sub: str
+    agent_sub: str
+    scope: str
+    jkt: str
+    mode: str
+    _key: ec.EllipticCurvePrivateKey
+    steps: list[dict[str, Any]] = field(default_factory=list)
+
+    def public_jwk(self) -> dict[str, str]:
+        nums = self._key.public_key().public_numbers()
+        return {
+            "kty": "EC",
+            "crv": "P-256",
+            "x": _int_to_b64url(nums.x),
+            "y": _int_to_b64url(nums.y),
+        }
+
+    def _dpop_proof(self, method: str, url: str) -> str:
+        """A fresh DPoP proof (RFC 9449) bound to this credential's key."""
+        ath = _b64url(hashlib.sha256(self.access_token.encode()).digest())
+        payload = {
+            "jti": str(uuid.uuid4()),
+            "htm": method.upper(),
+            "htu": url.split("?")[0],
+            "iat": int(time.time()),
+            "ath": ath,
+        }
+        return jwt.encode(
+            payload, self._key, algorithm="ES256",
+            headers={"typ": "dpop+jwt", "jwk": self.public_jwk()},
+        )
+
+    def httpx_auth(self) -> "DPoPAuth":
+        return DPoPAuth(self)
+
+    def claims(self) -> dict[str, Any]:
+        # decode without verifying signature — for display/transcript only
+        return jwt.decode(self.access_token, options={"verify_signature": False})
+
+
+class DPoPAuth(httpx.Auth):
+    """httpx auth that attaches `Authorization: DPoP <token>` and a fresh
+    per-request `DPoP: <proof>` header — the correct way to present a
+    sender-constrained token across the several requests an MCP session makes."""
+
+    requires_request_body = False
+
+    def __init__(self, cred: AgentCredential) -> None:
+        self._cred = cred
+
+    def auth_flow(self, request: httpx.Request) -> Generator[httpx.Request, httpx.Response, None]:
+        proof = self._cred._dpop_proof(request.method, str(request.url))
+        request.headers["Authorization"] = f"DPoP {self._cred.access_token}"
+        request.headers["DPoP"] = proof
+        yield request
+
+
+def _new_key() -> ec.EllipticCurvePrivateKey:
+    return ec.generate_private_key(ec.SECP256R1())
+
+
+def _jkt(key: ec.EllipticCurvePrivateKey) -> str:
+    """RFC 7638 JWK thumbprint of the EC public key."""
+    nums = key.public_key().public_numbers()
+    canon = (
+        '{"crv":"P-256","kty":"EC","x":"%s","y":"%s"}'
+        % (_int_to_b64url(nums.x), _int_to_b64url(nums.y))
+    )
+    return _b64url(hashlib.sha256(canon.encode()).digest())
+
+
+def _authorization_details() -> list[dict[str, Any]]:
+    return [{
+        "type": RAR_TYPE,
+        "actions": ["initiate"],
+        "locations": [RS_AUDIENCE],
+        "instructedAmount": {"currency": "AUD"},
+    }]
+
+
+# --------------------------------------------------------------------------
+# local mode: self-issue an equivalently-shaped delegated, DPoP-bound token
+# --------------------------------------------------------------------------
+
+def _acquire_local() -> AgentCredential:
+    key = _new_key()
+    jkt = _jkt(key)
+    now = int(time.time())
+    claims = {
+        "iss": "https://local-demo-idp.northwind.example",
+        "sub": PRINCIPAL_SUB,                 # the human principal
+        "act": {"sub": AGENT_ID},             # the acting agent — DELEGATION
+        "aud": RS_AUDIENCE,
+        "client_id": AGENT_CLIENT_ID,         # the Agent Operator
+        "azp": AGENT_CLIENT_ID,
+        "scope": DEFAULT_SCOPE,
+        "authorization_details": _authorization_details(),
+        "cnf": {"jkt": jkt},                  # DPoP sender-constraint
+        "iat": now,
+        "exp": now + TOKEN_TTL,
+    }
+    # a throwaway signing key for the demo IdP (token signature is not verified
+    # by the PDP plugin; the point here is the claim shape + DPoP binding)
+    signing_key = _new_key()
+    token = jwt.encode(claims, signing_key, algorithm="ES256")
+
+    steps = [
+        {"type": "auth", "title": "Agent authenticates",
+         "detail": f"Agent Operator client '{AGENT_CLIENT_ID}' authenticated; "
+                   f"agent identity '{AGENT_ID}'. (local demo IdP)"},
+        {"type": "token_exchange", "title": "Token exchange (RFC 8693)",
+         "detail": f"Delegated token issued: sub={PRINCIPAL_SUB} "
+                   f"act.sub={AGENT_ID} (delegation, not impersonation).",
+         "sub": PRINCIPAL_SUB, "act": AGENT_ID, "scope": DEFAULT_SCOPE,
+         "cnf_jkt": jkt, "mode": "local"},
+    ]
+    return AgentCredential(access_token=token, principal_sub=PRINCIPAL_SUB,
+                           agent_sub=AGENT_ID, scope=DEFAULT_SCOPE, jkt=jkt,
+                           mode="local", _key=key, steps=steps)
+
+
+# --------------------------------------------------------------------------
+# pingfederate mode: genuine client-credentials + RFC 8693 token exchange
+# --------------------------------------------------------------------------
+
+def _discover_token_endpoint() -> str:
+    url = OIDC_ISSUER.rstrip("/") + "/.well-known/openid-configuration"
+    with httpx.Client(timeout=10.0, verify=False) as c:
+        meta = c.get(url).json()
+    return meta["token_endpoint"]
+
+
+def _acquire_pingfederate() -> AgentCredential:
+    key = _new_key()
+    jkt = _jkt(key)
+    token_endpoint = _discover_token_endpoint()
+    steps: list[dict[str, Any]] = []
+
+    def dpop_for(method: str, url: str, access_token: str | None = None) -> str:
+        payload = {"jti": str(uuid.uuid4()), "htm": method.upper(),
+                   "htu": url.split("?")[0], "iat": int(time.time())}
+        if access_token:
+            payload["ath"] = _b64url(hashlib.sha256(access_token.encode()).digest())
+        pub = key.public_key().public_numbers()
+        jwk = {"kty": "EC", "crv": "P-256",
+               "x": _int_to_b64url(pub.x), "y": _int_to_b64url(pub.y)}
+        return jwt.encode(payload, key, algorithm="ES256",
+                          headers={"typ": "dpop+jwt", "jwk": jwk})
+
+    with httpx.Client(timeout=15.0, verify=False) as c:
+        # 1) Agent Operator authenticates -> actor token (client_credentials, DPoP)
+        actor_resp = c.post(token_endpoint, data={
+            "grant_type": "client_credentials",
+            "client_id": AGENT_CLIENT_ID,
+            "client_secret": AGENT_CLIENT_SECRET,
+            "scope": "agent",
+        }, headers={"DPoP": dpop_for("POST", token_endpoint)})
+        actor_resp.raise_for_status()
+        actor_token = actor_resp.json()["access_token"]
+        steps.append({"type": "auth", "title": "Agent authenticates",
+                      "detail": f"client '{AGENT_CLIENT_ID}' obtained an actor "
+                                f"token via client_credentials (DPoP)."})
+
+        # 2) Principal subject token (demo: pre-provisioned or password grant)
+        subject_token = os.environ.get("PRINCIPAL_SUBJECT_TOKEN")
+        if not subject_token:
+            sub_resp = c.post(token_endpoint, data={
+                "grant_type": "password",
+                "client_id": AGENT_CLIENT_ID,
+                "client_secret": AGENT_CLIENT_SECRET,
+                "username": os.environ.get("PRINCIPAL_USERNAME", PRINCIPAL_SUB),
+                "password": os.environ.get("PRINCIPAL_PASSWORD", ""),
+                "scope": "openid",
+            })
+            sub_resp.raise_for_status()
+            subject_token = sub_resp.json()["access_token"]
+
+        # 3) RFC 8693 token exchange: subject (Alice) + actor (agent) -> delegated
+        te = c.post(token_endpoint, data={
+            "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+            "client_id": AGENT_CLIENT_ID,
+            "client_secret": AGENT_CLIENT_SECRET,
+            "subject_token": subject_token,
+            "subject_token_type": "urn:ietf:params:oauth:token-type:access_token",
+            "actor_token": actor_token,
+            "actor_token_type": "urn:ietf:params:oauth:token-type:access_token",
+            "scope": DEFAULT_SCOPE,
+            "resource": RS_AUDIENCE,
+        }, headers={"DPoP": dpop_for("POST", token_endpoint)})
+        te.raise_for_status()
+        access_token = te.json()["access_token"]
+
+    decoded = jwt.decode(access_token, options={"verify_signature": False})
+    steps.append({
+        "type": "token_exchange", "title": "Token exchange (RFC 8693)",
+        "detail": f"PingFederate issued a delegated token: sub={decoded.get('sub')} "
+                  f"act.sub={(decoded.get('act') or {}).get('sub')}.",
+        "sub": decoded.get("sub"), "act": (decoded.get("act") or {}).get("sub"),
+        "scope": decoded.get("scope"), "cnf_jkt": (decoded.get("cnf") or {}).get("jkt"),
+        "mode": "pingfederate"})
+    return AgentCredential(
+        access_token=access_token, principal_sub=decoded.get("sub", PRINCIPAL_SUB),
+        agent_sub=(decoded.get("act") or {}).get("sub", AGENT_ID),
+        scope=decoded.get("scope", DEFAULT_SCOPE),
+        jkt=(decoded.get("cnf") or {}).get("jkt", jkt), mode="pingfederate",
+        _key=key, steps=steps)
+
+
+def acquire_delegated_token() -> AgentCredential:
+    """Obtain a delegated, DPoP-bound access token for the agent to act with."""
+    if TOKEN_MODE == "pingfederate":
+        logger.info("Acquiring delegated token via PingFederate token exchange")
+        return _acquire_pingfederate()
+    logger.info("Acquiring delegated token via local demo IdP (TOKEN_MODE=local)")
+    return _acquire_local()

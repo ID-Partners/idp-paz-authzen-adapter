@@ -2,27 +2,27 @@
 Bank MCP service.
 
 Exposes a small set of retail-banking tools over the Model Context Protocol
-(streamable HTTP transport). Before performing ANY state-changing or
-sensitive-read action, each tool asks the AuthZEN PDP (the Go `authzen-adapter`
-in front of Ping Authorize) for a decision. If policy denies, the tool returns a
-human-readable denial instead of acting — so the AI agent can explain to the
-user why it couldn't proceed.
+(streamable HTTP transport). It holds **no authorization policy of its own** —
+that moved to the Kong gateway. This MCP server itself sits behind Kong (PEP #1),
+and each tool calls the Bank REST API **through Kong (PEP #2)**, forwarding the
+caller's delegated identity. Ping Authorize (via the AuthZEN adapter) is consulted
+at both gateway hops.
 
 Scenario the tools support:
   An existing customer (Alice) asks an AI agent to open a new savings account
   with her bank and then move an opening deposit into it. Opening the account is
-  routine; the payment is governed by Ping Authorize policy (e.g. amount limits,
-  KYC, agent-channel rules).
+  routine; the payment is governed by policy at the Bank API edge (amount limits,
+  KYC, agent-channel rules) — enforced by Kong, not by this server.
 """
 from __future__ import annotations
 
 import logging
 import os
+from typing import Any
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
 
-import pdp
-from bank_store import store
+import rs_client
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -37,9 +37,10 @@ mcp = FastMCP(
         "Retail banking tools for an AI assistant acting on behalf of a bank "
         "customer. Use list_accounts to discover a customer's accounts, "
         "open_account to open a new account, get_balance to read a balance, and "
-        "make_payment to move money between accounts. Every action is subject to "
-        "the bank's authorization policy; a tool may return a POLICY DENIED "
-        "result, which you must relay to the customer without retrying."
+        "make_payment to move money between accounts. Every action is authorized "
+        "by the bank's policy gateway; a tool may return \"authorized\": false "
+        "with a POLICY DENIED message, which you must relay to the customer "
+        "without retrying."
     ),
     host=HOST,
     port=PORT,
@@ -47,73 +48,51 @@ mcp = FastMCP(
 )
 
 
-def _denied(decision: pdp.Decision) -> str:
-    return f"POLICY DENIED by Ping Authorize: {decision.reason}"
+def _incoming_token(ctx: Context | None, principal: str) -> str:
+    """The delegated token to forward to the Bank API through Kong.
+
+    Prefer the access token that arrived on the inbound MCP request (true
+    end-to-end identity pass-through). Fall back to a claims-only token carrying
+    the principal + agent so PEP #2 still has an identity to authorize.
+    """
+    try:
+        req = ctx.request_context.request  # type: ignore[union-attr]
+        auth = req.headers.get("authorization") if req else None
+        if auth and " " in auth:
+            return auth.split(" ", 1)[1]
+    except Exception:  # noqa: BLE001 - transport may not expose the raw request
+        pass
+    return rs_client.mint_claims_token(principal)
 
 
 @mcp.tool()
-async def list_accounts(customer_id: str) -> dict:
+async def list_accounts(customer_id: str, ctx: Context = None) -> dict:
     """List the accounts held by a customer.
 
     Args:
         customer_id: The bank customer identifier, e.g. "cust-alice".
     """
-    customer = store.get_customer(customer_id)
-    if customer is None:
-        return {"error": f"Unknown customer {customer_id}"}
-
-    decision = await pdp.evaluate(
-        action="list_accounts",
-        resource_type="customer",
-        resource_id=customer_id,
-        on_behalf_of=customer_id,
-        resource_properties={"kyc_verified": customer.kyc_verified},
-    )
-    if decision.denied:
-        return {"authorized": False, "message": _denied(decision)}
-
-    return {
-        "authorized": True,
-        "policy_reason": decision.reason,
-        "customer": {"id": customer.id, "name": customer.name},
-        "accounts": [a.to_dict() for a in store.list_accounts(customer_id)],
-    }
+    token = _incoming_token(ctx, customer_id)
+    resp = await rs_client.call("GET", f"/customers/{customer_id}/accounts", token)
+    return rs_client.summarize(resp)
 
 
 @mcp.tool()
-async def get_balance(customer_id: str, account_id: str) -> dict:
+async def get_balance(customer_id: str, account_id: str, ctx: Context = None) -> dict:
     """Get the balance of one of the customer's accounts.
 
     Args:
         customer_id: The bank customer identifier.
         account_id: The account to read, e.g. "CHK-1001".
     """
-    acct = store.get_account(account_id)
-    if acct is None or acct.customer_id != customer_id:
-        return {"error": f"Account {account_id} not found for customer {customer_id}"}
-
-    decision = await pdp.evaluate(
-        action="get_balance",
-        resource_type="account",
-        resource_id=account_id,
-        on_behalf_of=customer_id,
-        resource_properties={"account_type": acct.type},
-    )
-    if decision.denied:
-        return {"authorized": False, "message": _denied(decision)}
-
-    return {
-        "authorized": True,
-        "policy_reason": decision.reason,
-        "account_id": acct.id,
-        "balance": acct.balance,
-        "currency": acct.currency,
-    }
+    token = _incoming_token(ctx, customer_id)
+    resp = await rs_client.call("GET", f"/accounts/{account_id}/balance", token)
+    return rs_client.summarize(resp)
 
 
 @mcp.tool()
 async def open_account(customer_id: str, account_type: str = "savings",
-                       nickname: str = "") -> dict:
+                       nickname: str = "", ctx: Context = None) -> dict:
     """Open a new bank account for an existing customer.
 
     Args:
@@ -121,34 +100,16 @@ async def open_account(customer_id: str, account_type: str = "savings",
         account_type: The kind of account to open, e.g. "savings" or "checking".
         nickname: An optional friendly name for the account.
     """
-    customer = store.get_customer(customer_id)
-    if customer is None:
-        return {"error": f"Unknown customer {customer_id}"}
-
-    decision = await pdp.evaluate(
-        action="open_account",
-        resource_type="account",
-        resource_id=f"new:{account_type}",
-        on_behalf_of=customer_id,
-        resource_properties={"account_type": account_type},
-        context={"kyc_verified": customer.kyc_verified},
-    )
-    if decision.denied:
-        return {"authorized": False, "message": _denied(decision)}
-
-    acct = store.open_account(customer_id, account_type, nickname)
-    return {
-        "authorized": True,
-        "policy_reason": decision.reason,
-        "message": f"Opened {account_type} account {acct.id} for {customer.name}.",
-        "account": acct.to_dict(),
-    }
+    token = _incoming_token(ctx, customer_id)
+    resp = await rs_client.call("POST", "/accounts", token, json_body={
+        "customer_id": customer_id, "account_type": account_type, "nickname": nickname})
+    return rs_client.summarize(resp)
 
 
 @mcp.tool()
 async def make_payment(customer_id: str, from_account: str, to_account: str,
                        amount: float, currency: str = "AUD",
-                       description: str = "") -> dict:
+                       description: str = "", ctx: Context = None) -> dict:
     """Move money from one of the customer's accounts to another account.
 
     Args:
@@ -159,49 +120,16 @@ async def make_payment(customer_id: str, from_account: str, to_account: str,
         currency: ISO currency code, default AUD.
         description: Optional payment reference.
     """
-    src = store.get_account(from_account)
-    if src is None or src.customer_id != customer_id:
-        return {"error": f"Source account {from_account} not found for customer {customer_id}"}
-    dst = store.get_account(to_account)
-    if dst is None:
-        return {"error": f"Destination account {to_account} not found"}
-
-    decision = await pdp.evaluate(
-        action="make_payment",
-        resource_type="account",
-        resource_id=from_account,
-        on_behalf_of=customer_id,
-        resource_properties={
-            "from_account": from_account,
-            "to_account": to_account,
-            "account_type": src.type,
-        },
-        context={
-            "amount": amount,
-            "currency": currency,
-            "description": description,
-            "internal_transfer": dst.customer_id == customer_id,
-        },
-    )
-    if decision.denied:
-        return {"authorized": False, "message": _denied(decision)}
-
-    try:
-        store.transfer(from_account, to_account, amount)
-    except ValueError as exc:
-        return {"authorized": True, "success": False, "message": str(exc)}
-
-    return {
-        "authorized": True,
-        "success": True,
-        "policy_reason": decision.reason,
-        "message": f"Transferred {amount:.2f} {currency} from {from_account} to {to_account}.",
-        "from_balance": src.balance,
-        "to_balance": dst.balance,
-    }
+    token = _incoming_token(ctx, customer_id)
+    resp = await rs_client.call("POST", "/payments", token, json_body={
+        "customer_id": customer_id, "from_account": from_account,
+        "to_account": to_account, "amount": amount, "currency": currency,
+        "description": description})
+    return rs_client.summarize(resp)
 
 
 if __name__ == "__main__":
-    logger.info("Starting Bank MCP server on %s:%s (PDP=%s)", HOST, PORT, pdp.AUTHZEN_PDP_URL)
+    logger.info("Starting Bank MCP server on %s:%s (Bank API via %s)",
+                HOST, PORT, rs_client.BANK_API_BASE_URL)
     # Streamable HTTP transport -> tools reachable at http://<host>:<port>/mcp
     mcp.run(transport="streamable-http")

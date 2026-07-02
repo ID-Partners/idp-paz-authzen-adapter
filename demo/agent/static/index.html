@@ -8,6 +8,7 @@
   :root {
     --bg:#0d1117; --panel:#161b22; --border:#2d333b; --text:#e6edf3;
     --muted:#9198a1; --accent:#4493f8; --ok:#3fb950; --deny:#f85149; --tool:#d29922;
+    --id:#a371f7;
   }
   * { box-sizing:border-box; }
   body { margin:0; font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;
@@ -39,6 +40,16 @@
   .step.agent .label { color:var(--accent); }
   .step.tool_call .label { color:var(--tool); }
   .step.connect { border-style:dashed; }
+  .step.identity { border-left:3px solid var(--id); }
+  .step.identity .label { color:var(--id); }
+  .chain { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-top:8px;
+           font-size:13px; }
+  .chain .who { background:#0b0f14; border:1px solid var(--border); border-radius:6px;
+                padding:4px 10px; }
+  .chain .who b { color:var(--id); }
+  .chain .arrow { color:var(--muted); }
+  .meta { color:var(--muted); font-size:12px; margin-top:6px; font-family:ui-monospace,Menlo,monospace; }
+  .pep { font-size:11px; color:var(--muted); margin-left:6px; }
   .step pre { margin:6px 0 0; background:#0b0f14; border-radius:6px; padding:10px;
               overflow:auto; font-size:12px; color:#c9d1d9; }
   .decision { display:inline-flex; align-items:center; gap:6px; font-weight:600;
@@ -54,14 +65,17 @@
 <body>
 <header>
   <h1>🏦 Northwind Bank — AI Account Assistant</h1>
-  <span class="tag">AWS AgentCore-shaped agent · MCP tools · Ping Authorize via AuthZEN PDP</span>
+  <span class="tag">Agent identity · RFC 8693 token exchange · DPoP · Kong PDP enforcement (MCP + API)</span>
 </header>
 <div class="wrap">
   <div class="arch">
-    <span><b>Agent</b> (AgentCore /invocations · Claude)</span>
-    <span>→ <b>MCP</b> Bank service</span>
-    <span>→ <b>AuthZEN PDP</b> adapter</span>
-    <span>→ <b>Ping Authorize</b></span>
+    <span><b>Agent</b> (Claude)</span>
+    <span>→ <b>PingFederate</b> token exchange</span>
+    <span>→ <b>Kong PEP #1</b> (MCP edge)</span>
+    <span>→ <b>MCP</b> tools</span>
+    <span>→ <b>Kong PEP #2</b> (API edge)</span>
+    <span>→ <b>Bank API</b></span>
+    <span>→ <b>AuthZEN PDP</b> → <b>Ping Authorize</b></span>
   </div>
 
   <div class="examples">
@@ -100,8 +114,22 @@ function pretty(o){ return esc(typeof o === 'string' ? o : JSON.stringify(o, nul
 
 function render(steps) {
   for (const s of steps) {
-    if (s.type === 'connect') {
-      out.appendChild(el('step connect', `<div class="label">MCP connect</div>${esc(s.detail)}`));
+    if (s.type === 'auth') {
+      out.appendChild(el('step identity',
+        `<div class="label">① ${esc(s.title || 'Agent authenticates')}</div>${esc(s.detail)}`));
+    } else if (s.type === 'token_exchange') {
+      const jkt = s.cnf_jkt ? esc(String(s.cnf_jkt).slice(0,16)) + '…' : '—';
+      const chain = `<div class="chain">
+          <span class="who">principal <b>${esc(s.sub||'?')}</b></span>
+          <span class="arrow">◀ acts for ◀</span>
+          <span class="who">agent <b>${esc(s.act||'?')}</b></span>
+        </div>
+        <div class="meta">token: sub=${esc(s.sub||'?')} · act.sub=${esc(s.act||'?')} · scope=${esc(s.scope||'')}</div>
+        <div class="meta">DPoP cnf.jkt=${jkt} · mode=${esc(s.mode||'')} · delegation (not impersonation)</div>`;
+      out.appendChild(el('step identity',
+        `<div class="label">② ${esc(s.title || 'Token exchange (RFC 8693)')}</div>${esc(s.detail)}${chain}`));
+    } else if (s.type === 'connect') {
+      out.appendChild(el('step connect', `<div class="label">Gateway connect (PEP #1)</div>${esc(s.detail)}`));
     } else if (s.type === 'agent') {
       out.appendChild(el('step agent', `<div class="label">Agent</div>${esc(s.text)}`));
     } else if (s.type === 'tool_call') {
@@ -109,9 +137,10 @@ function render(steps) {
         `<div class="label">Tool call → ${esc(s.name)}</div><pre>${pretty(s.input)}</pre>`));
     } else if (s.type === 'tool_result') {
       const allowed = s.authorized;
+      const pep = s.pep ? `<span class="pep">at ${esc(s.pep)}</span>` : '';
       let badge = '';
-      if (allowed === true) badge = `<span class="decision allow">✔ Ping Authorize: PERMIT</span>`;
-      else if (allowed === false) badge = `<span class="decision deny">✘ Ping Authorize: DENY</span>`;
+      if (allowed === true) badge = `<span class="decision allow">✔ PERMIT</span>${pep}`;
+      else if (allowed === false) badge = `<span class="decision deny">✘ DENY</span>${pep}`;
       const reason = s.policy_reason ? `<div class="reason">Policy reason: ${esc(s.policy_reason)}</div>` : '';
       out.appendChild(el('step tool_result',
         `<div class="label">Result ← ${esc(s.name)}</div>${badge}${reason}<pre>${pretty(s.result)}</pre>`));
@@ -127,7 +156,7 @@ form.addEventListener('submit', async (e) => {
   out.appendChild(el('step agent', `<div class="label">You</div>${esc(prompt)}`));
   input.value = '';
   sendBtn.disabled = true;
-  const spin = el('step spinner', 'Agent is working (connecting to MCP, calling tools, checking Ping Authorize policy)…');
+  const spin = el('step spinner', 'Agent is working (authenticating, exchanging tokens, calling tools through the Kong policy gateways)…');
   out.appendChild(spin);
   try {
     const res = await fetch('/invocations', {

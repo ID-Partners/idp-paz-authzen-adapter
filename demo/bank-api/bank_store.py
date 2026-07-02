@@ -2,8 +2,9 @@
 Tiny in-memory "core banking" system for the demo.
 
 Not persistent, not concurrent-safe beyond a process — it exists only to give the
-MCP tools something realistic to act on so the Ping Authorize policy decisions
-have visible effects (accounts get created, balances move).
+Bank API something realistic to act on so the Ping Authorize policy decisions
+(now enforced at the Kong gateway) have visible effects: accounts get created,
+balances move.
 """
 from __future__ import annotations
 
