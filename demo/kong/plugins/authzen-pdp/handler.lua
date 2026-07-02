@@ -111,18 +111,19 @@ local function map_request(conf)
   local rprops = {}
 
   if conf.style == "mcp" then
-    rtype, rid, action = "mcp-service", "northwind-bank", "access_mcp"
-    -- best-effort: refine to the invoked tool without failing on non-JSON bodies
+    -- Only real tool invocations are policy-gated. The MCP handshake
+    -- (initialize / tools/list / notifications / ping) and the SSE GET stream
+    -- are allowed through on a valid token so an authenticated agent can always
+    -- connect; fine-grained policy still applies to tools/call here and to the
+    -- banking operations at PEP #2. action=__allow__ signals "skip the PDP".
+    rtype, rid, action = "mcp-service", "northwind-bank", "__allow__"
     local ok, body = pcall(function() return kong.request.get_raw_body() end)
     if ok and body then
       local rpc = cjson.decode(body)
-      if type(rpc) == "table" and rpc.method then
-        if rpc.method == "tools/call" and rpc.params and rpc.params.name then
-          action = "invoke_tool"
-          rtype, rid = "mcp-tool", rpc.params.name
-        else
-          action = "mcp:" .. tostring(rpc.method)
-        end
+      if type(rpc) == "table" and rpc.method == "tools/call"
+         and rpc.params and rpc.params.name then
+        action = "invoke_tool"
+        rtype, rid = "mcp-tool", rpc.params.name
       end
     end
     return action, rtype, rid, rprops, ctx
@@ -222,6 +223,18 @@ function AuthzenPDP:access(conf)
 
   -- 3) build AuthZEN evaluation request
   local action, rtype, rid, rprops, ctx = map_request(conf)
+
+  -- MCP handshake / non-tool traffic: allow on a valid token, skip the PDP.
+  if action == "__allow__" then
+    kong.service.request.set_header("X-Auth-Principal", sub or "")
+    kong.service.request.set_header("X-Auth-Agent", act or "")
+    kong.service.request.set_header("X-Auth-Scope", scope or "")
+    local c = kong.ctx.plugin
+    c.pep, c.decision, c.action = pep, "PERMIT", "mcp-handshake"
+    c.reason = "MCP handshake allowed (authenticated); policy applies to tool calls."
+    return
+  end
+
   local authzen_req = {
     subject = {
       type = "agent",
