@@ -117,78 +117,108 @@ async def run_agent(prompt: str, session_id: str = "demo") -> dict[str, Any]:
         dpop_note = "static DPoP header (SDK has no auth hook)"
 
     logger.info("Connecting to MCP server at %s (%s)", MCP_SERVER_URL, dpop_note)
-    async with streamablehttp_client(MCP_SERVER_URL, **client_kwargs) as (read, write, _):
-        async with ClientSession(read, write) as session:
-            await session.initialize()
-            listed = await session.list_tools()
-            tools = _mcp_tools_to_anthropic(listed.tools)
-            transcript.append({
-                "type": "connect",
-                "detail": f"Connected via Kong gateway (PEP #1) to MCP service "
-                          f"'{MCP_SERVER_URL}' using {dpop_note}. "
-                          f"Discovered tools: {', '.join(t['name'] for t in tools)}.",
-            })
+    try:
+        async with streamablehttp_client(MCP_SERVER_URL, **client_kwargs) as (read, write, _):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                listed = await session.list_tools()
+                tools = _mcp_tools_to_anthropic(listed.tools)
+                transcript.append({
+                    "type": "connect",
+                    "detail": f"Connected via Kong gateway (PEP #1) to MCP service "
+                              f"'{MCP_SERVER_URL}' using {dpop_note}. "
+                              f"Discovered tools: {', '.join(t['name'] for t in tools)}.",
+                })
 
-            messages: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
+                messages: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
 
-            for _turn in range(MAX_TURNS):
-                resp = client.messages.create(
-                    model=ANTHROPIC_MODEL,
-                    max_tokens=1024,
-                    system=SYSTEM_PROMPT,
-                    tools=tools,
-                    messages=messages,
-                )
+                for _turn in range(MAX_TURNS):
+                    resp = client.messages.create(
+                        model=ANTHROPIC_MODEL,
+                        max_tokens=1024,
+                        system=SYSTEM_PROMPT,
+                        tools=tools,
+                        messages=messages,
+                    )
 
-                assistant_content: list[dict[str, Any]] = []
-                tool_uses = []
-                for block in resp.content:
-                    if block.type == "text":
-                        assistant_content.append({"type": "text", "text": block.text})
-                        if block.text.strip():
-                            transcript.append({"type": "agent", "text": block.text})
-                    elif block.type == "tool_use":
-                        assistant_content.append({
-                            "type": "tool_use", "id": block.id,
-                            "name": block.name, "input": block.input,
+                    assistant_content: list[dict[str, Any]] = []
+                    tool_uses = []
+                    for block in resp.content:
+                        if block.type == "text":
+                            assistant_content.append({"type": "text", "text": block.text})
+                            if block.text.strip():
+                                transcript.append({"type": "agent", "text": block.text})
+                        elif block.type == "tool_use":
+                            assistant_content.append({
+                                "type": "tool_use", "id": block.id,
+                                "name": block.name, "input": block.input,
+                            })
+                            tool_uses.append(block)
+
+                    messages.append({"role": "assistant", "content": assistant_content})
+
+                    if resp.stop_reason != "tool_use":
+                        break
+
+                    tool_results = []
+                    for tu in tool_uses:
+                        transcript.append({
+                            "type": "tool_call",
+                            "name": tu.name,
+                            "input": tu.input,
                         })
-                        tool_uses.append(block)
+                        result = await session.call_tool(tu.name, tu.input)
+                        text = _extract_text(result.content)
+                        parsed = _safe_json(text)
+                        transcript.append({
+                            "type": "tool_result",
+                            "name": tu.name,
+                            "authorized": (parsed or {}).get("authorized"),
+                            "policy_reason": (parsed or {}).get("policy_reason")
+                                             or (parsed or {}).get("message"),
+                            "pep": (parsed or {}).get("pep"),
+                            "pep_action": (parsed or {}).get("pep_action"),
+                            "result": parsed if parsed is not None else text,
+                        })
+                        tool_results.append({
+                            "type": "tool_result",
+                            "tool_use_id": tu.id,
+                            "content": text,
+                        })
 
-                messages.append({"role": "assistant", "content": assistant_content})
-
-                if resp.stop_reason != "tool_use":
-                    break
-
-                tool_results = []
-                for tu in tool_uses:
-                    transcript.append({
-                        "type": "tool_call",
-                        "name": tu.name,
-                        "input": tu.input,
-                    })
-                    result = await session.call_tool(tu.name, tu.input)
-                    text = _extract_text(result.content)
-                    parsed = _safe_json(text)
-                    transcript.append({
-                        "type": "tool_result",
-                        "name": tu.name,
-                        "authorized": (parsed or {}).get("authorized"),
-                        "policy_reason": (parsed or {}).get("policy_reason")
-                                         or (parsed or {}).get("message"),
-                        "result": parsed if parsed is not None else text,
-                    })
-                    tool_results.append({
-                        "type": "tool_result",
-                        "tool_use_id": tu.id,
-                        "content": text,
-                    })
-
-                messages.append({"role": "user", "content": tool_results})
+                    messages.append({"role": "user", "content": tool_results})
+    except Exception as exc:  # noqa: BLE001 - surface a clean gateway denial to the UI
+        detail = _describe_connect_error(exc)
+        logger.warning("MCP connect/session failed: %s", exc)
+        transcript.append({"type": "connect_error", "detail": detail})
+        return {
+            "session_id": session_id,
+            "final": "I authenticated and obtained a delegated, DPoP-bound token, but the "
+                     "policy gateway refused the MCP connection, so I couldn't run any "
+                     "banking tools. " + detail,
+            "transcript": transcript,
+        }
 
     final_text = "\n\n".join(
         s["text"] for s in transcript if s["type"] == "agent"
     ) or "Done."
     return {"session_id": session_id, "final": final_text, "transcript": transcript}
+
+
+def _describe_connect_error(exc: BaseException) -> str:
+    """Turn an MCP transport failure into a clear, demo-friendly explanation."""
+    text = str(exc)
+    for sub in (getattr(exc, "exceptions", None) or []):
+        text += " | " + str(sub)
+    if "403" in text or "Forbidden" in text:
+        return ("PEP #1 (Kong, MCP edge) returned 403 Forbidden — the PDP denied MCP "
+                "access. In this demo that happens when Ping Authorize is not yet "
+                "reachable and the gateway fails closed. The identity and token "
+                "exchange steps above completed successfully.")
+    if "401" in text or "Unauthorized" in text:
+        return ("PEP #1 rejected the token (401) — the gateway could not validate the "
+                "delegated/DPoP-bound token.")
+    return f"Could not open the MCP session via the gateway: {text[:200]}"
 
 
 def _safe_json(text: str) -> dict[str, Any] | None:

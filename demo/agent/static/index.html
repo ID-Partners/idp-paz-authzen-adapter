@@ -244,6 +244,12 @@ function render(steps) {
       out.appendChild(el('step connect',
         `<div class="label">③ Gateway connect · PEP #1 (MCP edge)</div>${esc(s.detail)}
          <div class="explain">Kong authenticated the DPoP-bound token and asked the PDP to permit MCP access before the session opened.</div>`));
+    } else if (s.type === 'connect_error') {
+      setNode('pep1','deny','deny');
+      out.appendChild(el('step tool_result',
+        `<div class="label">🛡️ Gateway connect · PEP #1 (MCP edge)</div>
+         <span class="decision deny">✘ DENY</span>
+         <div class="reason">${esc(s.detail)}</div>`));
     } else if (s.type === 'agent') {
       out.appendChild(el('step agent', `<div class="label">💬 Agent</div>${esc(s.text)}`));
     } else if (s.type === 'tool_call') {
