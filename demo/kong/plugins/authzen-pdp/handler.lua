@@ -111,19 +111,17 @@ local function map_request(conf)
   local rprops = {}
 
   if conf.style == "mcp" then
-    -- Only real tool invocations are policy-gated. The MCP handshake
-    -- (initialize / tools/list / notifications / ping) and the SSE GET stream
-    -- are allowed through on a valid token so an authenticated agent can always
-    -- connect; fine-grained policy still applies to tools/call here and to the
-    -- banking operations at PEP #2. action=__allow__ signals "skip the PDP".
+    -- PEP #1 authorizes the agent's ACCESS TO THE MCP SERVICE, evaluated once on
+    -- the MCP `initialize` handshake (action=access_mcp). All other MCP traffic
+    -- (tools/list, tools/call, notifications, ping, SSE GET) is allowed through
+    -- on a valid token so the JSON-RPC session isn't broken by a mid-stream 403;
+    -- fine-grained per-operation policy is enforced at PEP #2 (the Bank API edge).
     rtype, rid, action = "mcp-service", "northwind-bank", "__allow__"
     local ok, body = pcall(function() return kong.request.get_raw_body() end)
     if ok and body then
       local rpc = cjson.decode(body)
-      if type(rpc) == "table" and rpc.method == "tools/call"
-         and rpc.params and rpc.params.name then
-        action = "invoke_tool"
-        rtype, rid = "mcp-tool", rpc.params.name
+      if type(rpc) == "table" and rpc.method == "initialize" then
+        action = "access_mcp"
       end
     end
     return action, rtype, rid, rprops, ctx
