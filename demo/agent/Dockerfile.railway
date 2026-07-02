@@ -17,4 +17,6 @@ ENV PORT=8000
 EXPOSE 8000
 
 # Start the AgentCore-compatible HTTP host (serves UI + /invocations + /ping).
-CMD ["sh", "-c", "uvicorn app:app --host :: --port ${PORT:-8000}"]
+# Bind 0.0.0.0: the public edge reaches the agent over IPv4 (matches the
+# previously working deploy); the agent needs no private-network inbound.
+CMD ["sh", "-c", "uvicorn app:app --host 0.0.0.0 --port ${PORT:-8000}"]
