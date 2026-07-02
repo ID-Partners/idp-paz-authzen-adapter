@@ -129,13 +129,15 @@ local function map_request(conf)
   end
 
   -- style == "rest"
-  local cust = path:match("^/customers/([^/]+)/accounts")
-  local acct = path:match("^/accounts/([^/]+)/balance")
+  -- Patterns are prefix-tolerant: Kong strips the route prefix (/bank) but the
+  -- plugin sees the original request path, so we match without anchoring at ^.
+  local cust = path:match("/customers/([^/]+)/accounts")
+  local acct = path:match("/accounts/([^/]+)/balance")
   if cust then
     action, rtype, rid = "list_accounts", "customer", cust
   elseif acct then
     action, rtype, rid = "get_balance", "account", acct
-  elseif path:match("^/accounts") and method == "POST" then
+  elseif path:match("/accounts") and method == "POST" then
     action, rtype = "open_account", "account"
     local ok, body = pcall(function() return kong.request.get_body() end)
     if ok and type(body) == "table" then
@@ -144,7 +146,7 @@ local function map_request(conf)
     else
       rid = "new:savings"
     end
-  elseif path:match("^/payments") and method == "POST" then
+  elseif path:match("/payments") and method == "POST" then
     action, rtype = "make_payment", "account"
     local ok, body = pcall(function() return kong.request.get_body() end)
     if ok and type(body) == "table" then
