@@ -134,5 +134,8 @@ if __name__ == "__main__":
     import uvicorn
 
     port = int(os.environ.get("PORT", "8070"))
-    logger.info("Starting Bank API (Resource Server) on 0.0.0.0:%s", port)
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    # Railway private networking is IPv6-only; bind :: there (set HOST=::).
+    # Locally, "::" on a dual-stack host still accepts IPv4.
+    host = os.environ.get("HOST", "0.0.0.0")
+    logger.info("Starting Bank API (Resource Server) on %s:%s", host, port)
+    uvicorn.run(app, host=host, port=port)

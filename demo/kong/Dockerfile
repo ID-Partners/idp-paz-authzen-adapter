@@ -17,8 +17,9 @@ USER kong
 ENV KONG_DATABASE=off
 ENV KONG_DECLARATIVE_CONFIG=/kong/kong.yml
 ENV KONG_PLUGINS=bundled,authzen-pdp
-ENV KONG_PROXY_LISTEN=0.0.0.0:8000
-ENV KONG_ADMIN_LISTEN=0.0.0.0:8001
+# Listen on both IPv4 (compose) and IPv6 (Railway private networking is IPv6-only).
+ENV KONG_PROXY_LISTEN="0.0.0.0:8000, [::]:8000"
+ENV KONG_ADMIN_LISTEN="0.0.0.0:8001, [::]:8001"
 
 EXPOSE 8000 8001
 ENTRYPOINT ["/custom-entrypoint.sh"]
