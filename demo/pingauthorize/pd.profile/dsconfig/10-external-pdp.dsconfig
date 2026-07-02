@@ -2,22 +2,14 @@
 # Points PingAuthorize at the Policy Editor (PAP) in EXTERNAL PDP mode, so
 # policy authored/managed in the PAP GUI drives decisions immediately.
 #
-# The PAP presents a self-signed cert (CN=localhost from demo setup); PAZ reaches
-# it over the Railway private network as pingauthorize-pap.railway.internal, so
-# we give this one link a blind-trust manager to accept that cert.
-#
 # decision-node is the well-known id of the "Global Decision Point" root node
 # seeded by PAP demo-mode setup (same constant used across Ping tutorials).
-
-create-trust-manager-provider --provider-name "PAP Blind Trust" \
-    --type blind-trust --set enabled:true
 
 create-external-server --server-name "Policy Editor" --type policy \
     --set "base-url:https://pingauthorize-pap.railway.internal:1443" \
     --set "shared-secret:2FederateM0re" \
     --set "decision-node:e51688ff-1dc9-4b6c-bb36-8af64d02e9d1" \
-    --set "branch:Default Policies" \
-    --set "trust-manager-provider:PAP Blind Trust"
+    --set "branch:Default Policies"
 
 set-policy-decision-service-prop --set pdp-mode:external \
     --set "policy-server:Policy Editor" \
