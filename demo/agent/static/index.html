@@ -112,6 +112,33 @@
   .legend dt { color:var(--text); font-weight:600; }
   .legend dd { margin:2px 0 8px; color:var(--muted); }
   @media (max-width:640px){ .legend .body { grid-template-columns:1fr; } }
+
+  /* standard tag */
+  .std { display:inline-block; font-size:10px; font-weight:700; letter-spacing:.3px;
+         padding:1px 7px; border-radius:10px; margin-left:6px; vertical-align:middle;
+         background:rgba(57,197,207,.14); color:var(--pdp); }
+  /* expandable wire detail */
+  details.wire { margin-top:10px; border:1px solid var(--border); border-radius:8px; background:var(--panel2); }
+  details.wire > summary { cursor:pointer; padding:8px 10px; font-size:11px; color:var(--muted);
+                           text-transform:uppercase; letter-spacing:.5px; list-style:none; }
+  details.wire > summary::before { content:'▸ '; color:var(--muted); }
+  details.wire[open] > summary::before { content:'▾ '; }
+  details.wire[open] > summary { border-bottom:1px solid var(--border); }
+  .wblock { padding:8px 10px; }
+  .wblock + .wblock { border-top:1px solid var(--border); }
+  .wlabel { font-size:11px; color:var(--text); margin-bottom:4px; }
+  .wlabel .desc { color:var(--muted); font-weight:400; }
+  .wblock pre { margin:0; background:#06090d; border-radius:6px; padding:8px 10px;
+                overflow:auto; font-size:11.5px; color:#c9d1d9; line-height:1.45; }
+  .wire-http { font-family:ui-monospace,Menlo,monospace; font-size:11.5px; color:#7ee787;
+               background:#06090d; border-radius:6px 6px 0 0; padding:8px 10px; }
+  /* components reference */
+  .components { width:100%; border-collapse:collapse; font-size:12.5px; }
+  .components th, .components td { text-align:left; padding:7px 10px; border-bottom:1px solid var(--border); vertical-align:top; }
+  .components th { color:var(--muted); font-weight:600; font-size:11px; text-transform:uppercase; letter-spacing:.4px; }
+  .components td.c1 { font-weight:600; white-space:nowrap; }
+  .components .role { color:var(--muted); }
+  .components a { color:var(--pdp); text-decoration:none; }
 </style>
 </head>
 <body>
@@ -152,17 +179,38 @@
   <div id="transcript" class="transcript"></div>
 
   <details class="legend">
-    <summary>What am I looking at? — actors &amp; protocols</summary>
-    <dl class="body">
-      <div><dt>Principal</dt><dd>The human the agent acts for (Alice, <code>sub</code> in the token).</dd></div>
-      <div><dt>Agent</dt><dd>The AI software taking the action (<code>act.sub</code> in the token) — a distinct identity from the human.</dd></div>
-      <div><dt>Agent Operator</dt><dd>The org that runs the agent; the OAuth <code>client_id</code>.</dd></div>
-      <div><dt>Token exchange (RFC 8693)</dt><dd>Swaps the principal's token + the agent's token for a <em>delegated</em> token carrying both — delegation, not impersonation.</dd></div>
-      <div><dt>DPoP (RFC 9449)</dt><dd>Sender-constraint: the token is bound to the agent's key (<code>cnf.jkt</code>); every call carries a fresh signed proof.</dd></div>
-      <div><dt>RAR (RFC 9396)</dt><dd><code>authorization_details</code> — fine-grained grant (this payment, this cap) beyond coarse scopes.</dd></div>
-      <div><dt>PEP</dt><dd>Policy Enforcement Point — the Kong gateway that intercepts each call.</dd></div>
-      <div><dt>PDP</dt><dd>Policy Decision Point — Ping Authorize (via the AuthZEN adapter) that returns PERMIT/DENY.</dd></div>
-    </dl>
+    <summary>Components &amp; standards — what's talking to what</summary>
+    <div style="padding:0 14px 14px">
+      <table class="components">
+        <thead><tr><th>Component</th><th>Role</th><th>Speaks (standard)</th></tr></thead>
+        <tbody>
+          <tr><td class="c1">🤖 Bank Agent</td><td class="role">AI agent (Claude); AgentCore-shaped. Holds its own identity + DPoP key.</td>
+              <td>OAuth 2.0 client · <a href="https://www.rfc-editor.org/rfc/rfc8693" target="_blank">RFC 8693</a> · <a href="https://www.rfc-editor.org/rfc/rfc9449" target="_blank">RFC 9449 DPoP</a> · MCP client</td></tr>
+          <tr><td class="c1">🎫 PingFederate</td><td class="role">Authorization Server / IdP. Runs the token exchange, issues the delegated DPoP-bound token.</td>
+              <td>OAuth 2.0 · <a href="https://www.rfc-editor.org/rfc/rfc8693" target="_blank">Token Exchange</a> · <a href="https://www.rfc-editor.org/rfc/rfc9126" target="_blank">PAR</a> · <a href="https://www.rfc-editor.org/rfc/rfc9068" target="_blank">JWT AT</a></td></tr>
+          <tr><td class="c1">🛡️ Kong (PEP #1/#2)</td><td class="role">API gateway = Policy Enforcement Point. Validates the token/DPoP, calls the PDP, allows or blocks.</td>
+              <td>HTTP · JWT/DPoP validation · <a href="https://openid.github.io/authzen/" target="_blank">AuthZEN</a> eval to the PDP</td></tr>
+          <tr><td class="c1">🧰 Bank MCP</td><td class="role">Model Context Protocol server exposing banking tools to the agent; forwards the delegated identity onward.</td>
+              <td><a href="https://modelcontextprotocol.io" target="_blank">MCP</a> (JSON-RPC over streamable HTTP)</td></tr>
+          <tr><td class="c1">🏦 Bank API</td><td class="role">Resource Server. Executes the banking operation; records the sub/act delegation chain for audit.</td>
+              <td>REST/HTTP · consumes the delegated token</td></tr>
+          <tr><td class="c1">⚖️ AuthZEN adapter</td><td class="role">PDP proxy (Go). Translates AuthZEN eval requests into Ping Authorize decision requests.</td>
+              <td><a href="https://openid.github.io/authzen/" target="_blank">AuthZEN Authorization API</a></td></tr>
+          <tr><td class="c1">🧠 Ping Authorize</td><td class="role">Policy Decision Point. Evaluates policy and returns PERMIT/DENY (+ reason).</td>
+              <td>PingAuthorize JSON PDP API (<code>/governance-engine</code>)</td></tr>
+        </tbody>
+      </table>
+      <dl class="body" style="margin-top:14px">
+        <div><dt>Principal <span class="std">sub</span></dt><dd>The human the agent acts for (Alice).</dd></div>
+        <div><dt>Agent <span class="std">act.sub</span></dt><dd>The AI software taking the action — a distinct identity from the human.</dd></div>
+        <div><dt>Agent Operator <span class="std">client_id</span></dt><dd>The org that runs the agent (the OAuth client).</dd></div>
+        <div><dt>Token Exchange <span class="std">RFC 8693</span></dt><dd>Swaps principal + agent tokens for one <em>delegated</em> token carrying both — delegation, not impersonation.</dd></div>
+        <div><dt>DPoP <span class="std">RFC 9449</span></dt><dd>Sender-constraint: token bound to the agent's key (<code>cnf.jkt</code>); each call carries a fresh signed proof.</dd></div>
+        <div><dt>RAR <span class="std">RFC 9396</span></dt><dd><code>authorization_details</code> — fine-grained grant (this payment, this cap) beyond coarse scopes.</dd></div>
+        <div><dt>AuthZEN <span class="std">OpenID</span></dt><dd>Standard request/response for asking a PDP "can this subject do this action on this resource?"</dd></div>
+        <div><dt>MCP</dt><dd>Model Context Protocol — how the agent discovers and calls the bank's tools (JSON-RPC).</dd></div>
+      </dl>
+    </div>
   </details>
 </div>
 
@@ -180,6 +228,38 @@ function el(cls, html) { const d = document.createElement('div'); d.className = 
 function esc(s){ return String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
 function pretty(o){ return esc(typeof o === 'string' ? o : JSON.stringify(o, null, 2)); }
 function short(s, n=22){ s=String(s||''); return s.length>n ? s.slice(0,n)+'…' : s; }
+
+// running identity context, captured at token exchange, used to reconstruct
+// the AuthZEN evaluation requests that the Kong PEPs send to the PDP.
+const CTX = { sub:null, act:null, scope:null, client_id:null };
+
+function wireDetails(title, blocks){
+  const b = blocks.map(x => {
+    const http = x.http ? `<div class="wire-http">${esc(x.http)}</div>` : '';
+    const desc = x.desc ? ` <span class="desc">— ${esc(x.desc)}</span>` : '';
+    return `<div class="wblock"><div class="wlabel">${x.label}${desc}</div>${http}<pre>${pretty(x.json)}</pre></div>`;
+  }).join('');
+  return `<details class="wire"><summary>${esc(title)}</summary>${b}</details>`;
+}
+function authzenRequest(action, rtype, rid, rprops, ctx){
+  return {
+    subject: { type:'agent', identity: CTX.act || CTX.client_id || 'agent',
+      properties: { on_behalf_of: CTX.sub, agent_type:'ai_assistant', scope: CTX.scope, client_id: CTX.client_id } },
+    action: { name: action },
+    resource: { type: rtype, id: rid, properties: rprops || {} },
+    context: Object.assign({ channel:'ai-agent' }, ctx || {})
+  };
+}
+function toolToAuthzen(name, input){
+  input = input || {};
+  if(name==='list_accounts') return authzenRequest('list_accounts','customer',input.customer_id||'');
+  if(name==='get_balance')  return authzenRequest('get_balance','account',input.account_id||'');
+  if(name==='open_account') return authzenRequest('open_account','account','new:'+(input.account_type||'savings'),{account_type:input.account_type});
+  if(name==='make_payment') return authzenRequest('make_payment','account',input.from_account||'',
+      {from_account:input.from_account,to_account:input.to_account},
+      {amount:input.amount,currency:input.currency||'AUD',description:input.description});
+  return authzenRequest('invoke_tool','mcp-tool',name);
+}
 
 function setNode(node, state, flag){
   const n = document.querySelector(`.node[data-node="${node}"]`);
@@ -230,20 +310,38 @@ function render(steps) {
          <div class="explain">The agent is its own identity and holds a private key; the token it gets next will be bound to that key.</div>`));
     } else if (s.type === 'token_exchange') {
       setNode('idp','done','issued');
+      CTX.sub = s.sub; CTX.act = s.act; CTX.scope = s.scope;
+      CTX.client_id = s.client_id || (s.claims && s.claims.client_id);
       const chain = `<div class="chain">
           <span class="who principal"><div class="k">principal</div><div class="v">${esc(s.sub||'?')}</div></span>
           <span class="arrow2">◀ acts on behalf of ◀</span>
           <span class="who agent"><div class="k">agent (actor)</div><div class="v">${esc(short(s.act,28)||'?')}</div></span>
         </div>`;
+      const wire = wireDetails('wire detail — the actual exchange', [
+        { label:'1 · Token exchange request', desc:'RFC 8693 — POST to the AS token endpoint',
+          http:`POST ${s.te_endpoint||'/as/token.oauth2'}`, json: s.te_request || {} },
+        { label:'2 · DPoP proof', desc:'RFC 9449 — signed by the agent key, sent as the DPoP header',
+          json: s.dpop_example || {} },
+        { label:'3 · Decoded delegated token', desc:'the issued access token (header + claims)',
+          json: { header: s.token_header || {alg:'ES256',typ:'JWT'}, payload: s.claims || {} } },
+      ]);
       out.appendChild(el('step identity',
         `<div class="label">② ${esc(s.title||'Token exchange (RFC 8693)')}</div>${esc(s.detail)}
          ${chain}${tokenPanel(s)}
-         <div class="explain">Delegation, not impersonation: the token names both the human and the agent, so every downstream action is attributable to both.</div>`));
+         <div class="explain">Delegation, not impersonation: the token names both the human and the agent, so every downstream action is attributable to both.</div>${wire}`));
     } else if (s.type === 'connect') {
       setNode('pep1','permit','permit'); setNode('mcp','done');
+      const wire = wireDetails('wire detail — MCP handshake + PEP #1 decision', [
+        { label:'1 · MCP initialize', desc:'JSON-RPC over streamable HTTP, carrying the DPoP-bound token',
+          http:'POST /mcp   Authorization: DPoP <token>   DPoP: <proof>',
+          json:{ jsonrpc:'2.0', id:0, method:'initialize',
+                 params:{ protocolVersion:'2025-11-25', capabilities:{}, clientInfo:{ name:'bank-agent', version:'1' } } } },
+        { label:'2 · AuthZEN evaluation @ PEP #1', desc:'Kong asks the PDP: may this agent open an MCP session?',
+          http:'POST /access/v1/evaluation', json: authzenRequest('access_mcp','mcp-service','northwind-bank') },
+      ]);
       out.appendChild(el('step connect',
         `<div class="label">③ Gateway connect · PEP #1 (MCP edge)</div>${esc(s.detail)}
-         <div class="explain">Kong authenticated the DPoP-bound token and asked the PDP to permit MCP access before the session opened.</div>`));
+         <div class="explain">Kong authenticated the DPoP-bound token and asked the PDP to permit MCP access before the session opened.</div>${wire}`));
     } else if (s.type === 'connect_error') {
       setNode('pep1','deny','deny');
       out.appendChild(el('step tool_result',
@@ -253,9 +351,15 @@ function render(steps) {
     } else if (s.type === 'agent') {
       out.appendChild(el('step agent', `<div class="label">💬 Agent</div>${esc(s.text)}`));
     } else if (s.type === 'tool_call') {
+      const wire = wireDetails('wire detail — MCP call + PEP #2 decision', [
+        { label:'1 · MCP tools/call', desc:'JSON-RPC the agent sends to the MCP server',
+          json:{ jsonrpc:'2.0', id:1, method:'tools/call', params:{ name:s.name, arguments:s.input } } },
+        { label:'2 · AuthZEN evaluation @ PEP #2', desc:'Kong maps the Bank API call to an AuthZEN request for the PDP',
+          http:'POST /access/v1/evaluation', json: toolToAuthzen(s.name, s.input) },
+      ]);
       out.appendChild(el('step tool_call',
         `<div class="label">🧰 Tool call → ${esc(s.name)}</div><pre>${pretty(s.input)}</pre>
-         <div class="hops"><span class="hop">Agent</span><span class="hop">PEP #1</span><span class="hop">MCP</span><span class="hop">PEP #2</span><span class="hop">Bank API</span></div>`));
+         <div class="hops"><span class="hop">Agent</span><span class="hop">PEP #1</span><span class="hop">MCP</span><span class="hop">PEP #2</span><span class="hop">Bank API</span></div>${wire}`));
     } else if (s.type === 'tool_result') {
       const allowed = s.authorized;
       const pep = s.pep ? `<span class="pep">at ${esc(s.pep)}${s.pep_action ? ' · action=' + esc(s.pep_action) : ''}</span>` : '';
@@ -263,8 +367,14 @@ function render(steps) {
       if (allowed === true) { badge = `<span class="decision allow">✔ PERMIT</span>${pep}`; setNode('pep2','permit','permit'); setNode('bankapi','done'); }
       else if (allowed === false) { badge = `<span class="decision deny">✘ DENY</span>${pep}`; setNode('pep2','deny','deny'); }
       const reason = s.policy_reason ? `<div class="reason">Policy reason: ${esc(s.policy_reason)}</div>` : '';
+      const wire = (allowed === true || allowed === false) ? wireDetails('wire detail — PDP decision', [
+        { label:'AuthZEN decision response', desc:'from Ping Authorize via the AuthZEN adapter; Kong enforces it',
+          json:{ decision: allowed, context:{ reason: s.policy_reason || (allowed ? 'Permitted by policy.' : 'Denied by policy.') } } },
+        { label:'Gateway headers', desc:'surfaced by Kong on the proxied response',
+          json:{ 'X-PDP-PEP': s.pep || '', 'X-PDP-Decision': allowed ? 'PERMIT' : 'DENY', 'X-PDP-Action': s.pep_action || '' } },
+      ]) : '';
       out.appendChild(el('step tool_result',
-        `<div class="label">🛡️ Decision ← ${esc(s.name)}</div>${badge}${reason}<pre>${pretty(s.result)}</pre>`));
+        `<div class="label">🛡️ Decision ← ${esc(s.name)}</div>${badge}${reason}<pre>${pretty(s.result)}</pre>${wire}`));
     }
     out.scrollIntoView({behavior:'smooth', block:'end'});
   }

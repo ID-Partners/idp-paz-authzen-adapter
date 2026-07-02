@@ -179,9 +179,28 @@ def _acquire_local() -> AgentCredential:
     # a throwaway signing key for the demo IdP (token signature is not verified
     # by the PDP plugin; the point here is the claim shape + DPoP binding)
     signing_key = _new_key()
-    token = jwt.encode(claims, signing_key, algorithm="ES256")
+    token_header = {"alg": "ES256", "typ": "JWT"}
+    token = jwt.encode(claims, signing_key, algorithm="ES256", headers=token_header)
 
     token_preview = token[:20] + "…" + token[-12:]
+    pub = key.public_key().public_numbers()
+    public_jwk = {"kty": "EC", "crv": "P-256",
+                  "x": _int_to_b64url(pub.x), "y": _int_to_b64url(pub.y)}
+    ath = _b64url(hashlib.sha256(token.encode()).digest())
+    dpop_example = {
+        "header": {"typ": "dpop+jwt", "alg": "ES256", "jwk": public_jwk},
+        "payload": {"jti": str(uuid.uuid4()), "htm": "POST",
+                    "htu": "https://<kong-gateway>/mcp", "iat": now, "ath": ath},
+    }
+    te_request = {
+        "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+        "subject_token": "<principal access token — Alice>",
+        "subject_token_type": "urn:ietf:params:oauth:token-type:access_token",
+        "actor_token": "<agent actor token>",
+        "actor_token_type": "urn:ietf:params:oauth:token-type:access_token",
+        "scope": DEFAULT_SCOPE,
+        "resource": RS_AUDIENCE,
+    }
     steps = [
         {"type": "auth", "title": "Agent authenticates",
          "detail": f"Agent Operator client '{AGENT_CLIENT_ID}' authenticated to the "
@@ -194,7 +213,10 @@ def _acquire_local() -> AgentCredential:
          "sub": PRINCIPAL_SUB, "act": AGENT_ID, "scope": DEFAULT_SCOPE,
          "cnf_jkt": jkt, "aud": RS_AUDIENCE, "client_id": AGENT_CLIENT_ID,
          "authorization_details": _authorization_details(),
-         "token_preview": token_preview, "claims": claims, "mode": "local"},
+         "token_preview": token_preview, "claims": claims,
+         "token_header": token_header, "te_request": te_request,
+         "te_endpoint": "https://<local-demo-idp>/as/token.oauth2",
+         "dpop_example": dpop_example, "mode": "local"},
     ]
     return AgentCredential(access_token=token, principal_sub=PRINCIPAL_SUB,
                            agent_sub=AGENT_ID, scope=DEFAULT_SCOPE, jkt=jkt,
@@ -276,6 +298,29 @@ def _acquire_pingfederate() -> AgentCredential:
         access_token = te.json()["access_token"]
 
     decoded = jwt.decode(access_token, options={"verify_signature": False})
+    try:
+        token_header = jwt.get_unverified_header(access_token)
+    except Exception:  # noqa: BLE001
+        token_header = {"alg": "?", "typ": "at+jwt"}
+    pub = key.public_key().public_numbers()
+    dpop_example = {
+        "header": {"typ": "dpop+jwt", "alg": "ES256",
+                   "jwk": {"kty": "EC", "crv": "P-256",
+                           "x": _int_to_b64url(pub.x), "y": _int_to_b64url(pub.y)}},
+        "payload": {"jti": str(uuid.uuid4()), "htm": "POST",
+                    "htu": "https://<kong-gateway>/mcp", "iat": int(time.time()),
+                    "ath": _b64url(hashlib.sha256(access_token.encode()).digest())},
+    }
+    te_request = {
+        "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+        "client_id": AGENT_CLIENT_ID,
+        "subject_token": "<principal access token — Alice>",
+        "subject_token_type": "urn:ietf:params:oauth:token-type:access_token",
+        "actor_token": "<agent actor token>",
+        "actor_token_type": "urn:ietf:params:oauth:token-type:access_token",
+        "scope": DEFAULT_SCOPE,
+        "resource": RS_AUDIENCE,
+    }
     steps.append({
         "type": "token_exchange", "title": "Token exchange (RFC 8693)",
         "detail": f"PingFederate issued a delegated token: sub={decoded.get('sub')} "
@@ -285,7 +330,9 @@ def _acquire_pingfederate() -> AgentCredential:
         "aud": decoded.get("aud"), "client_id": decoded.get("client_id") or decoded.get("azp"),
         "authorization_details": decoded.get("authorization_details"),
         "token_preview": access_token[:20] + "…" + access_token[-12:],
-        "claims": decoded, "mode": "pingfederate"})
+        "claims": decoded, "token_header": token_header, "te_request": te_request,
+        "te_endpoint": token_endpoint, "dpop_example": dpop_example,
+        "mode": "pingfederate"})
     return AgentCredential(
         access_token=access_token, principal_sub=decoded.get("sub", PRINCIPAL_SUB),
         agent_sub=(decoded.get("act") or {}).get("sub", AGENT_ID),
