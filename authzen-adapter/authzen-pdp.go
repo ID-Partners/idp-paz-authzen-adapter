@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/joho/godotenv"
 )
@@ -449,6 +450,7 @@ func makeQueryRequest(queryRequest *QueryRequest) ([]QueryItem, error) {
 	}
 
 	client := &http.Client{
+		Timeout: 12 * time.Second,
 		Transport: &http.Transport{
 			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 		},
@@ -508,6 +510,7 @@ func makeAuthorizationDecisionRequest(pdpPayload *PdpPayload) ([]EvaluationRespo
 	}
 
 	client := &http.Client{
+		Timeout: 12 * time.Second,
 		Transport: &http.Transport{
 			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 		},
