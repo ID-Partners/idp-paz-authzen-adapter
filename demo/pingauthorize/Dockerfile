@@ -1,26 +1,25 @@
 # PingAuthorize (the real Ping Authorize PDP) for the demo.
 #
 # The Go authzen-adapter proxies AuthZEN evaluations to this server's JSON PDP
-# API at https://<host>:1443/governance-engine (and /query). The license file is
-# supplied at deploy time as PingAuthorize.lic in this directory (git-ignored)
-# and copied into the server-profile instance dir; it is NOT committed.
+# API at https://<host>:1443/governance-engine (and /query).
 #
-# Override the image tag to match your license version:
-#   docker build --build-arg PAZ_TAG=<tag> .
-ARG PAZ_TAG=latest
+# The license is NOT in git or the image. Railway's build upload ships only
+# git-tracked files, so we inject the license at runtime from the PING_LICENSE
+# environment variable (set on the Railway service) via entrypoint-license.sh,
+# which writes it to LICENSE_DIR and then runs the stock PingAuthorize bootstrap.
+#
+# No 11.1.0.0 image is published; newest is 11.0.0.2. A license versioned
+# 11.1.0.0 is newer than the server, which Ping accepts (license >= server).
+ARG PAZ_TAG=11.0.0.2-latest
 FROM pingidentity/pingauthorize:${PAZ_TAG}
 
-# Accept the EULA and supply the license via the server-profile instance dir.
 ENV PING_IDENTITY_ACCEPT_EULA=YES
 ENV LICENSE_DIR=/opt/in/instance
 ENV MAX_HEAP_SIZE=1g
 
-# License (kept out of git; present in the deploy upload/build context).
-COPY PingAuthorize.lic /opt/in/instance/PingAuthorize.lic
-
-# NOTE: the demo Trust Framework + policy (returning {authorised, reason} for
-# domain=idpartners/service=AuthZEN) is added here after the base server is up
-# and its live PDP response shape has been confirmed:
-#   COPY profile /opt/in
+# world-executable so the image's non-root user can run it (no USER juggling)
+COPY --chmod=0755 entrypoint-license.sh /opt/entrypoint-license.sh
 
 EXPOSE 1443
+ENTRYPOINT ["/opt/entrypoint-license.sh"]
+CMD ["start-server"]
