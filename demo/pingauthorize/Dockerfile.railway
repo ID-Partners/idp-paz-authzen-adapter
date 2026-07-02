@@ -14,6 +14,9 @@ ENV LICENSE_DIR=/opt/in/instance
 ENV MAX_HEAP_SIZE=1g
 
 COPY --chmod=0755 demo/pingauthorize/entrypoint-license.sh /opt/entrypoint-license.sh
+# Server profile: dsconfig batch applied at setup — configures EXTERNAL PDP
+# mode pointing at the Policy Editor (PAP) service.
+COPY --chown=9031:0 demo/pingauthorize/pd.profile /opt/in/pd.profile
 
 EXPOSE 1443
 ENTRYPOINT ["/opt/entrypoint-license.sh"]

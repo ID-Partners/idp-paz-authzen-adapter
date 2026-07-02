@@ -1,0 +1,16 @@
+# Applied automatically at container setup (server-profile dsconfig batch).
+# Points PingAuthorize at the Policy Editor (PAP) in EXTERNAL PDP mode, so
+# policy authored/managed in the PAP GUI drives decisions immediately.
+#
+# decision-node is the well-known id of the "Global Decision Point" root node
+# seeded by PAP demo-mode setup (same constant used across Ping tutorials).
+
+create-external-server --server-name "Policy Editor" --type policy \
+    --set "base-url:https://pingauthorize-pap.railway.internal:1443" \
+    --set "shared-secret:2FederateM0re" \
+    --set "decision-node:e51688ff-1dc9-4b6c-bb36-8af64d02e9d1" \
+    --set "branch:Default Policies"
+
+set-policy-decision-service-prop --set pdp-mode:external \
+    --set "policy-server:Policy Editor" \
+    --set trust-framework-version:v2
