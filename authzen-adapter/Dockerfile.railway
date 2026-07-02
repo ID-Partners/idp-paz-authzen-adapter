@@ -1,0 +1,23 @@
+# Railway build of the AuthZEN adapter.
+# Used via RAILWAY_DOCKERFILE_PATH=authzen-adapter/Dockerfile.railway — the
+# build context is the git root, so COPY paths are repo-root-relative.
+FROM golang:1.23-alpine AS builder
+
+WORKDIR /app
+
+COPY authzen-adapter/go.mod authzen-adapter/go.sum ./
+RUN go mod download
+
+COPY authzen-adapter/ .
+
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /authzen-pdp .
+
+FROM alpine:latest
+
+WORKDIR /root/
+
+COPY --from=builder /authzen-pdp .
+
+EXPOSE 8080
+
+ENTRYPOINT ["./authzen-pdp"]

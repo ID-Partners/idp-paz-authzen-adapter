@@ -538,24 +538,49 @@ func makeAuthorizationDecisionRequest(pdpPayload *PdpPayload) ([]EvaluationRespo
 		return nil, fmt.Errorf("failed to read response body: %v", err)
 	}
 
+	// Log the raw PDP response so misconfigurations are diagnosable
+	log.Printf("DEBUG: PDP response status=%d body=%s", resp.StatusCode, string(body))
+
 	var responsePayload map[string]interface{}
 	if err := json.Unmarshal(body, &responsePayload); err != nil {
-		return nil, fmt.Errorf("failed to decode response: %v", err)
+		return nil, fmt.Errorf("failed to decode response (status %d): %v; body: %.300s",
+			resp.StatusCode, err, string(body))
 	}
 
-	// Generate EvaluationResponse from response
+	// Accept the legacy custom {"authorised": bool} shape as well as the
+	// standard PingAuthorize JSON PDP API shapes:
+	//   {"authorized": bool} and {"decision": "PERMIT"|"DENY"}.
 	authorized, ok := responsePayload["authorised"].(bool)
 	if !ok {
-		return nil, fmt.Errorf("missing or invalid 'authorised' field in response")
+		authorized, ok = responsePayload["authorized"].(bool)
+	}
+	if !ok {
+		if decisionStr, ok2 := responsePayload["decision"].(string); ok2 {
+			authorized = strings.EqualFold(decisionStr, "PERMIT")
+			ok = true
+		}
+	}
+	if !ok {
+		return nil, fmt.Errorf("no authorised/authorized/decision field in PDP response (status %d): %.300s",
+			resp.StatusCode, string(body))
 	}
 
 	var evalResponse EvaluationResponse
 	evalResponse.Decision = authorized
 
-	// Optionally add context if there is a reason for the decision
+	// Optionally add context if there is a reason for the decision. Prefer an
+	// explicit "reason"; otherwise surface the first policy statement payload
+	// (how PingAuthorize policies communicate advice back to the caller).
 	if reason, exists := responsePayload["reason"]; exists {
 		context := Context{"reason": reason}
 		evalResponse.Context = &context
+	} else if stmts, ok := responsePayload["statements"].([]interface{}); ok && len(stmts) > 0 {
+		if st, ok := stmts[0].(map[string]interface{}); ok {
+			if p, ok := st["payload"].(string); ok && p != "" {
+				context := Context{"reason": p}
+				evalResponse.Context = &context
+			}
+		}
 	}
 
 	return []EvaluationResponse{evalResponse}, nil
