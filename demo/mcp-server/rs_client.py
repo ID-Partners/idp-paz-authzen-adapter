@@ -66,6 +66,7 @@ def summarize(resp: httpx.Response) -> dict[str, Any]:
     pep = resp.headers.get("X-PDP-PEP", "PEP#2 (Bank API edge)")
     decision = resp.headers.get("X-PDP-Decision")
     reason = resp.headers.get("X-PDP-Reason")
+    pep_action = resp.headers.get("X-PDP-Action")
 
     try:
         body = resp.json()
@@ -79,14 +80,14 @@ def summarize(resp: httpx.Response) -> dict[str, Any]:
     if resp.status_code == 403:
         r = body.get("reason") or reason or "Denied by policy."
         p = body.get("pep") or pep
-        return {"authorized": False, "pep": p,
+        return {"authorized": False, "pep": p, "pep_action": pep_action,
                 "message": f"POLICY DENIED by {p}: {r}", "policy_reason": r}
     if resp.status_code >= 400:
-        return {"authorized": True, "success": False, "pep": pep,
+        return {"authorized": True, "success": False, "pep": pep, "pep_action": pep_action,
                 "message": body.get("error") or body.get("message") or f"HTTP {resp.status_code}",
                 "result": body}
 
     result = dict(body)
-    result.update({"authorized": True, "pep": pep,
+    result.update({"authorized": True, "pep": pep, "pep_action": pep_action,
                    "policy_reason": reason or "Permitted by policy."})
     return result

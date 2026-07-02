@@ -3,63 +3,115 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>Northwind Bank · AI Agent + Ping Authorize (AuthZEN)</title>
+<title>Northwind Bank · Agentic identity + Ping Authorize (AuthZEN)</title>
 <style>
   :root {
-    --bg:#0d1117; --panel:#161b22; --border:#2d333b; --text:#e6edf3;
+    --bg:#0d1117; --panel:#161b22; --panel2:#0b0f14; --border:#2d333b; --text:#e6edf3;
     --muted:#9198a1; --accent:#4493f8; --ok:#3fb950; --deny:#f85149; --tool:#d29922;
-    --id:#a371f7;
+    --id:#a371f7; --idp:#f778ba; --pep:#e3b341; --pdp:#39c5cf;
   }
   * { box-sizing:border-box; }
   body { margin:0; font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;
          background:var(--bg); color:var(--text); }
-  header { padding:16px 24px; border-bottom:1px solid var(--border); display:flex;
-           align-items:center; gap:12px; }
+  header { padding:16px 24px; border-bottom:1px solid var(--border); }
   header h1 { font-size:16px; margin:0; font-weight:600; }
   header .tag { font-size:12px; color:var(--muted); }
-  .wrap { max-width:920px; margin:0 auto; padding:24px; }
-  .arch { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:20px; font-size:12px; }
-  .arch span { background:var(--panel); border:1px solid var(--border); border-radius:6px;
-               padding:4px 10px; color:var(--muted); }
-  .arch b { color:var(--text); }
-  .examples { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:16px; }
+  .wrap { max-width:1000px; margin:0 auto; padding:24px; }
+  h2.section { font-size:12px; text-transform:uppercase; letter-spacing:.6px; color:var(--muted);
+               margin:26px 0 10px; font-weight:600; }
+
+  /* pipeline diagram */
+  .pipeline { display:flex; align-items:stretch; gap:0; flex-wrap:wrap; margin-bottom:6px; }
+  .node { flex:1 1 0; min-width:96px; background:var(--panel); border:1px solid var(--border);
+          border-radius:10px; padding:10px 8px; text-align:center; position:relative;
+          transition:border-color .3s, box-shadow .3s, background .3s; }
+  .node .ic { font-size:18px; }
+  .node .nm { font-size:11.5px; font-weight:600; margin-top:2px; }
+  .node .sub { font-size:10px; color:var(--muted); margin-top:1px; }
+  .node .proto { font-size:9px; color:var(--muted); margin-top:4px; text-transform:uppercase; letter-spacing:.4px; }
+  .arrow { align-self:center; color:var(--muted); padding:0 4px; font-size:14px; }
+  .node.done { border-color:var(--accent); box-shadow:0 0 0 1px var(--accent) inset; }
+  .node.permit { border-color:var(--ok); box-shadow:0 0 0 1px var(--ok) inset; }
+  .node.deny { border-color:var(--deny); box-shadow:0 0 0 1px var(--deny) inset; }
+  .node .flag { position:absolute; top:-8px; right:-6px; font-size:10px; padding:1px 6px;
+                border-radius:10px; font-weight:700; display:none; }
+  .node.permit .flag { display:inline-block; background:rgba(63,185,80,.16); color:var(--ok); }
+  .node.deny .flag { display:inline-block; background:rgba(248,81,73,.16); color:var(--deny); }
+  .pdp-note { font-size:11px; color:var(--muted); margin:8px 0 0; }
+  .pdp-note b { color:var(--pdp); }
+
+  .examples { display:flex; gap:8px; flex-wrap:wrap; margin:16px 0; }
   .examples button { background:var(--panel); color:var(--text); border:1px solid var(--border);
                      border-radius:8px; padding:8px 12px; cursor:pointer; font-size:13px; }
   .examples button:hover { border-color:var(--accent); }
-  form { display:flex; gap:8px; margin-bottom:20px; }
+  form { display:flex; gap:8px; margin-bottom:8px; }
   input[type=text] { flex:1; background:var(--panel); border:1px solid var(--border);
                      border-radius:8px; padding:12px; color:var(--text); font-size:14px; }
   button.send { background:var(--accent); color:#fff; border:none; border-radius:8px;
                 padding:0 20px; cursor:pointer; font-weight:600; }
   button.send:disabled { opacity:.5; cursor:default; }
+
   .transcript { display:flex; flex-direction:column; gap:10px; }
-  .step { border:1px solid var(--border); border-radius:10px; padding:12px 14px;
-          background:var(--panel); }
-  .step .label { font-size:11px; text-transform:uppercase; letter-spacing:.5px;
-                 color:var(--muted); margin-bottom:6px; }
+  .step { border:1px solid var(--border); border-radius:10px; padding:12px 14px; background:var(--panel); }
+  .step .label { font-size:11px; text-transform:uppercase; letter-spacing:.5px; color:var(--muted);
+                 margin-bottom:6px; display:flex; align-items:center; gap:6px; }
+  .step .explain { font-size:12px; color:var(--muted); margin-top:6px; font-style:italic; }
   .step.agent .label { color:var(--accent); }
   .step.tool_call .label { color:var(--tool); }
   .step.connect { border-style:dashed; }
   .step.identity { border-left:3px solid var(--id); }
   .step.identity .label { color:var(--id); }
-  .chain { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-top:8px;
-           font-size:13px; }
-  .chain .who { background:#0b0f14; border:1px solid var(--border); border-radius:6px;
-                padding:4px 10px; }
-  .chain .who b { color:var(--id); }
-  .chain .arrow { color:var(--muted); }
-  .meta { color:var(--muted); font-size:12px; margin-top:6px; font-family:ui-monospace,Menlo,monospace; }
-  .pep { font-size:11px; color:var(--muted); margin-left:6px; }
-  .step pre { margin:6px 0 0; background:#0b0f14; border-radius:6px; padding:10px;
+  .step.auth { border-left:3px solid var(--idp); }
+  .step.auth .label { color:var(--idp); }
+  .step pre { margin:6px 0 0; background:var(--panel2); border-radius:6px; padding:10px;
               overflow:auto; font-size:12px; color:#c9d1d9; }
-  .decision { display:inline-flex; align-items:center; gap:6px; font-weight:600;
-              font-size:13px; padding:2px 8px; border-radius:20px; }
+
+  /* delegation chain */
+  .chain { display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin:10px 0 4px; font-size:13px; }
+  .who { background:var(--panel2); border:1px solid var(--border); border-radius:8px; padding:6px 10px; }
+  .who .k { font-size:10px; color:var(--muted); text-transform:uppercase; letter-spacing:.4px; }
+  .who .v { font-weight:600; }
+  .who.principal .v { color:var(--ok); }
+  .who.agent .v { color:var(--id); }
+  .chain .arrow2 { color:var(--muted); font-size:12px; }
+
+  /* decoded token panel */
+  .token { margin-top:10px; border:1px solid var(--border); border-radius:8px; overflow:hidden; }
+  .token .thead { background:var(--panel2); padding:6px 10px; font-size:11px; color:var(--muted);
+                  display:flex; justify-content:space-between; align-items:center; }
+  .token .tprev { font-family:ui-monospace,Menlo,monospace; color:#6e7681; font-size:11px;
+                  word-break:break-all; }
+  .claims { display:grid; grid-template-columns:auto 1fr; gap:4px 12px; padding:10px; font-size:12.5px; }
+  .claims .ck { color:var(--muted); font-family:ui-monospace,Menlo,monospace; }
+  .claims .cv { font-family:ui-monospace,Menlo,monospace; word-break:break-all; }
+  .claims .cv.sub { color:var(--ok); font-weight:600; }
+  .claims .cv.act { color:var(--id); font-weight:600; }
+  .claims .cv.jkt { color:var(--pdp); }
+  .chips { display:flex; gap:6px; flex-wrap:wrap; }
+  .chip { background:rgba(68,147,248,.14); color:#79c0ff; border-radius:12px; padding:1px 8px; font-size:11px;
+          font-family:ui-monospace,Menlo,monospace; }
+  .rar { margin:8px 10px 10px; }
+  .rar pre { background:var(--panel2); border-radius:6px; padding:8px; font-size:11.5px; margin:4px 0 0; }
+
+  .decision { display:inline-flex; align-items:center; gap:6px; font-weight:600; font-size:13px;
+              padding:2px 8px; border-radius:20px; }
   .decision.allow { color:var(--ok); background:rgba(63,185,80,.12); }
   .decision.deny { color:var(--deny); background:rgba(248,81,73,.12); }
+  .pep { font-size:11px; color:var(--muted); margin-left:6px; }
   .reason { color:var(--muted); font-size:13px; margin-top:6px; }
+  .hops { display:flex; gap:6px; flex-wrap:wrap; margin-top:6px; font-size:11px; color:var(--muted); }
+  .hops .hop { background:var(--panel2); border:1px solid var(--border); border-radius:6px; padding:2px 7px; }
   .final { border:1px solid var(--accent); }
   .spinner { color:var(--muted); font-size:13px; }
   code { color:#79c0ff; }
+
+  /* legend */
+  .legend { margin-top:26px; border:1px solid var(--border); border-radius:10px; background:var(--panel); }
+  .legend summary { cursor:pointer; padding:12px 14px; font-size:13px; font-weight:600; }
+  .legend .body { padding:0 14px 14px; display:grid; grid-template-columns:1fr 1fr; gap:10px 20px; font-size:12.5px; }
+  .legend dt { color:var(--text); font-weight:600; }
+  .legend dd { margin:2px 0 8px; color:var(--muted); }
+  @media (max-width:640px){ .legend .body { grid-template-columns:1fr; } }
 </style>
 </head>
 <body>
@@ -68,15 +120,22 @@
   <span class="tag">Agent identity · RFC 8693 token exchange · DPoP · Kong PDP enforcement (MCP + API)</span>
 </header>
 <div class="wrap">
-  <div class="arch">
-    <span><b>Agent</b> (Claude)</span>
-    <span>→ <b>PingFederate</b> token exchange</span>
-    <span>→ <b>Kong PEP #1</b> (MCP edge)</span>
-    <span>→ <b>MCP</b> tools</span>
-    <span>→ <b>Kong PEP #2</b> (API edge)</span>
-    <span>→ <b>Bank API</b></span>
-    <span>→ <b>AuthZEN PDP</b> → <b>Ping Authorize</b></span>
+
+  <h2 class="section">How a request flows</h2>
+  <div class="pipeline" id="pipeline">
+    <div class="node" data-node="agent"><div class="ic">🤖</div><div class="nm">Agent</div><div class="sub">Claude</div><div class="proto">acts for user</div></div>
+    <div class="arrow">→</div>
+    <div class="node" data-node="idp"><div class="ic">🎫</div><div class="nm">IdP</div><div class="sub">PingFederate</div><div class="proto">token exchange</div><span class="flag">issued</span></div>
+    <div class="arrow">→</div>
+    <div class="node" data-node="pep1"><div class="ic">🛡️</div><div class="nm">PEP #1</div><div class="sub">Kong · MCP edge</div><div class="proto">DPoP token</div><span class="flag"></span></div>
+    <div class="arrow">→</div>
+    <div class="node" data-node="mcp"><div class="ic">🧰</div><div class="nm">MCP</div><div class="sub">bank tools</div><div class="proto">tools/call</div></div>
+    <div class="arrow">→</div>
+    <div class="node" data-node="pep2"><div class="ic">🛡️</div><div class="nm">PEP #2</div><div class="sub">Kong · API edge</div><div class="proto">bearer token</div><span class="flag"></span></div>
+    <div class="arrow">→</div>
+    <div class="node" data-node="bankapi"><div class="ic">🏦</div><div class="nm">Bank API</div><div class="sub">resource server</div><div class="proto">accounts · payments</div></div>
   </div>
+  <p class="pdp-note">Both PEPs call the <b>AuthZEN PDP</b> adapter → <b>Ping Authorize</b> for a PERMIT/DENY before letting a request through. Nodes light up green/red below once a run completes.</p>
 
   <div class="examples">
     <button data-prompt="I'd like to open a new savings account and move $500 into it from my checking account.">Open savings + fund $500</button>
@@ -91,6 +150,20 @@
   </form>
 
   <div id="transcript" class="transcript"></div>
+
+  <details class="legend">
+    <summary>What am I looking at? — actors &amp; protocols</summary>
+    <dl class="body">
+      <div><dt>Principal</dt><dd>The human the agent acts for (Alice, <code>sub</code> in the token).</dd></div>
+      <div><dt>Agent</dt><dd>The AI software taking the action (<code>act.sub</code> in the token) — a distinct identity from the human.</dd></div>
+      <div><dt>Agent Operator</dt><dd>The org that runs the agent; the OAuth <code>client_id</code>.</dd></div>
+      <div><dt>Token exchange (RFC 8693)</dt><dd>Swaps the principal's token + the agent's token for a <em>delegated</em> token carrying both — delegation, not impersonation.</dd></div>
+      <div><dt>DPoP (RFC 9449)</dt><dd>Sender-constraint: the token is bound to the agent's key (<code>cnf.jkt</code>); every call carries a fresh signed proof.</dd></div>
+      <div><dt>RAR (RFC 9396)</dt><dd><code>authorization_details</code> — fine-grained grant (this payment, this cap) beyond coarse scopes.</dd></div>
+      <div><dt>PEP</dt><dd>Policy Enforcement Point — the Kong gateway that intercepts each call.</dd></div>
+      <div><dt>PDP</dt><dd>Policy Decision Point — Ping Authorize (via the AuthZEN adapter) that returns PERMIT/DENY.</dd></div>
+    </dl>
+  </details>
 </div>
 
 <script>
@@ -103,47 +176,89 @@ document.querySelectorAll('.examples button').forEach(b => {
   b.addEventListener('click', () => { input.value = b.dataset.prompt; input.focus(); });
 });
 
-function el(cls, html) {
-  const d = document.createElement('div');
-  d.className = cls;
-  d.innerHTML = html;
-  return d;
-}
+function el(cls, html) { const d = document.createElement('div'); d.className = cls; d.innerHTML = html; return d; }
 function esc(s){ return String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
 function pretty(o){ return esc(typeof o === 'string' ? o : JSON.stringify(o, null, 2)); }
+function short(s, n=22){ s=String(s||''); return s.length>n ? s.slice(0,n)+'…' : s; }
+
+function setNode(node, state, flag){
+  const n = document.querySelector(`.node[data-node="${node}"]`);
+  if(!n) return;
+  n.classList.remove('done','permit','deny');
+  if(state) n.classList.add(state);
+  if(flag!==undefined){ const f=n.querySelector('.flag'); if(f) f.textContent = flag; }
+}
+function resetPipeline(){ ['agent','idp','pep1','mcp','pep2','bankapi'].forEach(n=>setNode(n,'')); }
+
+function scopeChips(scope){
+  if(!scope) return '';
+  return '<div class="chips">' + String(scope).split(/\s+/).filter(Boolean)
+    .map(s=>`<span class="chip">${esc(s)}</span>`).join('') + '</div>';
+}
+
+function tokenPanel(s){
+  const c = s.claims || {};
+  const rows = [];
+  const row = (k,v,cls='') => rows.push(`<div class="ck">${esc(k)}</div><div class="cv ${cls}">${v}</div>`);
+  row('sub', esc(c.sub || s.sub || '—') + ' <span style="color:var(--muted)">(principal)</span>', 'sub');
+  const actSub = (c.act && c.act.sub) || s.act || '—';
+  row('act.sub', esc(actSub) + ' <span style="color:var(--muted)">(acting agent)</span>', 'act');
+  if(c.client_id || s.client_id) row('client_id', esc(c.client_id||s.client_id) + ' <span style="color:var(--muted)">(agent operator)</span>');
+  if(c.aud || s.aud) row('aud', esc(c.aud||s.aud));
+  row('scope', scopeChips(c.scope || s.scope));
+  if(c.cnf || s.cnf_jkt) row('cnf.jkt', esc((c.cnf && c.cnf.jkt) || s.cnf_jkt) + ' <span style="color:var(--muted)">(DPoP key binding)</span>', 'jkt');
+  const rar = s.authorization_details || c.authorization_details;
+  let rarHtml = '';
+  if(rar) rarHtml = `<div class="rar"><div class="ck" style="font-size:11px">authorization_details (RAR)</div><pre>${pretty(rar)}</pre></div>`;
+  return `<div class="token">
+    <div class="thead"><span>DELEGATED ACCESS TOKEN · mode=${esc(s.mode||'')}</span>
+      <span class="tprev">${esc(s.token_preview||'')}</span></div>
+    <div class="claims">${rows.join('')}</div>${rarHtml}</div>`;
+}
 
 function render(steps) {
   for (const s of steps) {
     if (s.type === 'auth') {
-      out.appendChild(el('step identity',
-        `<div class="label">① ${esc(s.title || 'Agent authenticates')}</div>${esc(s.detail)}`));
+      setNode('agent','done'); setNode('idp','done','issued');
+      const meta = `<div class="claims" style="margin-top:8px">
+        <div class="ck">client_id</div><div class="cv">${esc(s.client_id||'')} <span style="color:var(--muted)">(agent operator)</span></div>
+        <div class="ck">agent</div><div class="cv act">${esc(s.agent||'')}</div>
+        <div class="ck">grant</div><div class="cv">${esc(s.grant||'')}</div>
+        <div class="ck">DPoP jkt</div><div class="cv jkt">${esc(short(s.jkt,32))}</div></div>`;
+      out.appendChild(el('step auth',
+        `<div class="label">① ${esc(s.title||'Agent authenticates')}</div>${esc(s.detail)}${meta}
+         <div class="explain">The agent is its own identity and holds a private key; the token it gets next will be bound to that key.</div>`));
     } else if (s.type === 'token_exchange') {
-      const jkt = s.cnf_jkt ? esc(String(s.cnf_jkt).slice(0,16)) + '…' : '—';
+      setNode('idp','done','issued');
       const chain = `<div class="chain">
-          <span class="who">principal <b>${esc(s.sub||'?')}</b></span>
-          <span class="arrow">◀ acts for ◀</span>
-          <span class="who">agent <b>${esc(s.act||'?')}</b></span>
-        </div>
-        <div class="meta">token: sub=${esc(s.sub||'?')} · act.sub=${esc(s.act||'?')} · scope=${esc(s.scope||'')}</div>
-        <div class="meta">DPoP cnf.jkt=${jkt} · mode=${esc(s.mode||'')} · delegation (not impersonation)</div>`;
+          <span class="who principal"><div class="k">principal</div><div class="v">${esc(s.sub||'?')}</div></span>
+          <span class="arrow2">◀ acts on behalf of ◀</span>
+          <span class="who agent"><div class="k">agent (actor)</div><div class="v">${esc(short(s.act,28)||'?')}</div></span>
+        </div>`;
       out.appendChild(el('step identity',
-        `<div class="label">② ${esc(s.title || 'Token exchange (RFC 8693)')}</div>${esc(s.detail)}${chain}`));
+        `<div class="label">② ${esc(s.title||'Token exchange (RFC 8693)')}</div>${esc(s.detail)}
+         ${chain}${tokenPanel(s)}
+         <div class="explain">Delegation, not impersonation: the token names both the human and the agent, so every downstream action is attributable to both.</div>`));
     } else if (s.type === 'connect') {
-      out.appendChild(el('step connect', `<div class="label">Gateway connect (PEP #1)</div>${esc(s.detail)}`));
+      setNode('pep1','permit','permit'); setNode('mcp','done');
+      out.appendChild(el('step connect',
+        `<div class="label">③ Gateway connect · PEP #1 (MCP edge)</div>${esc(s.detail)}
+         <div class="explain">Kong authenticated the DPoP-bound token and asked the PDP to permit MCP access before the session opened.</div>`));
     } else if (s.type === 'agent') {
-      out.appendChild(el('step agent', `<div class="label">Agent</div>${esc(s.text)}`));
+      out.appendChild(el('step agent', `<div class="label">💬 Agent</div>${esc(s.text)}`));
     } else if (s.type === 'tool_call') {
       out.appendChild(el('step tool_call',
-        `<div class="label">Tool call → ${esc(s.name)}</div><pre>${pretty(s.input)}</pre>`));
+        `<div class="label">🧰 Tool call → ${esc(s.name)}</div><pre>${pretty(s.input)}</pre>
+         <div class="hops"><span class="hop">Agent</span><span class="hop">PEP #1</span><span class="hop">MCP</span><span class="hop">PEP #2</span><span class="hop">Bank API</span></div>`));
     } else if (s.type === 'tool_result') {
       const allowed = s.authorized;
-      const pep = s.pep ? `<span class="pep">at ${esc(s.pep)}</span>` : '';
+      const pep = s.pep ? `<span class="pep">at ${esc(s.pep)}${s.pep_action ? ' · action=' + esc(s.pep_action) : ''}</span>` : '';
       let badge = '';
-      if (allowed === true) badge = `<span class="decision allow">✔ PERMIT</span>${pep}`;
-      else if (allowed === false) badge = `<span class="decision deny">✘ DENY</span>${pep}`;
+      if (allowed === true) { badge = `<span class="decision allow">✔ PERMIT</span>${pep}`; setNode('pep2','permit','permit'); setNode('bankapi','done'); }
+      else if (allowed === false) { badge = `<span class="decision deny">✘ DENY</span>${pep}`; setNode('pep2','deny','deny'); }
       const reason = s.policy_reason ? `<div class="reason">Policy reason: ${esc(s.policy_reason)}</div>` : '';
       out.appendChild(el('step tool_result',
-        `<div class="label">Result ← ${esc(s.name)}</div>${badge}${reason}<pre>${pretty(s.result)}</pre>`));
+        `<div class="label">🛡️ Decision ← ${esc(s.name)}</div>${badge}${reason}<pre>${pretty(s.result)}</pre>`));
     }
     out.scrollIntoView({behavior:'smooth', block:'end'});
   }
@@ -153,7 +268,9 @@ form.addEventListener('submit', async (e) => {
   e.preventDefault();
   const prompt = input.value.trim();
   if (!prompt) return;
-  out.appendChild(el('step agent', `<div class="label">You</div>${esc(prompt)}`));
+  out.innerHTML = '';
+  resetPipeline();
+  out.appendChild(el('step agent', `<div class="label">🧑 You</div>${esc(prompt)}`));
   input.value = '';
   sendBtn.disabled = true;
   const spin = el('step spinner', 'Agent is working (authenticating, exchanging tokens, calling tools through the Kong policy gateways)…');
@@ -166,14 +283,14 @@ form.addEventListener('submit', async (e) => {
     const data = await res.json();
     spin.remove();
     if (data.error) {
-      out.appendChild(el('step tool_result', `<div class="label">Error</div><pre>${esc(data.error)}</pre>`));
+      out.appendChild(el('step tool_result', `<div class="label">⚠ Error</div><pre>${esc(data.error)}</pre>`));
     } else {
       render(data.transcript || []);
-      out.appendChild(el('step final agent', `<div class="label">Agent — final answer</div>${esc(data.final)}`));
+      out.appendChild(el('step final agent', `<div class="label">✅ Agent — final answer</div>${esc(data.final)}`));
     }
   } catch (err) {
     spin.remove();
-    out.appendChild(el('step tool_result', `<div class="label">Error</div><pre>${esc(err)}</pre>`));
+    out.appendChild(el('step tool_result', `<div class="label">⚠ Error</div><pre>${esc(err)}</pre>`));
   } finally {
     sendBtn.disabled = false;
   }

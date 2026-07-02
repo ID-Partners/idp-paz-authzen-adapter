@@ -181,15 +181,20 @@ def _acquire_local() -> AgentCredential:
     signing_key = _new_key()
     token = jwt.encode(claims, signing_key, algorithm="ES256")
 
+    token_preview = token[:20] + "…" + token[-12:]
     steps = [
         {"type": "auth", "title": "Agent authenticates",
-         "detail": f"Agent Operator client '{AGENT_CLIENT_ID}' authenticated; "
-                   f"agent identity '{AGENT_ID}'. (local demo IdP)"},
+         "detail": f"Agent Operator client '{AGENT_CLIENT_ID}' authenticated to the "
+                   f"IdP and the agent generated a fresh DPoP key.",
+         "client_id": AGENT_CLIENT_ID, "agent": AGENT_ID, "jkt": jkt,
+         "grant": "client_credentials", "mode": "local"},
         {"type": "token_exchange", "title": "Token exchange (RFC 8693)",
          "detail": f"Delegated token issued: sub={PRINCIPAL_SUB} "
                    f"act.sub={AGENT_ID} (delegation, not impersonation).",
          "sub": PRINCIPAL_SUB, "act": AGENT_ID, "scope": DEFAULT_SCOPE,
-         "cnf_jkt": jkt, "mode": "local"},
+         "cnf_jkt": jkt, "aud": RS_AUDIENCE, "client_id": AGENT_CLIENT_ID,
+         "authorization_details": _authorization_details(),
+         "token_preview": token_preview, "claims": claims, "mode": "local"},
     ]
     return AgentCredential(access_token=token, principal_sub=PRINCIPAL_SUB,
                            agent_sub=AGENT_ID, scope=DEFAULT_SCOPE, jkt=jkt,
@@ -236,7 +241,10 @@ def _acquire_pingfederate() -> AgentCredential:
         actor_token = actor_resp.json()["access_token"]
         steps.append({"type": "auth", "title": "Agent authenticates",
                       "detail": f"client '{AGENT_CLIENT_ID}' obtained an actor "
-                                f"token via client_credentials (DPoP)."})
+                                f"token via client_credentials (DPoP).",
+                      "client_id": AGENT_CLIENT_ID, "agent": AGENT_ID, "jkt": jkt,
+                      "grant": "client_credentials", "mode": "pingfederate",
+                      "token_endpoint": token_endpoint})
 
         # 2) Principal subject token (demo: pre-provisioned or password grant)
         subject_token = os.environ.get("PRINCIPAL_SUBJECT_TOKEN")
@@ -274,7 +282,10 @@ def _acquire_pingfederate() -> AgentCredential:
                   f"act.sub={(decoded.get('act') or {}).get('sub')}.",
         "sub": decoded.get("sub"), "act": (decoded.get("act") or {}).get("sub"),
         "scope": decoded.get("scope"), "cnf_jkt": (decoded.get("cnf") or {}).get("jkt"),
-        "mode": "pingfederate"})
+        "aud": decoded.get("aud"), "client_id": decoded.get("client_id") or decoded.get("azp"),
+        "authorization_details": decoded.get("authorization_details"),
+        "token_preview": access_token[:20] + "…" + access_token[-12:],
+        "claims": decoded, "mode": "pingfederate"})
     return AgentCredential(
         access_token=access_token, principal_sub=decoded.get("sub", PRINCIPAL_SUB),
         agent_sub=(decoded.get("act") or {}).get("sub", AGENT_ID),
