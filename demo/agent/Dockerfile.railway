@@ -1,0 +1,20 @@
+# Railway build of the bank agent.
+#
+# Used via the service variable RAILWAY_DOCKERFILE_PATH=demo/agent/Dockerfile.railway:
+# `railway up` uploads the git ROOT as the build context, so COPY paths here are
+# repo-root-relative. docker-compose keeps using ./Dockerfile (context demo/agent).
+FROM python:3.12-slim
+
+WORKDIR /app
+
+COPY demo/agent/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY demo/agent/ .
+
+# Railway injects $PORT; default to 8000 for local runs.
+ENV PORT=8000
+EXPOSE 8000
+
+# Start the AgentCore-compatible HTTP host (serves UI + /invocations + /ping).
+CMD ["sh", "-c", "uvicorn app:app --host :: --port ${PORT:-8000}"]

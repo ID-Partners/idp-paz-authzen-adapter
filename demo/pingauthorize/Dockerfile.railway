@@ -1,0 +1,20 @@
+# Railway build of PingAuthorize (the real Ping Authorize PDP).
+# Used via RAILWAY_DOCKERFILE_PATH=demo/pingauthorize/Dockerfile.railway — the
+# build context is the git root, so COPY paths are repo-root-relative.
+#
+# The license is injected at runtime from the PING_LICENSE env var by
+# entrypoint-license.sh (never in git or image layers).
+#
+# No 11.1.0.0 image is published; newest is 11.0.0.2. A license versioned
+# 11.1.0.0 is newer than the server, which Ping accepts (license >= server).
+FROM pingidentity/pingauthorize:11.0.0.2-latest
+
+ENV PING_IDENTITY_ACCEPT_EULA=YES
+ENV LICENSE_DIR=/opt/in/instance
+ENV MAX_HEAP_SIZE=1g
+
+COPY --chmod=0755 demo/pingauthorize/entrypoint-license.sh /opt/entrypoint-license.sh
+
+EXPOSE 1443
+ENTRYPOINT ["/opt/entrypoint-license.sh"]
+CMD ["start-server"]
