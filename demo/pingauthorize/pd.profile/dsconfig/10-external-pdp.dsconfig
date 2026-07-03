@@ -1,16 +1,17 @@
 # Applied automatically at container setup (server-profile dsconfig batch).
-# Points PingAuthorize at the Policy Editor (PAP) in EXTERNAL PDP mode, so
-# policy authored/managed in the PAP GUI drives decisions immediately.
 #
-# decision-node is the well-known id of the "Global Decision Point" root node
-# seeded by PAP demo-mode setup (same constant used across Ping tutorials).
+# EMBEDDED PDP mode: PingAuthorize evaluates a self-contained deployment package
+# baked into the image (/opt/in/banking.deploymentpackage, exported from the PAP),
+# so decisions are stable, fast, and independent of the PAP at runtime — and they
+# survive restarts and apply to every instance.
+#
+# The banking policy: permit list_accounts / get_balance / open_account /
+# make_payment; DENY make_payment above 2000 AUD (agent channel, human step-up).
+# Request attributes (actionName, amount, ...) bind via each attribute's `request`
+# resolver. The PAP (pingauthorize-pap) is used only for AUTHORING; regenerate
+# banking.deploymentpackage when the policy changes.
 
-create-external-server --server-name "Policy Editor" --type policy \
-    --set "base-url:https://pingauthorize-pap.railway.internal:1443" \
-    --set "shared-secret:2FederateM0re" \
-    --set "decision-node:e51688ff-1dc9-4b6c-bb36-8af64d02e9d1" \
-    --set "branch:Default Policies"
-
-set-policy-decision-service-prop --set pdp-mode:external \
-    --set "policy-server:Policy Editor" \
-    --set trust-framework-version:v2
+set-policy-decision-service-prop \
+    --set pdp-mode:embedded \
+    --set deployment-package-source-type:static-file \
+    --set "deployment-package</opt/in/banking.deploymentpackage"
