@@ -302,6 +302,18 @@ function tokenPanel(s){
     <div class="claims">${rows.join('')}</div>${rarHtml}</div>`;
 }
 
+function presentedChip(p){
+  if(!p || !p.authorization) return '';
+  return `<div class="token" style="margin-top:8px">
+    <div class="thead"><span>PRESENTED CREDENTIAL · the real DPoP-bound token, at this component</span></div>
+    <div class="claims">
+      <div class="ck">Authorization</div><div class="cv">${esc(p.authorization)}</div>
+      <div class="ck">DPoP</div><div class="cv">${esc(p.dpop_proof||'')} <span style="color:var(--muted)">(fresh per-request proof, signed by the agent key)</span></div>
+      <div class="ck">cnf.jkt</div><div class="cv jkt">${esc(short(p.jkt,40))}</div>
+      <div class="ck">sub ◀ act</div><div class="cv"><span class="sub">${esc(p.sub||'')}</span> ◀ <span class="act">${esc(p.act||'')}</span></div>
+    </div></div>`;
+}
+
 function render(steps) {
   for (const s of steps) {
     if (s.type === 'attestation') {
@@ -370,17 +382,23 @@ function render(steps) {
          <div class="explain">Delegation, not impersonation: each hop <b>nests</b> the <code>act</code> claim, so the token records the whole chain — every downstream action is attributable to the human <i>and</i> every agent that delegated.${hopBadge}</div>${wire}`));
     } else if (s.type === 'connect') {
       setNode('pep1','permit','permit'); setNode('mcp','done');
-      const wire = wireDetails('wire detail — MCP handshake + PEP #1 decision', [
-        { label:'1 · MCP initialize', desc:'JSON-RPC over streamable HTTP, carrying the DPoP-bound token',
-          http:'POST /mcp   Authorization: DPoP <token>   DPoP: <proof>',
-          json:{ jsonrpc:'2.0', id:0, method:'initialize',
-                 params:{ protocolVersion:'2025-11-25', capabilities:{}, clientInfo:{ name:'bank-agent', version:'1' } } } },
-        { label:'2 · AuthZEN evaluation @ PEP #1', desc:'Kong asks the PDP: may this agent open an MCP session?',
+      const p = s.presented || {};
+      const url = s.mcp_url || '/mcp';
+      const wire = wireDetails('wire detail — real MCP handshake + PEP #1 decision', [
+        { label:'1 · Request the agent actually sends', desc:'MCP initialize over streamable HTTP, carrying the real DPoP-bound token',
+          http:`POST ${url}`,
+          json:{ headers:{ Authorization: p.authorization || 'DPoP <token>', DPoP: p.dpop_proof || '<proof>' },
+                 body:{ jsonrpc:'2.0', id:0, method:'initialize',
+                        params:{ protocolVersion:'2025-11-25', capabilities:{}, clientInfo:{ name:'bank-agent', version:'1' } } } } },
+        { label:'2 · AuthZEN evaluation @ PEP #1', desc:'Kong asks Ping Authorize: may this agent open an MCP session?',
           http:'POST /access/v1/evaluation', json: authzenRequest('access_mcp','mcp-service','northwind-bank') },
+        { label:'3 · PDP decision', desc:'the session opened, so Ping Authorize returned PERMIT for access_mcp',
+          json:{ decision:true } },
       ]);
       out.appendChild(el('step connect',
         `<div class="label">③ Gateway connect · PEP #1 (MCP edge)</div>${esc(s.detail)}
-         <div class="explain">Kong authenticated the DPoP-bound token and asked the PDP to permit MCP access before the session opened.</div>${wire}`));
+         ${presentedChip(p)}
+         <div class="explain">Kong authenticated the real DPoP-bound token and asked the PDP to permit MCP access before the session opened.</div>${wire}`));
     } else if (s.type === 'connect_error') {
       setNode('pep1','deny','deny');
       out.appendChild(el('step tool_result',
@@ -390,14 +408,19 @@ function render(steps) {
     } else if (s.type === 'agent') {
       out.appendChild(el('step agent', `<div class="label">💬 Agent</div>${esc(s.text)}`));
     } else if (s.type === 'tool_call') {
-      const wire = wireDetails('wire detail — MCP call + PEP #2 decision', [
-        { label:'1 · MCP tools/call', desc:'JSON-RPC the agent sends to the MCP server',
-          json:{ jsonrpc:'2.0', id:1, method:'tools/call', params:{ name:s.name, arguments:s.input } } },
+      const p = s.presented || {};
+      const url = s.mcp_url || '/mcp';
+      const wire = wireDetails('wire detail — real MCP call + PEP #2 decision', [
+        { label:'1 · Request the agent actually sends', desc:'tools/call over MCP to Kong, carrying the real DPoP-bound token',
+          http:`POST ${url}`,
+          json:{ headers:{ Authorization: p.authorization || 'DPoP <token>', DPoP: p.dpop_proof || '<proof>' },
+                 body:{ jsonrpc:'2.0', id:1, method:'tools/call', params:{ name:s.name, arguments:s.input } } } },
         { label:'2 · AuthZEN evaluation @ PEP #2', desc:'Kong maps the Bank API call to an AuthZEN request for the PDP',
           http:'POST /access/v1/evaluation', json: toolToAuthzen(s.name, s.input) },
       ]);
       out.appendChild(el('step tool_call',
         `<div class="label">🧰 Tool call → ${esc(s.name)}</div><pre>${pretty(s.input)}</pre>
+         ${presentedChip(p)}
          <div class="hops"><span class="hop">Agent</span><span class="hop">PEP #1</span><span class="hop">MCP</span><span class="hop">PEP #2</span><span class="hop">Bank API</span></div>${wire}`));
     } else if (s.type === 'tool_result') {
       const allowed = s.authorized;
@@ -412,8 +435,13 @@ function render(steps) {
         { label:'Gateway headers', desc:'surfaced by Kong on the proxied response',
           json:{ 'X-PDP-PEP': s.pep || '', 'X-PDP-Decision': allowed ? 'PERMIT' : 'DENY', 'X-PDP-Action': s.pep_action || '' } },
       ]) : '';
+      const respLabel = (allowed === false)
+        ? 'Gateway response (real) — PEP #2 blocked the call'
+        : 'Bank API response (real) — returned through Kong';
       out.appendChild(el('step tool_result',
-        `<div class="label">🛡️ Decision ← ${esc(s.name)}</div>${badge}${reason}<pre>${pretty(s.result)}</pre>${wire}`));
+        `<div class="label">🛡️ Decision ← ${esc(s.name)}</div>${badge}${reason}
+         <div class="ck" style="font-size:11px;margin:6px 0 2px">${respLabel}</div>
+         <pre>${pretty(s.result)}</pre>${wire}`));
     }
     out.scrollIntoView({behavior:'smooth', block:'end'});
   }

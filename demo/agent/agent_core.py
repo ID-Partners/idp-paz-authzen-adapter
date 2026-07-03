@@ -103,6 +103,23 @@ async def run_agent(prompt: str, session_id: str = "demo") -> dict[str, Any]:
     cred = acquire_delegated_token()
     transcript.extend(cred.steps)
 
+    # The REAL sender-constrained credential the agent will present at every
+    # component. We surface a truncated view (never the full secret) plus a fresh
+    # real DPoP proof per component, so the UI can show the actual token flowing
+    # through PEP #1 → MCP → PEP #2 → Bank API — not a placeholder.
+    _tok = cred.access_token
+    token_preview = (_tok[:28] + "…" + _tok[-14:]) if len(_tok) > 44 else _tok
+
+    def presented(url: str, method: str = "POST") -> dict[str, Any]:
+        proof = cred._dpop_proof(method, url)
+        return {
+            "scheme": "DPoP",
+            "authorization": f"DPoP {token_preview}",
+            "dpop_proof": (proof[:28] + "…" + proof[-14:]),
+            "jkt": cred.jkt, "sub": cred.principal_sub,
+            "act": cred.agent_sub, "scope": cred.scope,
+        }
+
     # 2) Present the token (DPoP-bound) on every MCP request to Kong (PEP #1).
     #    Prefer per-request DPoP proofs via httpx auth; fall back to a static
     #    Authorization header if the installed MCP SDK lacks an `auth` param.
@@ -128,6 +145,10 @@ async def run_agent(prompt: str, session_id: str = "demo") -> dict[str, Any]:
                     "detail": f"Connected via Kong gateway (PEP #1) to MCP service "
                               f"'{MCP_SERVER_URL}' using {dpop_note}. "
                               f"Discovered tools: {', '.join(t['name'] for t in tools)}.",
+                    "mcp_url": MCP_SERVER_URL,
+                    "token_preview": token_preview,
+                    "presented": presented(MCP_SERVER_URL),
+                    "tools": [t["name"] for t in tools],
                 })
 
                 messages: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
@@ -166,6 +187,9 @@ async def run_agent(prompt: str, session_id: str = "demo") -> dict[str, Any]:
                             "type": "tool_call",
                             "name": tu.name,
                             "input": tu.input,
+                            "mcp_url": MCP_SERVER_URL,
+                            "token_preview": token_preview,
+                            "presented": presented(MCP_SERVER_URL),
                         })
                         result = await session.call_tool(tu.name, tu.input)
                         text = _extract_text(result.content)
@@ -178,6 +202,7 @@ async def run_agent(prompt: str, session_id: str = "demo") -> dict[str, Any]:
                                              or (parsed or {}).get("message"),
                             "pep": (parsed or {}).get("pep"),
                             "pep_action": (parsed or {}).get("pep_action"),
+                            "bank_response": parsed if parsed is not None else text,
                             "result": parsed if parsed is not None else text,
                         })
                         tool_results.append({
