@@ -51,6 +51,12 @@ class BankStore:
                       nickname="Everyday Checking", currency="AUD", balance=5000.00)
         self._accounts[chk.id] = chk
         alice.accounts.append(chk.id)
+        # A savings account so the demo's happy-path transfer (pay from checking
+        # to savings) has a real destination and the balance visibly moves.
+        sav = Account(id="SAV-1002", customer_id=alice.id, type="savings",
+                      nickname="Rainy Day Savings", currency="AUD", balance=1200.00)
+        self._accounts[sav.id] = sav
+        alice.accounts.append(sav.id)
 
     # --- customers ---
     def get_customer(self, customer_id: str) -> Customer | None:
