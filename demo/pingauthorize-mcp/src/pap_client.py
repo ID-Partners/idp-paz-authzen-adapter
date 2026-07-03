@@ -205,8 +205,14 @@ class PAPClient:
         body = {**body,
                 "objectType": body.get("objectType") or TF_OBJECT_TYPE.get(type_token),
                 "type": body.get("type") or TF_TYPE.get(type_token)}
-        return self._request("POST", f"/api/trust-framework/{type_token}",
-                             params=self._branch(branch_id), json=body)
+        # 11.0: root definitions are created under /roots/{type}; children under
+        # /{parentId}/children (mirrors the test-suite API).
+        parent_id = body.get("parentId")
+        if parent_id:
+            path = f"/api/trust-framework/{quote(parent_id)}/children"
+        else:
+            path = f"/api/trust-framework/roots/{type_token}"
+        return self._request("POST", path, params=self._branch(branch_id), json=body)
 
     def tf_update(self, entity_id: str, branch_id: str, body: dict, type_token: str | None = None) -> Any:
         if type_token:
