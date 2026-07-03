@@ -8,7 +8,7 @@ from ..pap_client import PM_POLICY_SETS
 
 def _policy_set_body(name: str, description: str, combining_algorithm: str,
                      condition: Any, child_ids: list[str], shared: bool = False,
-                     disabled: bool = False) -> dict:
+                     disabled: bool = False, child_type: str = "Policy") -> dict:
     return {
         "name": name,
         "description": description or "",
@@ -16,7 +16,8 @@ def _policy_set_body(name: str, description: str, combining_algorithm: str,
         "disabled": disabled,
         "combiningAlgorithm": {"algorithm": combining_algorithm or "DenyOverrides"},
         "condition": condition if condition is not None else {"empty": {}},
-        "children": [{"id": cid} for cid in child_ids],
+        # 11.0: children are typed DecisionNode references (policies / policy-sets).
+        "children": [{"id": cid, "type": child_type} for cid in child_ids],
     }
 
 

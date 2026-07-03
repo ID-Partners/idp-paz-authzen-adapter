@@ -8,7 +8,7 @@ from .rules import _rule_body
 
 
 def _policy_body(name: str, description: str, combining_algorithm: str,
-                 target: Any, child_ids: list[str]) -> dict:
+                 target: Any, child_ids: list[str], child_type: str = "Rule") -> dict:
     return {
         "name": name,
         "description": description or "",
@@ -16,7 +16,8 @@ def _policy_body(name: str, description: str, combining_algorithm: str,
         "disabled": False,
         "combiningAlgorithm": {"algorithm": combining_algorithm or "DenyOverrides"},
         "condition": target if target is not None else {"empty": {}},
-        "children": [{"id": cid} for cid in child_ids],
+        # 11.0: children are typed DecisionNode references.
+        "children": [{"id": cid, "type": child_type} for cid in child_ids],
     }
 
 
