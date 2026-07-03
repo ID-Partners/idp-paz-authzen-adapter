@@ -1,3 +1,9 @@
 *.code-workspace
 __pycache__/
 *.pyc
+
+# compiled Go binary (built in Docker; never commit)
+/authzen-adapter/authzen-pdp
+
+# local Claude Code session data
+.claude/
