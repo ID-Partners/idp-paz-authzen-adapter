@@ -283,8 +283,12 @@ function tokenPanel(s){
   const rows = [];
   const row = (k,v,cls='') => rows.push(`<div class="ck">${esc(k)}</div><div class="cv ${cls}">${v}</div>`);
   row('sub', esc(c.sub || s.sub || '—') + ' <span style="color:var(--muted)">(principal)</span>', 'sub');
-  const actSub = (c.act && c.act.sub) || s.act || '—';
-  row('act.sub', esc(actSub) + ' <span style="color:var(--muted)">(acting agent)</span>', 'act');
+  // Flatten the nested act chain [current, …, earliest] for display.
+  const chainArr = s.actor_chain || (function(a){const o=[];while(a&&a.sub){o.push(a.sub);a=a.act;}return o;})(c.act) ;
+  const actSub = (chainArr && chainArr[0]) || s.act_sub || '—';
+  row('act.sub', esc(actSub) + ' <span style="color:var(--muted)">(current actor)</span>', 'act');
+  if (chainArr && chainArr.length > 1)
+    row('act chain', chainArr.map(esc).join(' <span style="color:var(--muted)">◀</span> ') + ' <span style="color:var(--muted)">(nested delegation)</span>', 'act');
   if(c.client_id || s.client_id) row('client_id', esc(c.client_id||s.client_id) + ' <span style="color:var(--muted)">(agent operator)</span>');
   if(c.aud || s.aud) row('aud', esc(c.aud||s.aud));
   row('scope', scopeChips(c.scope || s.scope));
@@ -336,25 +340,34 @@ function render(steps) {
          <div class="explain">The agent is its own identity and holds a private key; the token it gets next will be bound to that key.</div>`));
     } else if (s.type === 'token_exchange') {
       setNode('idp','done','issued');
-      CTX.sub = s.sub; CTX.act = s.act; CTX.scope = s.scope;
+      CTX.sub = s.sub; CTX.act = s.act_sub || s.act; CTX.scope = s.scope;
       CTX.client_id = s.client_id || (s.claims && s.claims.client_id);
-      const chain = `<div class="chain">
-          <span class="who principal"><div class="k">principal</div><div class="v">${esc(s.sub||'?')}</div></span>
-          <span class="arrow2">◀ acts on behalf of ◀</span>
-          <span class="who agent"><div class="k">agent (actor)</div><div class="v">${esc(short(s.act,28)||'?')}</div></span>
-        </div>`;
+      // Build the delegation chain: principal ◀ earliest-delegator ◀ … ◀ current
+      // actor. actor_chain is [current, …, earliest]; reverse so it reads
+      // left→right as authority flows, and highlight the actor added THIS hop.
+      const actors = [...(s.actor_chain || (s.act_sub ? [s.act_sub] : []))].reverse();
+      const parties = [`<span class="who principal"><div class="k">principal</div><div class="v">${esc(short(s.sub,26)||'?')}</div></span>`];
+      actors.forEach((a, i) => {
+        const isNew = i === actors.length - 1;
+        const role = isNew ? 'current actor' : 'delegator';
+        const hl = isNew ? ' style="outline:2px solid var(--ok);outline-offset:1px;border-radius:6px"' : '';
+        parties.push(`<span class="arrow2">◀</span>`);
+        parties.push(`<span class="who agent"${hl}><div class="k">agent · ${role}${isNew?' ✦':''}</div><div class="v">${esc(short(a,26))}</div></span>`);
+      });
+      const chain = `<div class="chain">${parties.join('')}</div>`;
       const wire = wireDetails('wire detail — the actual exchange', [
-        { label:'1 · Token exchange request', desc:'RFC 8693 — POST to the AS token endpoint',
+        { label:'1 · Token exchange request', desc:'RFC 8693 — subject = prior token, actor = the delegate',
           http:`POST ${s.te_endpoint||'/as/token.oauth2'}`, json: s.te_request || {} },
         { label:'2 · DPoP proof', desc:'RFC 9449 — signed by the agent key, sent as the DPoP header',
           json: s.dpop_example || {} },
-        { label:'3 · Decoded delegated token', desc:'the issued access token (header + claims)',
+        { label:'3 · Decoded delegated token', desc:'note the nested act chain in the claims',
           json: { header: s.token_header || {alg:'ES256',typ:'JWT'}, payload: s.claims || {} } },
       ]);
+      const hopBadge = s.hops > 1 ? ` <span style="font-weight:400;color:var(--muted)">(nesting act · hop ${s.hop}/${s.hops})</span>` : '';
       out.appendChild(el('step identity',
         `<div class="label">② ${esc(s.title||'Token exchange (RFC 8693)')}</div>${esc(s.detail)}
          ${chain}${tokenPanel(s)}
-         <div class="explain">Delegation, not impersonation: the token names both the human and the agent, so every downstream action is attributable to both.</div>${wire}`));
+         <div class="explain">Delegation, not impersonation: each hop <b>nests</b> the <code>act</code> claim, so the token records the whole chain — every downstream action is attributable to the human <i>and</i> every agent that delegated.${hopBadge}</div>${wire}`));
     } else if (s.type === 'connect') {
       setNode('pep1','permit','permit'); setNode('mcp','done');
       const wire = wireDetails('wire detail — MCP handshake + PEP #1 decision', [

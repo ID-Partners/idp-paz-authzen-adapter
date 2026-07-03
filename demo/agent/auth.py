@@ -48,6 +48,14 @@ logger = logging.getLogger("bank-agent.auth")
 # --- identities (three distinct parties; see module docstring) ---
 PRINCIPAL_SUB = os.environ.get("PRINCIPAL_SUB", "cust-alice")        # the human
 AGENT_ID = os.environ.get("AGENT_ID", "urn:agent:northwind-onboarding:v1")  # act.sub
+# The delegation chain: Alice authorises a Principal Agent (concierge), which
+# delegates to a Task Agent that does the actual bank work. Each token-exchange
+# hop nests the `act` claim (RFC 8693) so the exchanged token records the whole
+# chain — sub=Alice, act={task-agent, act={principal-agent}} — delegation, not
+# impersonation, at every hop. Ordered earliest-delegator → current-actor.
+PRINCIPAL_AGENT_ID = os.environ.get("PRINCIPAL_AGENT_ID", "urn:agent:northwind-concierge:v1")
+TASK_AGENT_ID = os.environ.get("TASK_AGENT_ID", AGENT_ID)
+DELEGATION_CHAIN = [PRINCIPAL_AGENT_ID, TASK_AGENT_ID]
 AGENT_TYPE = os.environ.get("AGENT_TYPE", "ai_assistant")            # agent classification
 AGENT_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-5")   # the model it runs
 AGENT_CLIENT_ID = os.environ.get("AGENT_CLIENT_ID", "bank-agent")    # Agent Operator (client_id)
@@ -150,6 +158,31 @@ def _jkt(key: ec.EllipticCurvePrivateKey) -> str:
     return _b64url(hashlib.sha256(canon.encode()).digest())
 
 
+def _build_act_chain(actor_subs: list[str]) -> dict[str, Any]:
+    """Nest an RFC 8693 `act` claim from a delegation chain.
+
+    `actor_subs` is ordered earliest-delegator → current-actor. The current
+    (most recent) actor is the OUTERMOST `act`; each prior delegator nests inside:
+
+        ["principal-agent", "task-agent"]  ->
+        {"sub": "task-agent", "act": {"sub": "principal-agent"}}
+    """
+    act: dict[str, Any] | None = None
+    for sub in actor_subs:
+        act = {"sub": sub, **({"act": act} if act else {})}
+    return act or {}
+
+
+def _actor_chain_labels(act: dict[str, Any]) -> list[str]:
+    """Flatten a nested `act` to [current-actor, …, earliest-delegator] for display."""
+    labels: list[str] = []
+    node: dict[str, Any] | None = act
+    while node and node.get("sub"):
+        labels.append(node["sub"])
+        node = node.get("act")
+    return labels
+
+
 def _authorization_details() -> list[dict[str, Any]]:
     return [{
         "type": RAR_TYPE,
@@ -167,61 +200,27 @@ def _acquire_local() -> AgentCredential:
     key = _new_key()
     jkt = _jkt(key)
     now = int(time.time())
-    claims = {
-        "iss": "https://local-demo-idp.northwind.example",
-        "sub": PRINCIPAL_SUB,                 # the human principal
-        "act": {"sub": AGENT_ID},             # the acting agent — DELEGATION
-        "aud": RS_AUDIENCE,
-        "client_id": AGENT_CLIENT_ID,         # the Agent Operator
-        "azp": AGENT_CLIENT_ID,
-        "scope": DEFAULT_SCOPE,
-        "authorization_details": _authorization_details(),
-        "cnf": {"jkt": jkt},                  # DPoP sender-constraint
-        "iat": now,
-        "exp": now + TOKEN_TTL,
-    }
-    # a throwaway signing key for the demo IdP (token signature is not verified
-    # by the PDP plugin; the point here is the claim shape + DPoP binding)
-    signing_key = _new_key()
+    signing_key = _new_key()          # throwaway demo IdP signing key
     token_header = {"alg": "ES256", "typ": "JWT"}
-    token = jwt.encode(claims, signing_key, algorithm="ES256", headers=token_header)
-
-    token_preview = token[:20] + "…" + token[-12:]
     pub = key.public_key().public_numbers()
     public_jwk = {"kty": "EC", "crv": "P-256",
                   "x": _int_to_b64url(pub.x), "y": _int_to_b64url(pub.y)}
 
-    # Client attestation: a trusted attester vouches for the agent's AgentCore
-    # attributes (workload) and binds the agent's DPoP key (cnf.jwk == public_jwk),
-    # ceilinged by authorization_details. This is what the agent presents to the
-    # AS as `attest_jwt_client_auth_dpop` instead of a client secret.
+    # Client attestation: a trusted attester vouches for the acting (task) agent's
+    # AgentCore attributes and binds its DPoP key (cnf.jwk == public_jwk). This is
+    # what the agent presents to the AS as `attest_jwt_client_auth_dpop`.
     attestation = mint_agent_attestation(
-        client_id=AGENT_CLIENT_ID, agent_id=AGENT_ID, agent_type=AGENT_TYPE,
+        client_id=AGENT_CLIENT_ID, agent_id=TASK_AGENT_ID, agent_type=AGENT_TYPE,
         principal_sub=PRINCIPAL_SUB, agent_public_jwk=public_jwk,
         authorization_details=_authorization_details(), model=AGENT_MODEL)
 
-    ath = _b64url(hashlib.sha256(token.encode()).digest())
-    dpop_example = {
-        "header": {"typ": "dpop+jwt", "alg": "ES256", "jwk": public_jwk},
-        "payload": {"jti": str(uuid.uuid4()), "htm": "POST",
-                    "htu": "https://<kong-gateway>/mcp", "iat": now, "ath": ath},
-    }
-    te_request = {
-        "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
-        "subject_token": "<principal access token — Alice>",
-        "subject_token_type": "urn:ietf:params:oauth:token-type:access_token",
-        "actor_token": "<agent actor token>",
-        "actor_token_type": "urn:ietf:params:oauth:token-type:access_token",
-        "scope": DEFAULT_SCOPE,
-        "resource": RS_AUDIENCE,
-    }
-    steps = [
+    steps: list[dict[str, Any]] = [
         {"type": "attestation", "title": "Client attestation",
          "detail": f"Attester '{attestation.attester_issuer}' issued an attestation "
                    f"JWT vouching for the agent's identity and AgentCore attributes, "
                    f"binding its DPoP key (cnf.jwk) and authority ceiling.",
          "attester": attestation.attester_issuer, "client_id": AGENT_CLIENT_ID,
-         "agent": AGENT_ID, "agent_type": AGENT_TYPE,
+         "agent": TASK_AGENT_ID, "agent_type": AGENT_TYPE,
          "auth_method": "attest_jwt_client_auth_dpop",
          "typ": attestation.header.get("typ"),
          "workload": attestation.claims.get("workload"),
@@ -235,22 +234,70 @@ def _acquire_local() -> AgentCredential:
          "detail": f"Agent Operator client '{AGENT_CLIENT_ID}' authenticated to the "
                    f"IdP with the attestation (attest_jwt_client_auth_dpop) and a "
                    f"fresh DPoP key — no client secret.",
-         "client_id": AGENT_CLIENT_ID, "agent": AGENT_ID, "jkt": jkt,
+         "client_id": AGENT_CLIENT_ID, "agent": TASK_AGENT_ID, "jkt": jkt,
          "grant": "client_credentials", "auth_method": "attest_jwt_client_auth_dpop",
          "mode": "local"},
-        {"type": "token_exchange", "title": "Token exchange (RFC 8693)",
-         "detail": f"Delegated token issued: sub={PRINCIPAL_SUB} "
-                   f"act.sub={AGENT_ID} (delegation, not impersonation).",
-         "sub": PRINCIPAL_SUB, "act": AGENT_ID, "scope": DEFAULT_SCOPE,
-         "cnf_jkt": jkt, "aud": RS_AUDIENCE, "client_id": AGENT_CLIENT_ID,
-         "authorization_details": _authorization_details(),
-         "token_preview": token_preview, "claims": claims,
-         "token_header": token_header, "te_request": te_request,
-         "te_endpoint": "https://<local-demo-idp>/as/token.oauth2",
-         "dpop_example": dpop_example, "mode": "local"},
     ]
+
+    # Chained RFC 8693 token exchange: one hop per delegation link. Each hop nests
+    # the `act` claim, so the actor chain BUILDS UP — sub=Alice stays fixed while
+    # act grows to {task-agent, act={principal-agent}} (delegation, not impersonation).
+    token = ""
+    claims: dict[str, Any] = {}
+    prev_subject = "<principal access token — Alice>"
+    for i, actor in enumerate(DELEGATION_CHAIN):
+        act = _build_act_chain(DELEGATION_CHAIN[:i + 1])
+        chain_labels = _actor_chain_labels(act)         # [current, …, earliest]
+        claims = {
+            "iss": "https://local-demo-idp.northwind.example",
+            "sub": PRINCIPAL_SUB,                       # the human principal (fixed)
+            "act": act,                                 # the nested delegation chain
+            "aud": RS_AUDIENCE,
+            "client_id": AGENT_CLIENT_ID,
+            "azp": AGENT_CLIENT_ID,
+            "scope": DEFAULT_SCOPE,
+            "authorization_details": _authorization_details(),
+            "cnf": {"jkt": jkt},                        # DPoP sender-constraint
+            "iat": now,
+            "exp": now + TOKEN_TTL,
+        }
+        token = jwt.encode(claims, signing_key, algorithm="ES256", headers=token_header)
+        ath = _b64url(hashlib.sha256(token.encode()).digest())
+        te_request = {
+            "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+            "subject_token": prev_subject,
+            "subject_token_type": "urn:ietf:params:oauth:token-type:access_token",
+            "actor_token": f"<actor token — {actor}>",
+            "actor_token_type": "urn:ietf:params:oauth:token-type:access_token",
+            "scope": DEFAULT_SCOPE,
+            "resource": RS_AUDIENCE,
+        }
+        dpop_example = {
+            "header": {"typ": "dpop+jwt", "alg": "ES256", "jwk": public_jwk},
+            "payload": {"jti": str(uuid.uuid4()), "htm": "POST",
+                        "htu": "https://<kong-gateway>/mcp", "iat": now, "ath": ath},
+        }
+        delegator = PRINCIPAL_SUB if i == 0 else DELEGATION_CHAIN[i - 1]
+        steps.append({
+            "type": "token_exchange",
+            "title": f"Token exchange · hop {i + 1} of {len(DELEGATION_CHAIN)}",
+            "detail": (f"{delegator} delegates to {actor}: the exchanged token now "
+                       f"carries act = {' ◀ '.join(chain_labels)} under sub={PRINCIPAL_SUB} "
+                       f"— delegation, not impersonation."),
+            "sub": PRINCIPAL_SUB, "act": act, "act_sub": (act or {}).get("sub"),
+            "actor_chain": chain_labels, "hop": i + 1, "hops": len(DELEGATION_CHAIN),
+            "delegator": (None if i == 0 else delegator),
+            "scope": DEFAULT_SCOPE, "cnf_jkt": jkt, "aud": RS_AUDIENCE,
+            "client_id": AGENT_CLIENT_ID,
+            "authorization_details": _authorization_details(),
+            "token_preview": token[:20] + "…" + token[-12:], "claims": claims,
+            "token_header": token_header, "te_request": te_request,
+            "te_endpoint": "https://<local-demo-idp>/as/token.oauth2",
+            "dpop_example": dpop_example, "mode": "local"})
+        prev_subject = f"<delegated token from hop {i + 1}>"
+
     return AgentCredential(access_token=token, principal_sub=PRINCIPAL_SUB,
-                           agent_sub=AGENT_ID, scope=DEFAULT_SCOPE, jkt=jkt,
+                           agent_sub=TASK_AGENT_ID, scope=DEFAULT_SCOPE, jkt=jkt,
                            mode="local", _key=key, steps=steps)
 
 
