@@ -745,9 +745,15 @@ func handleEvaluationRequest(w http.ResponseWriter, r *http.Request) {
 	decisionJSON, _ := json.MarshalIndent(decision, "", "  ")
 	log.Printf("DEBUG: Authorization Decision Response:\n%s\n", decisionJSON)
 
-	// Send Response
+	// Send Response. The AuthZEN single-evaluation endpoint returns a single
+	// decision OBJECT ({"decision":bool,"context":{...}}) — NOT an array — so
+	// callers (e.g. the Kong PEP) can read `.decision` directly.
+	var single EvaluationResponse
+	if len(decision) > 0 {
+		single = decision[0]
+	}
 	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(decision); err != nil {
+	if err := json.NewEncoder(w).Encode(single); err != nil {
 		log.Printf("ERROR: Failed to encode response: %v\n", err)
 		http.Error(w, "Failed to encode response", http.StatusInternalServerError)
 	}
