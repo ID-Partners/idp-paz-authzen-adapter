@@ -131,11 +131,28 @@ def make_payment(body: PaymentBody,
 
 
 if __name__ == "__main__":
+    import asyncio
+    import socket
     import uvicorn
 
     port = int(os.environ.get("PORT", "8070"))
-    # Railway private networking is IPv6-only; bind :: there (set HOST=::).
-    # Locally, "::" on a dual-stack host still accepts IPv4.
-    host = os.environ.get("HOST", "0.0.0.0")
+    host = os.environ.get("HOST", "::")
     logger.info("Starting Bank API (Resource Server) on %s:%s", host, port)
-    uvicorn.run(app, host=host, port=port)
+
+    # Railway's private mesh may hand the gateway either our IPv6 address
+    # (…railway.internal AAAA) or an IPv4 one. A plain `::` bind is IPv6-only on
+    # Linux, so Kong's IPv4 connect() is refused -> 502 "connection refused".
+    # Bind a DUAL-STACK socket (IPV6_V6ONLY=0) so we accept both families.
+    if ":" in host or host in ("", "::"):
+        sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        except (AttributeError, OSError):
+            pass
+        sock.bind((host or "::", port))
+        sock.listen(128)
+        server = uvicorn.Server(uvicorn.Config(app))
+        asyncio.run(server.serve(sockets=[sock]))
+    else:
+        uvicorn.run(app, host=host, port=port)
