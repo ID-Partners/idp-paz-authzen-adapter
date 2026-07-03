@@ -45,6 +45,24 @@ TF_DOMAINS = "domains"
 TF_IDENTITY_PROVIDERS = "identity-providers"
 TF_ACTIONS = "actions"
 
+# --- PingAuthorize 11.0 write-body discriminators --------------------------
+# 11.0 requires a Jackson type discriminator in every create/update body that
+# the 10.3-era API inferred from the URL. Policy-manager entities use ``type``;
+# trust-framework definitions use ``objectType`` (+ an uppercase ``type``).
+PM_TYPE = {
+    "policies": "Policy", "rules": "Rule", "policysets": "PolicySet",
+    "statements": "Statement", "targets": "Target",
+}
+TF_OBJECT_TYPE = {
+    "attributes": "AttributeDefinition", "conditions": "ConditionDefinition",
+    "services": "ServiceDefinition", "domains": "DomainDefinition",
+    "actions": "ActionDefinition", "identity-providers": "IdentityProviderDefinition",
+}
+TF_TYPE = {
+    "attributes": "ATTRIBUTE", "conditions": "CONDITION", "services": "SERVICE",
+    "domains": "DOMAIN", "actions": "ACTION", "identity-providers": "IDENTITY_PROVIDER",
+}
+
 
 class PAPClient:
     def __init__(self, cfg: Config):
@@ -153,10 +171,12 @@ class PAPClient:
                              params=self._branch(branch_id))
 
     def pm_create(self, type_token: str, branch_id: str, body: dict) -> Any:
+        body = {**body, "type": body.get("type") or PM_TYPE.get(type_token)}
         return self._request("POST", f"/api/v2/policy-manager/{type_token}",
                              params=self._branch(branch_id), json=body)
 
     def pm_update(self, type_token: str, entity_id: str, branch_id: str, body: dict) -> Any:
+        body = {**body, "type": body.get("type") or PM_TYPE.get(type_token)}
         return self._request("PUT", f"/api/v2/policy-manager/{type_token}/{quote(entity_id)}",
                              params=self._branch(branch_id), json=body)
 
@@ -182,10 +202,17 @@ class PAPClient:
                              params=self._branch(branch_id))
 
     def tf_create(self, type_token: str, branch_id: str, body: dict) -> Any:
+        body = {**body,
+                "objectType": body.get("objectType") or TF_OBJECT_TYPE.get(type_token),
+                "type": body.get("type") or TF_TYPE.get(type_token)}
         return self._request("POST", f"/api/trust-framework/{type_token}",
                              params=self._branch(branch_id), json=body)
 
-    def tf_update(self, entity_id: str, branch_id: str, body: dict) -> Any:
+    def tf_update(self, entity_id: str, branch_id: str, body: dict, type_token: str | None = None) -> Any:
+        if type_token:
+            body = {**body,
+                    "objectType": body.get("objectType") or TF_OBJECT_TYPE.get(type_token),
+                    "type": body.get("type") or TF_TYPE.get(type_token)}
         return self._request("PUT", f"/api/trust-framework/{quote(entity_id)}",
                              params=self._branch(branch_id), json=body)
 
