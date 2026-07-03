@@ -131,7 +131,6 @@ def make_payment(body: PaymentBody,
 
 
 if __name__ == "__main__":
-    import asyncio
     import socket
     import uvicorn
 
@@ -139,10 +138,13 @@ if __name__ == "__main__":
     host = os.environ.get("HOST", "::")
     logger.info("Starting Bank API (Resource Server) on %s:%s", host, port)
 
-    # Railway's private mesh may hand the gateway either our IPv6 address
-    # (…railway.internal AAAA) or an IPv4 one. A plain `::` bind is IPv6-only on
-    # Linux, so Kong's IPv4 connect() is refused -> 502 "connection refused".
-    # Bind a DUAL-STACK socket (IPV6_V6ONLY=0) so we accept both families.
+    # Railway now dual-stacks private networking: bank-api.railway.internal
+    # resolves to BOTH an IPv6 and an IPv4 address, and Kong's resolver may pick
+    # the IPv4 one. A plain `::` bind is IPv6-only on Linux, so that IPv4
+    # connect() is refused -> Kong 502 "connection refused". Hand uvicorn a
+    # pre-bound DUAL-STACK socket (IPV6_V6ONLY=0) via fd= so it accepts both
+    # families while keeping uvicorn.run's normal startup path. (Go's net stack
+    # dual-stacks by default, which is why the Go adapter never hit this.)
     if ":" in host or host in ("", "::"):
         sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -152,7 +154,7 @@ if __name__ == "__main__":
             pass
         sock.bind((host or "::", port))
         sock.listen(128)
-        server = uvicorn.Server(uvicorn.Config(app))
-        asyncio.run(server.serve(sockets=[sock]))
+        sock.set_inheritable(True)
+        uvicorn.run(app, fd=sock.fileno())
     else:
         uvicorn.run(app, host=host, port=port)
