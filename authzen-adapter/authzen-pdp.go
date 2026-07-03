@@ -429,6 +429,34 @@ func buildPdpDecisionPayload(evalRequest EvaluationRequest) (*PdpPayload, error)
 	actionJSON, _ := json.Marshal(actionObj)
 	pdpPayload.Attributes[fmt.Sprintf("%s.action", pdpAttributePrefix)] = string(actionJSON)
 
+	// Flat scalar attributes (in addition to the JSON-string attributes above)
+	// so PingAuthorize policies can read them directly via a "request" resolver
+	// keyed on the attribute name. Keys are dot-free -> 1:1 Trust Framework attrs.
+	pdpPayload.Attributes["actionName"] = evalRequest.Action.Name
+	pdpPayload.Attributes["resourceType"] = evalRequest.Resource.Type
+	pdpPayload.Attributes["resourceId"] = evalRequest.Resource.ID
+	pdpPayload.Attributes["agentId"] = evalRequest.Subject.ID
+	if evalRequest.Subject.Properties != nil {
+		if v, ok := evalRequest.Subject.Properties["on_behalf_of"]; ok {
+			pdpPayload.Attributes["onBehalfOf"] = fmt.Sprintf("%v", v)
+		}
+		if v, ok := evalRequest.Subject.Properties["agent_type"]; ok {
+			pdpPayload.Attributes["agentType"] = fmt.Sprintf("%v", v)
+		}
+	}
+	if evalRequest.Context != nil {
+		ctx := *evalRequest.Context
+		if v, ok := ctx["amount"]; ok {
+			pdpPayload.Attributes["amount"] = fmt.Sprintf("%v", v)
+		}
+		if v, ok := ctx["currency"]; ok {
+			pdpPayload.Attributes["currency"] = fmt.Sprintf("%v", v)
+		}
+		if v, ok := ctx["channel"]; ok {
+			pdpPayload.Attributes["channel"] = fmt.Sprintf("%v", v)
+		}
+	}
+
 	log.Println("Successfully built PdpPayload")
 	log.Printf("PdpPayload: %+v\n", pdpPayload)
 
