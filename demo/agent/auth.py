@@ -41,11 +41,15 @@ import httpx
 import jwt  # PyJWT
 from cryptography.hazmat.primitives.asymmetric import ec
 
+from attestation import mint_agent_attestation
+
 logger = logging.getLogger("bank-agent.auth")
 
 # --- identities (three distinct parties; see module docstring) ---
 PRINCIPAL_SUB = os.environ.get("PRINCIPAL_SUB", "cust-alice")        # the human
 AGENT_ID = os.environ.get("AGENT_ID", "urn:agent:northwind-onboarding:v1")  # act.sub
+AGENT_TYPE = os.environ.get("AGENT_TYPE", "ai_assistant")            # agent classification
+AGENT_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-5")   # the model it runs
 AGENT_CLIENT_ID = os.environ.get("AGENT_CLIENT_ID", "bank-agent")    # Agent Operator (client_id)
 AGENT_CLIENT_SECRET = os.environ.get("AGENT_CLIENT_SECRET", "")
 
@@ -186,6 +190,16 @@ def _acquire_local() -> AgentCredential:
     pub = key.public_key().public_numbers()
     public_jwk = {"kty": "EC", "crv": "P-256",
                   "x": _int_to_b64url(pub.x), "y": _int_to_b64url(pub.y)}
+
+    # Client attestation: a trusted attester vouches for the agent's AgentCore
+    # attributes (workload) and binds the agent's DPoP key (cnf.jwk == public_jwk),
+    # ceilinged by authorization_details. This is what the agent presents to the
+    # AS as `attest_jwt_client_auth_dpop` instead of a client secret.
+    attestation = mint_agent_attestation(
+        client_id=AGENT_CLIENT_ID, agent_id=AGENT_ID, agent_type=AGENT_TYPE,
+        principal_sub=PRINCIPAL_SUB, agent_public_jwk=public_jwk,
+        authorization_details=_authorization_details(), model=AGENT_MODEL)
+
     ath = _b64url(hashlib.sha256(token.encode()).digest())
     dpop_example = {
         "header": {"typ": "dpop+jwt", "alg": "ES256", "jwk": public_jwk},
@@ -202,11 +216,28 @@ def _acquire_local() -> AgentCredential:
         "resource": RS_AUDIENCE,
     }
     steps = [
+        {"type": "attestation", "title": "Client attestation",
+         "detail": f"Attester '{attestation.attester_issuer}' issued an attestation "
+                   f"JWT vouching for the agent's identity and AgentCore attributes, "
+                   f"binding its DPoP key (cnf.jwk) and authority ceiling.",
+         "attester": attestation.attester_issuer, "client_id": AGENT_CLIENT_ID,
+         "agent": AGENT_ID, "agent_type": AGENT_TYPE,
+         "auth_method": "attest_jwt_client_auth_dpop",
+         "typ": attestation.header.get("typ"),
+         "workload": attestation.claims.get("workload"),
+         "attestation_header": attestation.header, "attestation_claims": attestation.claims,
+         "attestation_preview": attestation.jwt[:24] + "…" + attestation.jwt[-12:],
+         "presentation_headers": {
+             "OAuth-Client-Attestation": attestation.jwt[:24] + "…" + attestation.jwt[-12:],
+             "DPoP": "<proof signed by cnf.jwk>"},
+         "attester_jwks": attestation.attester_jwks, "mode": "local"},
         {"type": "auth", "title": "Agent authenticates",
          "detail": f"Agent Operator client '{AGENT_CLIENT_ID}' authenticated to the "
-                   f"IdP and the agent generated a fresh DPoP key.",
+                   f"IdP with the attestation (attest_jwt_client_auth_dpop) and a "
+                   f"fresh DPoP key — no client secret.",
          "client_id": AGENT_CLIENT_ID, "agent": AGENT_ID, "jkt": jkt,
-         "grant": "client_credentials", "mode": "local"},
+         "grant": "client_credentials", "auth_method": "attest_jwt_client_auth_dpop",
+         "mode": "local"},
         {"type": "token_exchange", "title": "Token exchange (RFC 8693)",
          "detail": f"Delegated token issued: sub={PRINCIPAL_SUB} "
                    f"act.sub={AGENT_ID} (delegation, not impersonation).",
@@ -237,8 +268,33 @@ def _discover_token_endpoint() -> str:
 def _acquire_pingfederate() -> AgentCredential:
     key = _new_key()
     jkt = _jkt(key)
+    pub0 = key.public_key().public_numbers()
+    agent_jwk = {"kty": "EC", "crv": "P-256",
+                 "x": _int_to_b64url(pub0.x), "y": _int_to_b64url(pub0.y)}
     token_endpoint = _discover_token_endpoint()
     steps: list[dict[str, Any]] = []
+
+    # Client attestation presented as attest_jwt_client_auth_dpop: the
+    # OAuth-Client-Attestation header + the DPoP proof (signed by cnf.jwk) replace
+    # the client secret at PingFederate's token endpoint. pf-oidf-modules validates
+    # it via the OIDF trust chain and enforces requested ⊆ attested.
+    attestation = mint_agent_attestation(
+        client_id=AGENT_CLIENT_ID, agent_id=AGENT_ID, agent_type=AGENT_TYPE,
+        principal_sub=PRINCIPAL_SUB, agent_public_jwk=agent_jwk,
+        authorization_details=_authorization_details(), model=AGENT_MODEL)
+    steps.append({
+        "type": "attestation", "title": "Client attestation",
+        "detail": f"Attester '{attestation.attester_issuer}' issued an attestation "
+                  f"JWT vouching for the agent's AgentCore attributes and DPoP key; "
+                  f"presented to PingFederate as attest_jwt_client_auth_dpop.",
+        "attester": attestation.attester_issuer, "client_id": AGENT_CLIENT_ID,
+        "agent": AGENT_ID, "agent_type": AGENT_TYPE,
+        "auth_method": "attest_jwt_client_auth_dpop", "typ": attestation.header.get("typ"),
+        "workload": attestation.claims.get("workload"),
+        "attestation_header": attestation.header, "attestation_claims": attestation.claims,
+        "attestation_preview": attestation.jwt[:24] + "…" + attestation.jwt[-12:],
+        "attester_jwks": attestation.attester_jwks, "mode": "pingfederate"})
+    attest_headers = {"OAuth-Client-Attestation": attestation.jwt}
 
     def dpop_for(method: str, url: str, access_token: str | None = None) -> str:
         payload = {"jti": str(uuid.uuid4()), "htm": method.upper(),
@@ -258,7 +314,7 @@ def _acquire_pingfederate() -> AgentCredential:
             "client_id": AGENT_CLIENT_ID,
             "client_secret": AGENT_CLIENT_SECRET,
             "scope": "agent",
-        }, headers={"DPoP": dpop_for("POST", token_endpoint)})
+        }, headers={"DPoP": dpop_for("POST", token_endpoint), **attest_headers})
         actor_resp.raise_for_status()
         actor_token = actor_resp.json()["access_token"]
         steps.append({"type": "auth", "title": "Agent authenticates",
@@ -293,7 +349,7 @@ def _acquire_pingfederate() -> AgentCredential:
             "actor_token_type": "urn:ietf:params:oauth:token-type:access_token",
             "scope": DEFAULT_SCOPE,
             "resource": RS_AUDIENCE,
-        }, headers={"DPoP": dpop_for("POST", token_endpoint)})
+        }, headers={"DPoP": dpop_for("POST", token_endpoint), **attest_headers})
         te.raise_for_status()
         access_token = te.json()["access_token"]
 

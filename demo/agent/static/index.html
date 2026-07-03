@@ -152,6 +152,8 @@
   <div class="pipeline" id="pipeline">
     <div class="node" data-node="agent"><div class="ic">🤖</div><div class="nm">Agent</div><div class="sub">Claude</div><div class="proto">acts for user</div></div>
     <div class="arrow">→</div>
+    <div class="node" data-node="attester"><div class="ic">📜</div><div class="nm">Attester</div><div class="sub">client attestation</div><div class="proto">attest_jwt</div><span class="flag"></span></div>
+    <div class="arrow">→</div>
     <div class="node" data-node="idp"><div class="ic">🎫</div><div class="nm">IdP</div><div class="sub">PingFederate</div><div class="proto">token exchange</div><span class="flag">issued</span></div>
     <div class="arrow">→</div>
     <div class="node" data-node="pep1"><div class="ic">🛡️</div><div class="nm">PEP #1</div><div class="sub">Kong · MCP edge</div><div class="proto">DPoP token</div><span class="flag"></span></div>
@@ -268,7 +270,7 @@ function setNode(node, state, flag){
   if(state) n.classList.add(state);
   if(flag!==undefined){ const f=n.querySelector('.flag'); if(f) f.textContent = flag; }
 }
-function resetPipeline(){ ['agent','idp','pep1','mcp','pep2','bankapi'].forEach(n=>setNode(n,'')); }
+function resetPipeline(){ ['agent','attester','idp','pep1','mcp','pep2','bankapi'].forEach(n=>setNode(n,'')); }
 
 function scopeChips(scope){
   if(!scope) return '';
@@ -298,7 +300,31 @@ function tokenPanel(s){
 
 function render(steps) {
   for (const s of steps) {
-    if (s.type === 'auth') {
+    if (s.type === 'attestation') {
+      setNode('agent','done'); setNode('attester','done','attested');
+      const w = s.workload || {};
+      const wrows = Object.keys(w).map(k =>
+        `<div class="ck">${esc(k)}</div><div class="cv">${esc(String(w[k]))}</div>`).join('');
+      const meta = `<div class="claims" style="margin-top:8px">
+        <div class="ck">attester (iss)</div><div class="cv">${esc(s.attester||'')}</div>
+        <div class="ck">sub</div><div class="cv">${esc(s.client_id||'')} <span style="color:var(--muted)">(agent client_id)</span></div>
+        <div class="ck">auth_method</div><div class="cv">${esc(s.auth_method||'')}</div>
+        <div class="ck">typ</div><div class="cv">${esc(s.typ||'')}</div></div>
+        <div class="rar"><div class="ck" style="font-size:11px">workload — attested AgentCore attributes</div>
+          <div class="claims">${wrows}</div></div>`;
+      const wire = wireDetails('wire detail — the attestation the agent presents', [
+        { label:'1 · Attestation JWT', desc:'issued by the attester; header + claims',
+          json:{ header: s.attestation_header || {}, payload: s.attestation_claims || {} } },
+        { label:'2 · Presentation to the AS', desc:'attest_jwt_client_auth_dpop — headers on the token request',
+          http:'POST /as/token.oauth2', json: s.presentation_headers ||
+            { 'OAuth-Client-Attestation':'<attestation jwt>', 'DPoP':'<proof signed by cnf.jwk>' } },
+        { label:'3 · Attester trust (OIDF)', desc:'PingFederate resolves these keys via the federation trust chain',
+          json:{ 'well_known':`${s.attester||''}/.well-known/openid-federation`, jwks: s.attester_jwks || {} } },
+      ]);
+      out.appendChild(el('step auth',
+        `<div class="label">🎫 ${esc(s.title||'Client attestation')}</div>${esc(s.detail)}${meta}
+         <div class="explain">Instead of a shared secret, a trusted attester vouches for the agent's identity and AgentCore attributes and binds its DPoP key — so PingFederate can verify <b>what</b> the agent is, not just that it holds a password.</div>${wire}`));
+    } else if (s.type === 'auth') {
       setNode('agent','done'); setNode('idp','done','issued');
       const meta = `<div class="claims" style="margin-top:8px">
         <div class="ck">client_id</div><div class="cv">${esc(s.client_id||'')} <span style="color:var(--muted)">(agent operator)</span></div>
