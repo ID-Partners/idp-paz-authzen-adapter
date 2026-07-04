@@ -20,25 +20,29 @@
   h2.section { font-size:12px; text-transform:uppercase; letter-spacing:.6px; color:var(--muted);
                margin:26px 0 10px; font-weight:600; }
 
-  /* pipeline diagram */
-  .pipeline { display:flex; align-items:stretch; gap:0; flex-wrap:wrap; margin-bottom:6px; }
-  .node { flex:1 1 0; min-width:96px; background:var(--panel); border:1px solid var(--border);
-          border-radius:10px; padding:10px 8px; text-align:center; position:relative;
-          transition:border-color .3s, box-shadow .3s, background .3s; }
-  .node .ic { font-size:18px; }
-  .node .nm { font-size:11.5px; font-weight:600; margin-top:2px; }
-  .node .sub { font-size:10px; color:var(--muted); margin-top:1px; }
-  .node .proto { font-size:9px; color:var(--muted); margin-top:4px; text-transform:uppercase; letter-spacing:.4px; }
-  .arrow { align-self:center; color:var(--muted); padding:0 4px; font-size:14px; }
-  .node.done { border-color:var(--accent); box-shadow:0 0 0 1px var(--accent) inset; }
-  .node.permit { border-color:var(--ok); box-shadow:0 0 0 1px var(--ok) inset; }
-  .node.deny { border-color:var(--deny); box-shadow:0 0 0 1px var(--deny) inset; }
-  .node .flag { position:absolute; top:-8px; right:-6px; font-size:10px; padding:1px 6px;
-                border-radius:10px; font-weight:700; display:none; }
-  .node.permit .flag { display:inline-block; background:rgba(63,185,80,.16); color:var(--ok); }
-  .node.deny .flag { display:inline-block; background:rgba(248,81,73,.16); color:var(--deny); }
+  /* interaction graph */
+  .graphwrap { width:100%; overflow-x:auto; margin-bottom:4px; }
+  #graph { width:100%; height:auto; min-width:660px; display:block; }
+  .gnode rect { fill:var(--panel); stroke:var(--border); stroke-width:1.5;
+                transition:stroke .35s, filter .35s; }
+  .gnode .gt { fill:#e6edf3; font-family:system-ui,sans-serif; font-size:11.5px; font-weight:600; }
+  .gnode .gs { fill:var(--muted); font-family:system-ui,sans-serif; font-size:9.5px; }
+  .gnode .gic { font-size:15px; }
+  .gnode .gflag { font-family:system-ui,sans-serif; font-size:8.5px; font-weight:700; fill:var(--muted); }
+  .gnode.done rect { stroke:var(--accent); filter:drop-shadow(0 0 3px rgba(88,166,255,.45)); }
+  .gnode.permit rect { stroke:var(--ok); filter:drop-shadow(0 0 3px rgba(63,185,80,.5)); }
+  .gnode.deny rect { stroke:var(--deny); filter:drop-shadow(0 0 4px rgba(248,81,73,.5)); }
+  .gnode.done .gflag { fill:var(--accent); }
+  .gnode.permit .gflag { fill:var(--ok); }
+  .gnode.deny .gflag { fill:var(--deny); }
+  .gedge { stroke:var(--border); stroke-width:1.5; fill:none; marker-end:url(#garrow); }
+  .gedge.thin { stroke-width:1.2; opacity:.85; }
+  .gedge.dash { stroke:var(--pdp); stroke-dasharray:4 3; marker-end:url(#garrowd); opacity:.8; }
+  .gelabel { fill:var(--muted); font-family:system-ui,sans-serif; font-size:8.5px; }
+  .gelabel.dash { fill:var(--pdp); }
   .pdp-note { font-size:11px; color:var(--muted); margin:8px 0 0; }
   .pdp-note b { color:var(--pdp); }
+  .pdp-note b.c-a { color:var(--accent); }
 
   .examples { display:flex; gap:8px; flex-wrap:wrap; margin:16px 0; }
   .examples button { background:var(--panel); color:var(--text); border:1px solid var(--border);
@@ -148,23 +152,12 @@
 </header>
 <div class="wrap">
 
-  <h2 class="section">How a request flows</h2>
-  <div class="pipeline" id="pipeline">
-    <div class="node" data-node="agent"><div class="ic">🤖</div><div class="nm">Agent</div><div class="sub">Claude</div><div class="proto">acts for user</div></div>
-    <div class="arrow">→</div>
-    <div class="node" data-node="attester"><div class="ic">📜</div><div class="nm">Attester</div><div class="sub">client attestation</div><div class="proto">attest_jwt</div><span class="flag"></span></div>
-    <div class="arrow">→</div>
-    <div class="node" data-node="idp"><div class="ic">🎫</div><div class="nm">IdP</div><div class="sub">PingFederate</div><div class="proto">token exchange</div><span class="flag">issued</span></div>
-    <div class="arrow">→</div>
-    <div class="node" data-node="pep1"><div class="ic">🛡️</div><div class="nm">PEP #1</div><div class="sub">Kong · MCP edge</div><div class="proto">DPoP token</div><span class="flag"></span></div>
-    <div class="arrow">→</div>
-    <div class="node" data-node="mcp"><div class="ic">🧰</div><div class="nm">MCP</div><div class="sub">bank tools</div><div class="proto">tools/call</div></div>
-    <div class="arrow">→</div>
-    <div class="node" data-node="pep2"><div class="ic">🛡️</div><div class="nm">PEP #2</div><div class="sub">Kong · API edge</div><div class="proto">bearer token</div><span class="flag"></span></div>
-    <div class="arrow">→</div>
-    <div class="node" data-node="bankapi"><div class="ic">🏦</div><div class="nm">Bank API</div><div class="sub">resource server</div><div class="proto">accounts · payments</div></div>
+  <h2 class="section">How the agents &amp; services interact</h2>
+  <div class="graphwrap">
+    <svg id="graph" viewBox="0 0 960 360" preserveAspectRatio="xMinYMin meet" role="img"
+         aria-label="Interaction graph: Alice delegates to a principal agent, which delegates to a task agent; agents are attested and exchange tokens at the AS, then call the bank through two Kong policy enforcement points backed by Ping Authorize."></svg>
   </div>
-  <p class="pdp-note">Both PEPs call the <b>AuthZEN PDP</b> adapter → <b>Ping Authorize</b> for a PERMIT/DENY before letting a request through. Nodes light up green/red below once a run completes.</p>
+  <p class="pdp-note">Alice authorises a <b class="c-a">principal agent</b>, which <b class="c-a">delegates</b> to a task agent — the token exchange <b class="c-a">nests the actor chain</b> at each hop. Both gateways (PEP&nbsp;#1/#2) and the token exchange consult <b>Ping Authorize</b> (the PDP) for a PERMIT/DENY. Nodes light up as a run progresses.</p>
 
   <div class="examples">
     <button data-prompt="I'd like to open a new savings account and move $500 into it from my checking account.">Open savings + fund $500</button>
@@ -263,14 +256,77 @@ function toolToAuthzen(name, input){
   return authzenRequest('invoke_tool','mcp-tool',name);
 }
 
+// ---- interaction graph -------------------------------------------------------
+const GW=140, GH=46;
+const GN = {
+  alice:     {x:6,   y:26,  ic:'🧑', t:'Alice',           s:'principal · human'},
+  principal: {x:230, y:26,  ic:'🤖', t:'Principal Agent', s:'concierge'},
+  task:      {x:454, y:26,  ic:'🤖', t:'Task Agent',      s:'onboarding'},
+  pep1:      {x:806, y:26,  ic:'🛡️', t:'PEP #1',          s:'Kong · MCP edge'},
+  mcp:       {x:806, y:118, ic:'🧰', t:'MCP',             s:'bank tools'},
+  pep2:      {x:806, y:210, ic:'🛡️', t:'PEP #2',          s:'Kong · API edge'},
+  bankapi:   {x:806, y:302, ic:'🏦', t:'Bank API',        s:'resource server'},
+  attester:  {x:230, y:150, ic:'📜', t:'Attester',        s:'client attestation'},
+  as:        {x:454, y:158, ic:'🎫', t:'PingFederate AS', s:'token exchange'},
+  pdp:       {x:600, y:302, ic:'⚖️', t:'Ping Authorize',  s:'policy decision point'},
+};
+const GE = [
+  ['alice','principal','acts for'],
+  ['principal','task','delegates'],
+  ['task','pep1','presents DPoP token'],
+  ['pep1','mcp','MCP session'],
+  ['mcp','pep2','tools/call'],
+  ['pep2','bankapi','bank call'],
+  ['principal','attester','attested','thin'],
+  ['task','as','token exchange','thin'],
+  ['pep1','pdp','decision','dash'],
+  ['pep2','pdp','decision','dash'],
+  ['as','pdp','governs issuance','dash'],
+];
+function gcenter(n){ return [n.x+GW/2, n.y+GH/2]; }
+function gboundary(n, tx, ty){
+  const [cx,cy]=gcenter(n); const dx=tx-cx, dy=ty-cy;
+  if(!dx && !dy) return [cx,cy];
+  const t=Math.min((GW/2)/(Math.abs(dx)||1e-6),(GH/2)/(Math.abs(dy)||1e-6));
+  return [cx+dx*t, cy+dy*t];
+}
+function buildGraph(){
+  const svg=document.getElementById('graph'); if(!svg) return;
+  let edges='', nodes='';
+  for(const [a,b,label,kind] of GE){
+    const na=GN[a], nb=GN[b];
+    const [bx,by]=gcenter(nb), [ax,ay]=gcenter(na);
+    const p1=gboundary(na,bx,by), p2=gboundary(nb,ax,ay);
+    const cls='gedge'+(kind==='dash'?' dash':kind==='thin'?' thin':'');
+    edges+=`<path class="${cls}" d="M${p1[0].toFixed(1)},${p1[1].toFixed(1)} L${p2[0].toFixed(1)},${p2[1].toFixed(1)}"/>`;
+    const mx=(p1[0]+p2[0])/2, my=(p1[1]+p2[1])/2;
+    edges+=`<text class="gelabel${kind==='dash'?' dash':''}" x="${mx.toFixed(1)}" y="${(my-4).toFixed(1)}" text-anchor="middle">${label}</text>`;
+  }
+  for(const [id,n] of Object.entries(GN)){
+    nodes+=`<g class="gnode" data-node="${id}">
+      <rect x="${n.x}" y="${n.y}" width="${GW}" height="${GH}" rx="8"/>
+      <text class="gic" x="${n.x+15}" y="${n.y+29}">${n.ic}</text>
+      <text class="gt" x="${n.x+34}" y="${n.y+21}">${n.t}</text>
+      <text class="gs" x="${n.x+34}" y="${n.y+35}">${n.s}</text>
+      <text class="gflag" x="${n.x+GW}" y="${n.y-4}" text-anchor="end"></text>
+    </g>`;
+  }
+  const defs=`<defs>
+    <marker id="garrow" markerWidth="8" markerHeight="8" refX="6.5" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 z" fill="var(--muted)"/></marker>
+    <marker id="garrowd" markerWidth="8" markerHeight="8" refX="6.5" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 z" fill="var(--pdp)"/></marker>
+  </defs>`;
+  svg.innerHTML=defs+edges+nodes;
+}
+
 function setNode(node, state, flag){
-  const n = document.querySelector(`.node[data-node="${node}"]`);
+  const n = document.querySelector(`[data-node="${node}"]`);
   if(!n) return;
   n.classList.remove('done','permit','deny');
   if(state) n.classList.add(state);
-  if(flag!==undefined){ const f=n.querySelector('.flag'); if(f) f.textContent = flag; }
+  if(flag!==undefined){ const f=n.querySelector('.flag, .gflag'); if(f) f.textContent = flag; }
 }
-function resetPipeline(){ ['agent','attester','idp','pep1','mcp','pep2','bankapi'].forEach(n=>setNode(n,'')); }
+function resetPipeline(){ ['alice','principal','task','attester','as','pep1','mcp','pep2','bankapi','pdp'].forEach(n=>setNode(n,'','')); }
+buildGraph();
 
 function scopeChips(scope){
   if(!scope) return '';
@@ -317,7 +373,7 @@ function presentedChip(p){
 function render(steps) {
   for (const s of steps) {
     if (s.type === 'attestation') {
-      setNode('agent','done'); setNode('attester','done','attested');
+      setNode('task','done'); setNode('attester','done','attests');
       const w = s.workload || {};
       const wrows = Object.keys(w).map(k =>
         `<div class="ck">${esc(k)}</div><div class="cv">${esc(String(w[k]))}</div>`).join('');
@@ -341,7 +397,7 @@ function render(steps) {
         `<div class="label">🎫 ${esc(s.title||'Client attestation')}</div>${esc(s.detail)}${meta}
          <div class="explain">Instead of a shared secret, a trusted attester vouches for the agent's identity and AgentCore attributes and binds its DPoP key — so PingFederate can verify <b>what</b> the agent is, not just that it holds a password.</div>${wire}`));
     } else if (s.type === 'auth') {
-      setNode('agent','done'); setNode('idp','done','issued');
+      setNode('alice','done'); setNode('task','done');
       const meta = `<div class="claims" style="margin-top:8px">
         <div class="ck">client_id</div><div class="cv">${esc(s.client_id||'')} <span style="color:var(--muted)">(agent operator)</span></div>
         <div class="ck">agent</div><div class="cv act">${esc(s.agent||'')}</div>
@@ -351,7 +407,9 @@ function render(steps) {
         `<div class="label">① ${esc(s.title||'Agent authenticates')}</div>${esc(s.detail)}${meta}
          <div class="explain">The agent is its own identity and holds a private key; the token it gets next will be bound to that key.</div>`));
     } else if (s.type === 'token_exchange') {
-      setNode('idp','done','issued');
+      setNode('alice','done'); setNode('as','done','issued');
+      if (s.hop >= 1) setNode('principal','done');
+      if (s.hop >= 2) setNode('task','done');
       CTX.sub = s.sub; CTX.act = s.act_sub || s.act; CTX.scope = s.scope;
       CTX.client_id = s.client_id || (s.claims && s.claims.client_id);
       // Build the delegation chain: principal ◀ earliest-delegator ◀ … ◀ current
@@ -381,7 +439,7 @@ function render(steps) {
          ${chain}${tokenPanel(s)}
          <div class="explain">Delegation, not impersonation: each hop <b>nests</b> the <code>act</code> claim, so the token records the whole chain — every downstream action is attributable to the human <i>and</i> every agent that delegated.${hopBadge}</div>${wire}`));
     } else if (s.type === 'connect') {
-      setNode('pep1','permit','permit'); setNode('mcp','done');
+      setNode('pep1','permit','permit'); setNode('mcp','done'); setNode('pdp','permit','PERMIT');
       const p = s.presented || {};
       const url = s.mcp_url || '/mcp';
       const wire = wireDetails('wire detail — real MCP handshake + PEP #1 decision', [
@@ -400,7 +458,7 @@ function render(steps) {
          ${presentedChip(p)}
          <div class="explain">Kong authenticated the real DPoP-bound token and asked the PDP to permit MCP access before the session opened.</div>${wire}`));
     } else if (s.type === 'connect_error') {
-      setNode('pep1','deny','deny');
+      setNode('pep1','deny','deny'); setNode('pdp','deny','DENY');
       out.appendChild(el('step tool_result',
         `<div class="label">🛡️ Gateway connect · PEP #1 (MCP edge)</div>
          <span class="decision deny">✘ DENY</span>
@@ -426,8 +484,8 @@ function render(steps) {
       const allowed = s.authorized;
       const pep = s.pep ? `<span class="pep">at ${esc(s.pep)}${s.pep_action ? ' · action=' + esc(s.pep_action) : ''}</span>` : '';
       let badge = '';
-      if (allowed === true) { badge = `<span class="decision allow">✔ PERMIT</span>${pep}`; setNode('pep2','permit','permit'); setNode('bankapi','done'); }
-      else if (allowed === false) { badge = `<span class="decision deny">✘ DENY</span>${pep}`; setNode('pep2','deny','deny'); }
+      if (allowed === true) { badge = `<span class="decision allow">✔ PERMIT</span>${pep}`; setNode('pep2','permit','permit'); setNode('bankapi','done'); setNode('pdp','permit','PERMIT'); }
+      else if (allowed === false) { badge = `<span class="decision deny">✘ DENY</span>${pep}`; setNode('pep2','deny','deny'); setNode('pdp','deny','DENY'); }
       const reason = s.policy_reason ? `<div class="reason">Policy reason: ${esc(s.policy_reason)}</div>` : '';
       const wire = (allowed === true || allowed === false) ? wireDetails('wire detail — PDP decision', [
         { label:'AuthZEN decision response', desc:'from Ping Authorize via the AuthZEN adapter; Kong enforces it',
