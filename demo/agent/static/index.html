@@ -54,6 +54,12 @@
   button.send { background:var(--accent); color:#fff; border:none; border-radius:8px;
                 padding:0 20px; cursor:pointer; font-weight:600; }
   button.send:disabled { opacity:.5; cursor:default; }
+  button.newconv { background:transparent; color:var(--muted); border:1px solid var(--border);
+                   border-radius:8px; padding:0 14px; cursor:pointer; font-size:12px; }
+  button.newconv:hover { color:#e6edf3; border-color:var(--accent); }
+  .step.memory { border-left:2px solid var(--accent); }
+  .turn-sep { text-align:center; color:var(--muted); font-size:11px; margin:14px 0 4px;
+              border-top:1px dashed var(--border); padding-top:8px; }
 
   .transcript { display:flex; flex-direction:column; gap:10px; }
   .step { border:1px solid var(--border); border-radius:10px; padding:12px 14px; background:var(--panel); }
@@ -169,6 +175,7 @@
     <input id="prompt" type="text" autocomplete="off"
            placeholder="Ask the agent to open an account and make a payment…" />
     <button class="send" type="submit">Send</button>
+    <button class="newconv" type="button" id="newconv" title="Start a fresh conversation">New conversation</button>
   </form>
 
   <div id="transcript" class="transcript"></div>
@@ -214,6 +221,10 @@ const form = document.getElementById('chat');
 const input = document.getElementById('prompt');
 const out = document.getElementById('transcript');
 const sendBtn = form.querySelector('button.send');
+const newConvBtn = document.getElementById('newconv');
+function newSid(){ return 'web-' + Math.random().toString(36).slice(2,10) + Date.now().toString(36); }
+let SID = localStorage.getItem('bankagent_sid') || newSid();
+localStorage.setItem('bankagent_sid', SID);
 
 document.querySelectorAll('.examples button').forEach(b => {
   b.addEventListener('click', () => { input.value = b.dataset.prompt; input.focus(); });
@@ -372,7 +383,11 @@ function presentedChip(p){
 
 function render(steps) {
   for (const s of steps) {
-    if (s.type === 'attestation') {
+    if (s.type === 'memory') {
+      out.appendChild(el('step memory',
+        `<div class="label">🧠 Memory</div>${esc(s.detail||'')}
+         <div class="explain">The agent recalls this session's earlier turns, so it can follow up in context. Identity is still re-established (fresh token, re-authorized) every turn.</div>`));
+    } else if (s.type === 'attestation') {
       setNode('task','done'); setNode('attester','done','attests');
       const w = s.workload || {};
       const wrows = Object.keys(w).map(k =>
@@ -509,32 +524,45 @@ form.addEventListener('submit', async (e) => {
   e.preventDefault();
   const prompt = input.value.trim();
   if (!prompt) return;
-  out.innerHTML = '';
+  // Keep the conversation thread (.convo), but drop the previous turn's
+  // mechanics (.mech) so the identity/tool detail doesn't pile up turn on turn.
+  out.querySelectorAll('.mech').forEach(n => n.remove());
+  if (out.querySelector('.convo')) out.appendChild(el('turn-sep mech', 'new turn — same session, agent has context'));
   resetPipeline();
-  out.appendChild(el('step agent', `<div class="label">🧑 You</div>${esc(prompt)}`));
+  out.appendChild(el('step agent convo', `<div class="label">🧑 You</div>${esc(prompt)}`));
   input.value = '';
   sendBtn.disabled = true;
-  const spin = el('step spinner', 'Agent is working (authenticating, exchanging tokens, calling tools through the Kong policy gateways)…');
+  const spin = el('step spinner mech', 'Agent is working (recalling context, authenticating, exchanging tokens, calling tools through the Kong policy gateways)…');
   out.appendChild(spin);
   try {
     const res = await fetch('/invocations', {
       method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({ prompt, session_id: 'web-demo' })
+      body: JSON.stringify({ prompt, session_id: SID })
     });
     const data = await res.json();
     spin.remove();
     if (data.error) {
-      out.appendChild(el('step tool_result', `<div class="label">⚠ Error</div><pre>${esc(data.error)}</pre>`));
+      out.appendChild(el('step tool_result convo', `<div class="label">⚠ Error</div><pre>${esc(data.error)}</pre>`));
     } else {
+      const from = out.children.length;
       render(data.transcript || []);
-      out.appendChild(el('step final agent', `<div class="label">✅ Agent — final answer</div>${esc(data.final)}`));
+      for (let i = from; i < out.children.length; i++) out.children[i].classList.add('mech');
+      out.appendChild(el('step final agent convo', `<div class="label">✅ Agent — final answer</div>${esc(data.final)}`));
     }
   } catch (err) {
     spin.remove();
-    out.appendChild(el('step tool_result', `<div class="label">⚠ Error</div><pre>${esc(err)}</pre>`));
+    out.appendChild(el('step tool_result convo', `<div class="label">⚠ Error</div><pre>${esc(err)}</pre>`));
   } finally {
     sendBtn.disabled = false;
+    out.lastChild && out.lastChild.scrollIntoView({behavior:'smooth', block:'end'});
   }
+});
+
+newConvBtn.addEventListener('click', async () => {
+  try { await fetch('/reset', { method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ session_id: SID }) }); } catch (e) {}
+  SID = newSid(); localStorage.setItem('bankagent_sid', SID);
+  out.innerHTML = ''; resetPipeline(); input.focus();
 });
 </script>
 </body>

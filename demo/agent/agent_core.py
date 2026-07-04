@@ -38,6 +38,31 @@ MCP_SERVER_URL = os.environ.get("MCP_SERVER_URL", "http://localhost:8090/mcp")
 ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-5")
 MAX_TURNS = int(os.environ.get("AGENT_MAX_TURNS", "12"))
 
+# --- conversation memory ------------------------------------------------------
+# Per-session conversation history so the agent remembers earlier turns. This is
+# an in-process store (fine for the single-replica demo; not shared across
+# replicas and cleared on restart). Keyed by session_id sent from the UI.
+_SESSIONS: dict[str, list[dict[str, Any]]] = {}
+MAX_HISTORY_MESSAGES = int(os.environ.get("AGENT_HISTORY_MESSAGES", "40"))
+MAX_SESSIONS = int(os.environ.get("AGENT_MAX_SESSIONS", "100"))
+
+
+def _trim_history(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Cap history length, trimming to a real user-turn boundary so the first
+    message is a plain user prompt (never an orphaned tool_result), which the
+    Anthropic API requires."""
+    if len(messages) <= MAX_HISTORY_MESSAGES:
+        return messages
+    tail = messages[-MAX_HISTORY_MESSAGES:]
+    for i, m in enumerate(tail):
+        if m.get("role") == "user" and isinstance(m.get("content"), str):
+            return tail[i:]
+    return tail
+
+
+def reset_session(session_id: str) -> None:
+    _SESSIONS.pop(session_id, None)
+
 SYSTEM_PROMPT = """\
 You are a helpful banking assistant for Northwind Bank. You act on behalf of an
 authenticated customer and can open accounts and move money using the tools
@@ -151,7 +176,17 @@ async def run_agent(prompt: str, session_id: str = "demo") -> dict[str, Any]:
                     "tools": [t["name"] for t in tools],
                 })
 
-                messages: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
+                # Seed from this session's prior turns so the agent has memory,
+                # then add the new user prompt.
+                messages: list[dict[str, Any]] = list(_SESSIONS.get(session_id, []))
+                messages.append({"role": "user", "content": prompt})
+                if len(messages) > 1:
+                    transcript.append({
+                        "type": "memory",
+                        "detail": f"Continuing session '{session_id}' with "
+                                  f"{len(messages) - 1} prior message(s) of context.",
+                        "prior_messages": len(messages) - 1,
+                    })
 
                 for _turn in range(MAX_TURNS):
                     resp = client.messages.create(
@@ -212,6 +247,11 @@ async def run_agent(prompt: str, session_id: str = "demo") -> dict[str, Any]:
                         })
 
                     messages.append({"role": "user", "content": tool_results})
+
+                # Persist the conversation so the next turn in this session has memory.
+                _SESSIONS[session_id] = _trim_history(messages)
+                if len(_SESSIONS) > MAX_SESSIONS:
+                    _SESSIONS.pop(next(iter(_SESSIONS)))
     except Exception as exc:  # noqa: BLE001 - surface a clean gateway denial to the UI
         detail = _describe_connect_error(exc)
         logger.warning("MCP connect/session failed: %s", exc)

@@ -18,7 +18,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from agent_core import run_agent
+from agent_core import reset_session, run_agent
 
 app = FastAPI(title="Northwind Bank Agent (AgentCore-compatible)")
 
@@ -54,6 +54,15 @@ async def invocations(request: Request):
     except Exception as exc:  # noqa: BLE001 - surface errors to the demo UI
         return JSONResponse(status_code=500, content={"error": str(exc)})
     return result
+
+
+@app.post("/reset")
+async def reset(request: Request):
+    """Clear a session's conversation memory (the UI's 'New conversation')."""
+    body = await request.json()
+    session_id = (body.get("input", body)).get("session_id", "demo")
+    reset_session(session_id)
+    return {"status": "reset", "session_id": session_id}
 
 
 @app.get("/")
