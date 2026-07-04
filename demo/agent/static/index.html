@@ -535,20 +535,7 @@ form.addEventListener('submit', async (e) => {
   const spin = el('step spinner mech', 'Agent is working (recalling context, authenticating, exchanging tokens, calling tools through the Kong policy gateways)…');
   out.appendChild(spin);
   try {
-    const res = await fetch('/invocations', {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({ prompt, session_id: SID })
-    });
-    const data = await res.json();
-    spin.remove();
-    if (data.error) {
-      out.appendChild(el('step tool_result convo', `<div class="label">⚠ Error</div><pre>${esc(data.error)}</pre>`));
-    } else {
-      const from = out.children.length;
-      render(data.transcript || []);
-      for (let i = from; i < out.children.length; i++) out.children[i].classList.add('mech');
-      out.appendChild(el('step final agent convo', `<div class="label">✅ Agent — final answer</div>${esc(data.final)}`));
-    }
+    await streamRun(prompt, spin);
   } catch (err) {
     spin.remove();
     out.appendChild(el('step tool_result convo', `<div class="label">⚠ Error</div><pre>${esc(err)}</pre>`));
@@ -557,6 +544,51 @@ form.addEventListener('submit', async (e) => {
     out.lastChild && out.lastChild.scrollIntoView({behavior:'smooth', block:'end'});
   }
 });
+
+// Render one streamed step live and tag it as this-turn mechanics.
+function renderLive(ev){
+  const from = out.children.length;
+  render([ev]);
+  for (let i = from; i < out.children.length; i++) out.children[i].classList.add('mech');
+}
+
+// Stream the run over SSE so the diagram lights up as each event arrives.
+// Falls back to the non-streaming /invocations endpoint if streaming is unavailable.
+async function streamRun(prompt, spin){
+  let res;
+  try {
+    res = await fetch('/stream', { method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ prompt, session_id: SID }) });
+  } catch(e){ res = null; }
+  if(!res || !res.ok || !res.body){
+    spin.remove();
+    const data = await (await fetch('/invocations', { method:'POST',
+      headers:{'Content-Type':'application/json'}, body: JSON.stringify({ prompt, session_id: SID }) })).json();
+    if(data.error){ out.appendChild(el('step tool_result convo', `<div class="label">⚠ Error</div><pre>${esc(data.error)}</pre>`)); return; }
+    render(data.transcript || []);
+    out.appendChild(el('step final agent convo', `<div class="label">✅ Agent — final answer</div>${esc(data.final)}`));
+    return;
+  }
+  const reader = res.body.getReader(); const dec = new TextDecoder();
+  let buf = '', finalText = '', firstSeen = false;
+  while(true){
+    const { value, done } = await reader.read(); if(done) break;
+    buf += dec.decode(value, { stream:true });
+    let idx;
+    while((idx = buf.indexOf('\n\n')) >= 0){
+      const frame = buf.slice(0, idx); buf = buf.slice(idx + 2);
+      const dline = frame.split('\n').find(l => l.startsWith('data:'));
+      if(!dline) continue;
+      let ev; try { ev = JSON.parse(dline.slice(5).trim()); } catch(e){ continue; }
+      if(!firstSeen){ spin.remove(); firstSeen = true; }
+      if(ev.type === 'final'){ finalText = ev.final || ''; continue; }
+      renderLive(ev);
+      await new Promise(r => setTimeout(r, 150));   // small stagger so nodes light in sequence
+    }
+  }
+  if(!firstSeen) spin.remove();
+  out.appendChild(el('step final agent convo', `<div class="label">✅ Agent — final answer</div>${esc(finalText || 'Done.')}`));
+}
 
 newConvBtn.addEventListener('click', async () => {
   try { await fetch('/reset', { method:'POST', headers:{'Content-Type':'application/json'},

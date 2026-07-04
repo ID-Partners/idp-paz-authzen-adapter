@@ -16,11 +16,12 @@ decisions.
 """
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 import logging
 import os
-from typing import Any
+from typing import Any, AsyncIterator
 
 import anthropic
 from mcp import ClientSession
@@ -113,25 +114,23 @@ def _extract_text(content_block) -> str:
     return "\n".join(parts)
 
 
-async def run_agent(prompt: str, session_id: str = "demo") -> dict[str, Any]:
-    """Run one agent turn against the user's prompt.
+async def agent_events(prompt: str, session_id: str = "demo") -> AsyncIterator[dict[str, Any]]:
+    """Run one agent turn, yielding each transcript step AS IT HAPPENS.
 
-    Returns a structured transcript describing the agent's reasoning text, each
-    tool call, and each tool result (including the Ping Authorize decision), plus
-    the final assistant message.
+    Emits identity steps, the gateway connect, the agent's reasoning, each tool
+    call and its Ping Authorize decision, and finally a `{"type":"final", ...}`
+    event with the assistant's answer. Consumers (the SSE endpoint, or the
+    `run_agent` collector below) render each event the moment it arrives so the
+    UI can reflect activity live.
     """
-    transcript: list[dict[str, Any]] = []
     client = _anthropic_client()
 
     # 1) Establish the agent's authority: authenticate and obtain a delegated,
     #    DPoP-bound token via token exchange (sub=principal, act.sub=agent).
     cred = acquire_delegated_token()
-    transcript.extend(cred.steps)
+    for step in cred.steps:
+        yield step
 
-    # The REAL sender-constrained credential the agent will present at every
-    # component. We surface a truncated view (never the full secret) plus a fresh
-    # real DPoP proof per component, so the UI can show the actual token flowing
-    # through PEP #1 → MCP → PEP #2 → Bank API — not a placeholder.
     _tok = cred.access_token
     token_preview = (_tok[:28] + "…" + _tok[-14:]) if len(_tok) > 44 else _tok
 
@@ -146,8 +145,6 @@ async def run_agent(prompt: str, session_id: str = "demo") -> dict[str, Any]:
         }
 
     # 2) Present the token (DPoP-bound) on every MCP request to Kong (PEP #1).
-    #    Prefer per-request DPoP proofs via httpx auth; fall back to a static
-    #    Authorization header if the installed MCP SDK lacks an `auth` param.
     client_kwargs: dict[str, Any] = {}
     if "auth" in inspect.signature(streamablehttp_client).parameters:
         client_kwargs["auth"] = cred.httpx_auth()
@@ -159,13 +156,14 @@ async def run_agent(prompt: str, session_id: str = "demo") -> dict[str, Any]:
         dpop_note = "static DPoP header (SDK has no auth hook)"
 
     logger.info("Connecting to MCP server at %s (%s)", MCP_SERVER_URL, dpop_note)
+    agent_texts: list[str] = []
     try:
         async with streamablehttp_client(MCP_SERVER_URL, **client_kwargs) as (read, write, _):
             async with ClientSession(read, write) as session:
                 await session.initialize()
                 listed = await session.list_tools()
                 tools = _mcp_tools_to_anthropic(listed.tools)
-                transcript.append({
+                yield {
                     "type": "connect",
                     "detail": f"Connected via Kong gateway (PEP #1) to MCP service "
                               f"'{MCP_SERVER_URL}' using {dpop_note}. "
@@ -174,28 +172,26 @@ async def run_agent(prompt: str, session_id: str = "demo") -> dict[str, Any]:
                     "token_preview": token_preview,
                     "presented": presented(MCP_SERVER_URL),
                     "tools": [t["name"] for t in tools],
-                })
+                }
 
-                # Seed from this session's prior turns so the agent has memory,
-                # then add the new user prompt.
+                # Seed from this session's prior turns so the agent has memory.
                 messages: list[dict[str, Any]] = list(_SESSIONS.get(session_id, []))
                 messages.append({"role": "user", "content": prompt})
                 if len(messages) > 1:
-                    transcript.append({
+                    yield {
                         "type": "memory",
                         "detail": f"Continuing session '{session_id}' with "
                                   f"{len(messages) - 1} prior message(s) of context.",
                         "prior_messages": len(messages) - 1,
-                    })
+                    }
 
                 for _turn in range(MAX_TURNS):
-                    resp = client.messages.create(
-                        model=ANTHROPIC_MODEL,
-                        max_tokens=1024,
-                        system=SYSTEM_PROMPT,
-                        tools=tools,
-                        messages=messages,
-                    )
+                    # Run the (blocking) Anthropic call off the event loop so the
+                    # already-yielded events flush to the client while it thinks.
+                    resp = await asyncio.to_thread(
+                        lambda: client.messages.create(
+                            model=ANTHROPIC_MODEL, max_tokens=1024,
+                            system=SYSTEM_PROMPT, tools=tools, messages=messages))
 
                     assistant_content: list[dict[str, Any]] = []
                     tool_uses = []
@@ -203,7 +199,8 @@ async def run_agent(prompt: str, session_id: str = "demo") -> dict[str, Any]:
                         if block.type == "text":
                             assistant_content.append({"type": "text", "text": block.text})
                             if block.text.strip():
-                                transcript.append({"type": "agent", "text": block.text})
+                                agent_texts.append(block.text)
+                                yield {"type": "agent", "text": block.text}
                         elif block.type == "tool_use":
                             assistant_content.append({
                                 "type": "tool_use", "id": block.id,
@@ -218,20 +215,16 @@ async def run_agent(prompt: str, session_id: str = "demo") -> dict[str, Any]:
 
                     tool_results = []
                     for tu in tool_uses:
-                        transcript.append({
-                            "type": "tool_call",
-                            "name": tu.name,
-                            "input": tu.input,
-                            "mcp_url": MCP_SERVER_URL,
-                            "token_preview": token_preview,
+                        yield {
+                            "type": "tool_call", "name": tu.name, "input": tu.input,
+                            "mcp_url": MCP_SERVER_URL, "token_preview": token_preview,
                             "presented": presented(MCP_SERVER_URL),
-                        })
+                        }
                         result = await session.call_tool(tu.name, tu.input)
                         text = _extract_text(result.content)
                         parsed = _safe_json(text)
-                        transcript.append({
-                            "type": "tool_result",
-                            "name": tu.name,
+                        yield {
+                            "type": "tool_result", "name": tu.name,
                             "authorized": (parsed or {}).get("authorized"),
                             "policy_reason": (parsed or {}).get("policy_reason")
                                              or (parsed or {}).get("message"),
@@ -239,35 +232,42 @@ async def run_agent(prompt: str, session_id: str = "demo") -> dict[str, Any]:
                             "pep_action": (parsed or {}).get("pep_action"),
                             "bank_response": parsed if parsed is not None else text,
                             "result": parsed if parsed is not None else text,
-                        })
+                        }
                         tool_results.append({
-                            "type": "tool_result",
-                            "tool_use_id": tu.id,
-                            "content": text,
+                            "type": "tool_result", "tool_use_id": tu.id, "content": text,
                         })
 
                     messages.append({"role": "user", "content": tool_results})
 
-                # Persist the conversation so the next turn in this session has memory.
+                # Persist the conversation so the next turn has memory.
                 _SESSIONS[session_id] = _trim_history(messages)
                 if len(_SESSIONS) > MAX_SESSIONS:
                     _SESSIONS.pop(next(iter(_SESSIONS)))
     except Exception as exc:  # noqa: BLE001 - surface a clean gateway denial to the UI
         detail = _describe_connect_error(exc)
         logger.warning("MCP connect/session failed: %s", exc)
-        transcript.append({"type": "connect_error", "detail": detail})
-        return {
-            "session_id": session_id,
-            "final": "I authenticated and obtained a delegated, DPoP-bound token, but the "
-                     "policy gateway refused the MCP connection, so I couldn't run any "
-                     "banking tools. " + detail,
-            "transcript": transcript,
-        }
+        yield {"type": "connect_error", "detail": detail}
+        yield {"type": "final", "session_id": session_id,
+               "final": "I authenticated and obtained a delegated, DPoP-bound token, but "
+                        "the policy gateway refused the MCP connection, so I couldn't run "
+                        "any banking tools. " + detail}
+        return
 
-    final_text = "\n\n".join(
-        s["text"] for s in transcript if s["type"] == "agent"
-    ) or "Done."
-    return {"session_id": session_id, "final": final_text, "transcript": transcript}
+    yield {"type": "final", "session_id": session_id,
+           "final": "\n\n".join(agent_texts) or "Done."}
+
+
+async def run_agent(prompt: str, session_id: str = "demo") -> dict[str, Any]:
+    """Non-streaming wrapper (AgentCore /invocations contract): collect the
+    streamed events into a full transcript + final answer."""
+    transcript: list[dict[str, Any]] = []
+    final = "Done."
+    async for ev in agent_events(prompt, session_id):
+        if ev.get("type") == "final":
+            final = ev.get("final", final)
+        else:
+            transcript.append(ev)
+    return {"session_id": session_id, "final": final, "transcript": transcript}
 
 
 def _describe_connect_error(exc: BaseException) -> str:
