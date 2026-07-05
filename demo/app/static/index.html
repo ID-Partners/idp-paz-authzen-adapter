@@ -366,9 +366,18 @@ function showLogin(){ whoami.style.display = 'none'; signedout.style.display = '
 async function ensureAuth(){
   try {
     const r = await fetch('/me');
-    if(r.ok){ showApp((await r.json()).principal); return; }
+    if(r.ok){ showApp((await r.json()).principal); resumePending(); return; }
   } catch(e){}
   showLogin();
+}
+// After Alice signs in and PingFederate redirects her back, pick up the request
+// that triggered the login challenge and run it — so the agent activity resumes.
+function resumePending(){
+  const p = sessionStorage.getItem('pending_prompt');
+  if(!p) return;
+  sessionStorage.removeItem('pending_prompt');
+  out.appendChild(el('step agent convo', `<div class="label">✅ Signed in with PingFederate</div>Resuming your request…`));
+  setTimeout(()=>runPrompt(p), 400);
 }
 document.getElementById('logout').addEventListener('click', async ()=>{
   try { await fetch('/logout', {method:'POST'}); } catch(e){}
@@ -761,9 +770,7 @@ function render(steps) {
   }
 }
 
-form.addEventListener('submit', async (e) => {
-  e.preventDefault();
-  const prompt = input.value.trim();
+async function runPrompt(prompt){
   if (!prompt) return;
   // Keep the conversation thread (.convo), but drop the previous turn's
   // mechanics (.mech) so the identity/tool detail doesn't pile up turn on turn.
@@ -771,7 +778,6 @@ form.addEventListener('submit', async (e) => {
   if (out.querySelector('.convo')) out.appendChild(el('turn-sep mech', 'new turn — same session, agent has context'));
   resetPipeline();
   out.appendChild(el('step agent convo', `<div class="label">🧑 You</div>${esc(prompt)}`));
-  input.value = '';
   sendBtn.disabled = true;
   const spin = el('step spinner mech', 'Agent is working (recalling context, authenticating, exchanging tokens, calling tools through the Kong policy gateways)…');
   out.appendChild(spin);
@@ -784,6 +790,13 @@ form.addEventListener('submit', async (e) => {
     sendBtn.disabled = false;
     out.lastChild && out.lastChild.scrollIntoView({behavior:'smooth', block:'end'});
   }
+}
+form.addEventListener('submit', (e) => {
+  e.preventDefault();
+  const prompt = input.value.trim();
+  if (!prompt) return;
+  input.value = '';
+  runPrompt(prompt);
 });
 
 // Render one streamed step live and tag it as this-turn mechanics.
@@ -826,7 +839,14 @@ async function streamRun(prompt, spin){
       let ev; try { ev = JSON.parse(dline.slice(5).trim()); } catch(e){ continue; }
       if(!firstSeen){ spin.remove(); firstSeen = true; }
       if(ev.type === 'login_challenge'){
-        out.appendChild(el('step tool_result convo', `<div class="label">🔒 Gateway login challenge</div><div>${esc(ev.detail||'The account gateway requires a signed-in user.')} Redirecting to PingFederate…</div>`));
+        // Remember what Alice asked so we can resume it automatically after she
+        // signs in and PingFederate redirects her back.
+        sessionStorage.setItem('pending_prompt', prompt);
+        setNode('alice','done'); setNode('principal','done');
+        if(ev.stage === 'token_exchange') setNode('as','deny','login required');
+        else setNode('pep1','deny','login required');
+        const title = ev.stage === 'token_exchange' ? '🔒 Sign-in required for token exchange' : '🔒 Sign-in required';
+        out.appendChild(el('step tool_result convo', `<div class="label">${title}</div><div>${esc(ev.detail||'Policy requires an authenticated user.')} Redirecting you to PingFederate…</div>`));
         setTimeout(()=>{ location.href = ev.login_url || '/login'; }, 1800);
         return;
       }

@@ -146,6 +146,23 @@ async def agent_events(prompt: str, session_id: str = "demo",
     """
     client = _anthropic_client()
 
+    # 0) Policy at the token exchange: the Principal Agent can only get a token to
+    #    act FOR Alice by exchanging one at the AS, and issuance requires an
+    #    AUTHENTICATED USER PRINCIPAL (the subject) plus the delegated scopes.
+    #    If Alice isn't signed in there is no subject to exchange — challenge for
+    #    login up front, before any agent work, rather than deep at the gateway.
+    if not user_token:
+        yield {"type": "login_challenge", "role": "principal", "agent_label": "Principal Agent",
+               "login_url": "/login", "stage": "token_exchange",
+               "detail": "The Principal Agent must exchange a token at PingFederate to act on your "
+                         "behalf. Ping Authorize governs issuance and requires an authenticated user "
+                         "principal (the subject) with the delegated scopes — and you're not signed in."}
+        yield {"type": "final", "session_id": session_id,
+               "final": "🔒 Before I can act on your behalf I have to exchange a token at the "
+                        "authorization server, and policy requires you to be signed in first. "
+                        "Taking you to the PingFederate login…"}
+        return
+
     # 1) Establish the Principal Agent (concierge)'s own authority: attestation +
     #    the Alice → concierge token exchange at the AS.
     principal = acquire_principal_credential()
