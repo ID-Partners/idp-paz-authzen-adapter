@@ -27,7 +27,7 @@ return {
           { require_user_login = { type = "boolean", default = false } },
           -- Step-up scope: for `stepup_action`, the user's token (X-User-Token)
           -- must carry this scope; if not, return 401 insufficient_scope.
-          { stepup_scope = { type = "string", default = "" } },
+          { stepup_scope = { type = "string" } },
           { stepup_action = { type = "string", default = "make_payment" } },
         },
       },
