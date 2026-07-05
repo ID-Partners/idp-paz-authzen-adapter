@@ -13,13 +13,10 @@ Railway health checks.
 from __future__ import annotations
 
 import os
-import time
 
 import httpx
-import jwt  # PyJWT
 from fastapi import FastAPI, Request
-from fastapi.responses import FileResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import JSONResponse
 
 import json as _json
 
@@ -29,64 +26,12 @@ from agent_core import agent_events, reset_session, run_agent
 
 app = FastAPI(title="Northwind Bank Agent (AgentCore-compatible)")
 
-STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 # The Bank API's admin reset (direct, internal — a demo convenience, not governed).
 BANK_API_URL = os.environ.get("BANK_API_URL", "http://bank-api.railway.internal:8070")
 
-# --- Principal login ---------------------------------------------------------
-# The human (principal) authenticates to the app before any agent acts on their
-# behalf. In production this is a real IdP (OIDC redirect to PingFederate); here
-# it's a small demo credential store + a signed session token, so Alice can sign
-# in and the chat is gated behind her authenticated session. The principal `sub`
-# (cust-alice) matches the subject the delegated tokens already carry.
-SESSION_SECRET = os.environ.get("SESSION_SECRET", "northwind-demo-session-secret")
-SESSION_TTL = int(os.environ.get("SESSION_TTL", "28800"))  # 8 hours
-DEMO_USERS = {
-    "alice": {"password": os.environ.get("ALICE_PASSWORD", "demo"),
-              "sub": "cust-alice", "name": "Alice Anderson",
-              "email": "alice@northwind.example"},
-}
-
-
-def _issue_session(user: dict, username: str) -> str:
-    now = int(time.time())
-    return jwt.encode({"sub": user["sub"], "name": user["name"], "email": user["email"],
-                       "preferred_username": username, "iat": now, "exp": now + SESSION_TTL},
-                      SESSION_SECRET, algorithm="HS256")
-
-
-def _principal(request: Request) -> dict | None:
-    """Return the authenticated principal claims from the session bearer, or None."""
-    auth = request.headers.get("authorization", "")
-    if not auth.lower().startswith("bearer "):
-        return None
-    try:
-        return jwt.decode(auth.split(" ", 1)[1].strip(), SESSION_SECRET, algorithms=["HS256"])
-    except Exception:  # noqa: BLE001 - any invalid/expired token = not signed in
-        return None
-
-
-@app.post("/login")
-async def login(request: Request):
-    """Authenticate the principal and return a signed session token."""
-    body = await request.json()
-    username = (body.get("username") or "").strip().lower()
-    user = DEMO_USERS.get(username)
-    if not user or (body.get("password") or "") != user["password"]:
-        return JSONResponse(status_code=401, content={"error": "Invalid username or password"})
-    return {"token": _issue_session(user, username),
-            "principal": {"sub": user["sub"], "name": user["name"],
-                          "email": user["email"], "username": username}}
-
-
-@app.get("/me")
-async def me(request: Request):
-    """Return the current signed-in principal (used by the UI to restore a session)."""
-    p = _principal(request)
-    if not p:
-        return JSONResponse(status_code=401, content={"error": "not signed in"})
-    return {"principal": {"sub": p.get("sub"), "name": p.get("name"),
-                          "email": p.get("email"), "username": p.get("preferred_username")}}
+# Login is handled by the separate app/BFF service (real OIDC to PingFederate);
+# this principal-agent service is headless and reached over the private network.
+# The BFF forwards Alice's identity + PF token as X-Principal-Sub / X-User-Token.
 
 
 @app.get("/ping")
@@ -107,8 +52,6 @@ async def invocations(request: Request):
     Body: {"prompt": "...", "session_id": "..."} (also accepts AgentCore's
     {"input": {...}} envelope).
     """
-    if not _principal(request):
-        return JSONResponse(status_code=401, content={"error": "login required"})
     body = await request.json()
     payload = body.get("input", body)
     prompt = payload.get("prompt") or payload.get("message") or ""
@@ -126,8 +69,6 @@ async def invocations(request: Request):
 async def stream(request: Request):
     """Stream the agent's steps as Server-Sent Events so the UI can reflect
     activity live. Each event is a transcript step; the last is {"type":"final"}."""
-    if not _principal(request):
-        return JSONResponse(status_code=401, content={"error": "login required"})
     body = await request.json()
     payload = body.get("input", body)
     prompt = payload.get("prompt") or payload.get("message") or ""
@@ -172,11 +113,9 @@ async def reset(request: Request):
 
 @app.get("/")
 def index():
-    return FileResponse(os.path.join(STATIC_DIR, "index.html"))
-
-
-if os.path.isdir(STATIC_DIR):
-    app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+    """Headless principal agent — the UI + login live in the separate app/BFF."""
+    return {"service": "principal-agent", "role": "concierge",
+            "note": "UI and login are served by the app/BFF service"}
 
 
 if __name__ == "__main__":
