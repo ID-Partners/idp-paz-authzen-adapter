@@ -1,0 +1,3 @@
+{
+  "https://attester.example.com": { "keys": [ {"kty":"EC","kid":"mock-attester-1","x":"c2pTtxD_E2ZGIMam9QGsiDvlY57axE9Q9LKSnidQUag","y":"ZI_wiUp0BUd_Gmi9412cAet7vBMhi4fkwclL_ujlTSI","crv":"P-256"} ] }
+}
