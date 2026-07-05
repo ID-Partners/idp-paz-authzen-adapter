@@ -13,6 +13,8 @@ COPY --chown=9031:0 oidf.war /opt/in/instance/server/default/deploy/oidf.war
 COPY --chown=9031:0 pf-oidf-modules.jar /opt/in/instance/server/default/deploy/pf-oidf-modules.jar
 COPY --chown=9031:0 jose4j-0.9.6.jar /opt/in/instance/server/default/deploy/jose4j-0.9.6.jar
 COPY --chown=9031:0 oidf-mock-attesters.json /opt/in/instance/server/default/conf/oidf-mock-attesters.json
+# Northwind-branded HTML Form login page (native submit button, site theme).
+COPY --chown=9031:0 template/html.form.login.template.html /opt/in/instance/server/default/conf/template/html.form.login.template.html
 RUN sed -i 's/^pf.http.port=-1/pf.http.port=9080/' /opt/staging/instance/bin/run.properties.subst.default
 # Activate the static mock-attester resolver (DEV) — PF loads run.properties entries as sys props.
 # Without this the hook falls back to federation resolution and rejects the demo attester.
