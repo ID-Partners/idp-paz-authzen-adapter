@@ -36,15 +36,23 @@ plugin json-decodes it), and the presented `cnf.jkt`.
 
 ## ⚠️ PingFederate on Railway is EPHEMERAL — no volume
 
-Any OAuth config created live via the admin API is **lost on redeploy**. The two ways config
-survives:
+Any OAuth config created live via the admin API is **lost on redeploy**. Two mechanisms:
 
-1. **Baked (default).** `data.zip` here is the snapshot of the live config; the Dockerfile
-   drops it into `.../data/drop-in-deployer/data.zip`, so a `railway up` from this directory
-   boots a fully-configured PF. Keep `data.zip` current — see "Re-snapshotting" below.
-2. **Restored (safety net).** [`restore-config.sh`](restore-config.sh) imports `data.zip`
-   into an already-running PF via the admin API in ~30s. Use it if a redeploy ever lands
-   without the config.
+1. **Restore via admin API — VALIDATED, the primary path.**
+   [`restore-config.sh`](restore-config.sh) imports `data.zip` into an already-running PF via
+   `POST /pf-admin-api/v1/configArchive/import`. Verified against the live server (2026-07-05):
+   returns `success`, all 3 agent clients back, in ~1s, with zero disruption to in-flight token
+   issuance. Run it after any redeploy that lands without the config, or after a container
+   restart.
+
+2. **Baked drop-in on boot — armed but UNVERIFIED.** The Dockerfile drops `data.zip` into
+   `.../data/drop-in-deployer/data.zip` so PF imports it at boot. A verification redeploy
+   (2026-07-05) **built fine but failed the runtime healthcheck** — PF's boot + config-import
+   exceeded the healthcheck window (the previous image booted from a config-less `data.zip`, so
+   it came up faster). The old deploy kept serving, so nothing broke. Before relying on this
+   path, extend the service's healthcheck timeout (PF cold-boot + import can take several
+   minutes) and confirm on a throwaway service. Until then, treat drop-in as best-effort and
+   use mechanism (1) as the source of truth.
 
 ## Re-snapshotting after admin-API changes
 
