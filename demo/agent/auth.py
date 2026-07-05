@@ -56,6 +56,30 @@ AGENT_ID = os.environ.get("AGENT_ID", "urn:agent:northwind-onboarding:v1")  # ac
 PRINCIPAL_AGENT_ID = os.environ.get("PRINCIPAL_AGENT_ID", "urn:agent:northwind-concierge:v1")
 TASK_AGENT_ID = os.environ.get("TASK_AGENT_ID", AGENT_ID)
 DELEGATION_CHAIN = [PRINCIPAL_AGENT_ID, TASK_AGENT_ID]
+
+# The Principal Agent (concierge) delegates to TWO specialised task agents — an
+# Account Agent and a Payments Agent — each getting its own key, attestation and
+# nested actor chain (sub=Alice, act={task-agent, act={concierge}}). Each banking
+# tool is owned by exactly one task agent, so the concierge routes each operation
+# to the right agent (see tool_role / acquire_agent_fleet).
+ACCOUNT_AGENT_ID = os.environ.get("ACCOUNT_AGENT_ID", "urn:agent:northwind-account:v1")
+PAYMENTS_AGENT_ID = os.environ.get("PAYMENTS_AGENT_ID", "urn:agent:northwind-payments:v1")
+TASK_AGENTS = [
+    {"role": "account", "id": ACCOUNT_AGENT_ID, "type": "account-opening",
+     "label": "Account Agent", "tools": ["list_accounts", "get_balance", "open_account"]},
+    {"role": "payments", "id": PAYMENTS_AGENT_ID, "type": "payments",
+     "label": "Payments Agent", "tools": ["make_payment"]},
+]
+
+
+def tool_role(tool_name: str) -> str:
+    """Which task agent owns this banking tool (defaults to the account agent)."""
+    for a in TASK_AGENTS:
+        if tool_name in a["tools"]:
+            return a["role"]
+    return TASK_AGENTS[0]["role"]
+
+
 AGENT_TYPE = os.environ.get("AGENT_TYPE", "ai_assistant")            # agent classification
 AGENT_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-5")   # the model it runs
 AGENT_CLIENT_ID = os.environ.get("AGENT_CLIENT_ID", "bank-agent")    # Agent Operator (client_id)
@@ -451,3 +475,162 @@ def acquire_delegated_token() -> AgentCredential:
         return _acquire_pingfederate()
     logger.info("Acquiring delegated token via local demo IdP (TOKEN_MODE=local)")
     return _acquire_local()
+
+
+# --------------------------------------------------------------------------
+# Agent fleet: one Principal Agent (concierge) delegating to TWO task agents
+# (Account Agent + Payments Agent), each with its own key, attestation and
+# nested actor chain. Used by the demo so the concierge is shown calling two.
+# --------------------------------------------------------------------------
+
+def _pub_jwk(key: ec.EllipticCurvePrivateKey) -> dict[str, str]:
+    p = key.public_key().public_numbers()
+    return {"kty": "EC", "crv": "P-256",
+            "x": _int_to_b64url(p.x), "y": _int_to_b64url(p.y)}
+
+
+def _attestation_step(att, agent_id: str, agent_type: str, role: str | None = None) -> dict[str, Any]:
+    step = {
+        "type": "attestation", "title": "Client attestation",
+        "detail": f"Attester '{att.attester_issuer}' issued an attestation JWT vouching for "
+                  f"{agent_id} ({agent_type}), binding its DPoP key (cnf.jkt) and ceiling.",
+        "attester": att.attester_issuer, "client_id": AGENT_CLIENT_ID,
+        "agent": agent_id, "agent_type": agent_type,
+        "auth_method": "attest_jwt_client_auth_dpop", "typ": att.header.get("typ"),
+        "workload": att.claims.get("workload"),
+        "attestation_header": att.header, "attestation_claims": att.claims,
+        "attestation_preview": att.jwt[:24] + "…" + att.jwt[-12:],
+        "attester_jwks": att.attester_jwks, "mode": "local",
+    }
+    if role:
+        step["role"] = role
+    return step
+
+
+def _auth_step(agent_id: str, jkt: str, role: str | None = None) -> dict[str, Any]:
+    step = {
+        "type": "auth", "title": "Agent authenticates",
+        "detail": f"{agent_id} authenticated with its attestation "
+                  f"(attest_jwt_client_auth_dpop) and a fresh DPoP key — no client secret.",
+        "client_id": AGENT_CLIENT_ID, "agent": agent_id, "jkt": jkt,
+        "grant": "client_credentials", "auth_method": "attest_jwt_client_auth_dpop", "mode": "local",
+    }
+    if role:
+        step["role"] = role
+    return step
+
+
+def _mint_token(signing_key, header, act, jkt, now) -> tuple[str, dict[str, Any]]:
+    claims = {
+        "iss": "https://local-demo-idp.northwind.example", "sub": PRINCIPAL_SUB,
+        "act": act, "aud": RS_AUDIENCE, "client_id": AGENT_CLIENT_ID, "azp": AGENT_CLIENT_ID,
+        "scope": DEFAULT_SCOPE, "authorization_details": _authorization_details(),
+        "cnf": {"jkt": jkt}, "iat": now, "exp": now + TOKEN_TTL,
+    }
+    return jwt.encode(claims, signing_key, algorithm="ES256", headers=header), claims
+
+
+def _te_step(*, actor, delegator, hop, hops, token, claims, jkt, jwk, now,
+             title, subject_desc, role=None, label=None) -> dict[str, Any]:
+    act = claims["act"]
+    chain_labels = _actor_chain_labels(act)
+    ath = _b64url(hashlib.sha256(token.encode()).digest())
+    te_request = {
+        "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+        "subject_token": subject_desc,
+        "subject_token_type": "urn:ietf:params:oauth:token-type:access_token",
+        "actor_token": f"<actor token — {actor}>",
+        "actor_token_type": "urn:ietf:params:oauth:token-type:access_token",
+        "scope": DEFAULT_SCOPE, "resource": RS_AUDIENCE,
+    }
+    dpop_example = {
+        "header": {"typ": "dpop+jwt", "alg": "ES256", "jwk": jwk},
+        "payload": {"jti": str(uuid.uuid4()), "htm": "POST",
+                    "htu": "https://<kong-gateway>/mcp", "iat": now, "ath": ath},
+    }
+    step = {
+        "type": "token_exchange", "title": title,
+        "detail": f"{delegator} delegates to {actor}: the exchanged token now carries "
+                  f"act = {' ◀ '.join(chain_labels)} under sub={PRINCIPAL_SUB} — "
+                  f"delegation, not impersonation.",
+        "sub": PRINCIPAL_SUB, "act": act, "act_sub": (act or {}).get("sub"),
+        "actor_chain": chain_labels, "hop": hop, "hops": hops,
+        "delegator": (None if hop == 1 else delegator),
+        "scope": DEFAULT_SCOPE, "cnf_jkt": jkt, "aud": RS_AUDIENCE, "client_id": AGENT_CLIENT_ID,
+        "authorization_details": _authorization_details(),
+        "token_preview": token[:20] + "…" + token[-12:], "claims": claims,
+        "token_header": {"alg": "ES256", "typ": "JWT"}, "te_request": te_request,
+        "te_endpoint": "https://<local-demo-idp>/as/token.oauth2",
+        "dpop_example": dpop_example, "mode": "local",
+    }
+    if role:
+        step["role"] = role
+    if label:
+        step["agent_label"] = label
+    return step
+
+
+@dataclass
+class AgentFleet:
+    """The concierge + its task agents: per-role credentials, the tool→role map,
+    and the combined identity transcript steps to display."""
+    roles: dict[str, AgentCredential]
+    tool_role: dict[str, str]
+    role_label: dict[str, str]
+    steps: list[dict[str, Any]]
+
+
+def acquire_agent_fleet() -> AgentFleet:
+    """Provision the Principal Agent (concierge) and both task agents.
+
+    The concierge is attested and takes Alice's delegation (hop 1); it then
+    delegates to the Account Agent and the Payments Agent, each getting its own
+    key, attestation and a token whose nested `act` chain is
+    {task-agent, act={concierge}}. Tools are routed to the owning agent.
+    """
+    now = int(time.time())
+    signing_key = _new_key()          # throwaway demo IdP signing key
+    header = {"alg": "ES256", "typ": "JWT"}
+    steps: list[dict[str, Any]] = []
+
+    # Principal Agent (concierge): attestation + authenticate + Alice → concierge.
+    conc_key = _new_key(); conc_jkt = _jkt(conc_key); conc_jwk = _pub_jwk(conc_key)
+    conc_att = mint_agent_attestation(
+        client_id=AGENT_CLIENT_ID, agent_id=PRINCIPAL_AGENT_ID, agent_type="orchestrator",
+        principal_sub=PRINCIPAL_SUB, agent_public_jwk=conc_jwk,
+        authorization_details=_authorization_details(), model=AGENT_MODEL)
+    steps.append(_attestation_step(conc_att, PRINCIPAL_AGENT_ID, "orchestrator", role="principal"))
+    steps.append(_auth_step(PRINCIPAL_AGENT_ID, conc_jkt, role="principal"))
+    act1 = _build_act_chain([PRINCIPAL_AGENT_ID])
+    tok1, claims1 = _mint_token(signing_key, header, act1, conc_jkt, now)
+    steps.append(_te_step(actor=PRINCIPAL_AGENT_ID, delegator=PRINCIPAL_SUB, hop=1, hops=2,
+                          token=tok1, claims=claims1, jkt=conc_jkt, jwk=conc_jwk, now=now,
+                          role="principal", title="Alice → Principal Agent (token exchange)",
+                          subject_desc="<principal access token — Alice>"))
+
+    # Each task agent: attestation + concierge → task-agent delegation → credential.
+    roles: dict[str, AgentCredential] = {}
+    tool_role_map: dict[str, str] = {}
+    role_label: dict[str, str] = {}
+    for cfg in TASK_AGENTS:
+        key = _new_key(); jkt = _jkt(key); jwk = _pub_jwk(key)
+        att = mint_agent_attestation(
+            client_id=AGENT_CLIENT_ID, agent_id=cfg["id"], agent_type=cfg["type"],
+            principal_sub=PRINCIPAL_SUB, agent_public_jwk=jwk,
+            authorization_details=_authorization_details(), model=AGENT_MODEL)
+        steps.append(_attestation_step(att, cfg["id"], cfg["type"], role=cfg["role"]))
+        act = _build_act_chain([PRINCIPAL_AGENT_ID, cfg["id"]])
+        tok, claims = _mint_token(signing_key, header, act, jkt, now)
+        steps.append(_te_step(actor=cfg["id"], delegator=PRINCIPAL_AGENT_ID, hop=2, hops=2,
+                              token=tok, claims=claims, jkt=jkt, jwk=jwk, now=now,
+                              role=cfg["role"], label=cfg["label"],
+                              title=f"Principal Agent → {cfg['label']} (token exchange)",
+                              subject_desc="<delegated token from hop 1 (concierge)>"))
+        roles[cfg["role"]] = AgentCredential(
+            access_token=tok, principal_sub=PRINCIPAL_SUB, agent_sub=cfg["id"],
+            scope=DEFAULT_SCOPE, jkt=jkt, mode="local", _key=key, steps=[])
+        role_label[cfg["role"]] = cfg["label"]
+        for t in cfg["tools"]:
+            tool_role_map[t] = cfg["role"]
+
+    return AgentFleet(roles=roles, tool_role=tool_role_map, role_label=role_label, steps=steps)

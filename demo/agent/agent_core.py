@@ -17,6 +17,7 @@ decisions.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import inspect
 import json
 import logging
@@ -27,7 +28,7 @@ import anthropic
 from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
 
-from auth import acquire_delegated_token
+from auth import acquire_agent_fleet
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -125,124 +126,141 @@ async def agent_events(prompt: str, session_id: str = "demo") -> AsyncIterator[d
     """
     client = _anthropic_client()
 
-    # 1) Establish the agent's authority: authenticate and obtain a delegated,
-    #    DPoP-bound token via token exchange (sub=principal, act.sub=agent).
-    cred = acquire_delegated_token()
-    for step in cred.steps:
+    # 1) Provision the agent fleet: the Principal Agent (concierge) delegates to
+    #    the Account Agent and the Payments Agent, each with its own key, DPoP
+    #    binding and nested actor chain. Emit all the identity steps.
+    fleet = acquire_agent_fleet()
+    for step in fleet.steps:
         yield step
 
-    _tok = cred.access_token
-    token_preview = (_tok[:28] + "…" + _tok[-14:]) if len(_tok) > 44 else _tok
+    def _tp(cred) -> str:
+        t = cred.access_token
+        return (t[:28] + "…" + t[-14:]) if len(t) > 44 else t
 
-    def presented(url: str, method: str = "POST") -> dict[str, Any]:
+    def presented(cred, url: str, method: str = "POST") -> dict[str, Any]:
         proof = cred._dpop_proof(method, url)
         return {
-            "scheme": "DPoP",
-            "authorization": f"DPoP {token_preview}",
+            "scheme": "DPoP", "authorization": f"DPoP {_tp(cred)}",
             "dpop_proof": (proof[:28] + "…" + proof[-14:]),
             "jkt": cred.jkt, "sub": cred.principal_sub,
             "act": cred.agent_sub, "scope": cred.scope,
         }
 
-    # 2) Present the token (DPoP-bound) on every MCP request to Kong (PEP #1).
-    client_kwargs: dict[str, Any] = {}
-    if "auth" in inspect.signature(streamablehttp_client).parameters:
-        client_kwargs["auth"] = cred.httpx_auth()
-        dpop_note = "per-request DPoP proofs"
-    else:
+    def _auth_kwargs(cred) -> dict[str, Any]:
+        if "auth" in inspect.signature(streamablehttp_client).parameters:
+            return {"auth": cred.httpx_auth()}
         proof = cred._dpop_proof("POST", MCP_SERVER_URL)
-        client_kwargs["headers"] = {
-            "Authorization": f"DPoP {cred.access_token}", "DPoP": proof}
-        dpop_note = "static DPoP header (SDK has no auth hook)"
+        return {"headers": {"Authorization": f"DPoP {cred.access_token}", "DPoP": proof}}
 
-    logger.info("Connecting to MCP server at %s (%s)", MCP_SERVER_URL, dpop_note)
+    # Each task agent gets its OWN MCP session (its own DPoP-bound delegated
+    # token), so PEP #1/#2 see the acting agent's token. Sessions open on demand.
+    default_role = next(iter(fleet.roles))
+    sessions: dict[str, Any] = {}
     agent_texts: list[str] = []
+    tools: list[dict[str, Any]] = []
     try:
-        async with streamablehttp_client(MCP_SERVER_URL, **client_kwargs) as (read, write, _):
-            async with ClientSession(read, write) as session:
-                await session.initialize()
-                listed = await session.list_tools()
-                tools = _mcp_tools_to_anthropic(listed.tools)
-                yield {
-                    "type": "connect",
-                    "detail": f"Connected via Kong gateway (PEP #1) to MCP service "
-                              f"'{MCP_SERVER_URL}' using {dpop_note}. "
-                              f"Discovered tools: {', '.join(t['name'] for t in tools)}.",
-                    "mcp_url": MCP_SERVER_URL,
-                    "token_preview": token_preview,
-                    "presented": presented(MCP_SERVER_URL),
-                    "tools": [t["name"] for t in tools],
-                }
+        async with contextlib.AsyncExitStack() as stack:
+            async def open_role(role: str):
+                cred = fleet.roles[role]
+                read, write, _ = await stack.enter_async_context(
+                    streamablehttp_client(MCP_SERVER_URL, **_auth_kwargs(cred)))
+                sess = await stack.enter_async_context(ClientSession(read, write))
+                await sess.initialize()
+                sessions[role] = sess
+                return cred, sess
 
-                # Seed from this session's prior turns so the agent has memory.
-                messages: list[dict[str, Any]] = list(_SESSIONS.get(session_id, []))
-                messages.append({"role": "user", "content": prompt})
-                if len(messages) > 1:
+            def _connect_step(role: str, cred, discovered: list[str] | None):
+                label = fleet.role_label.get(role, role)
+                detail = (f"{label} ({cred.agent_sub}) opened its MCP session via Kong "
+                          f"(PEP #1) with its own DPoP-bound token.")
+                if discovered:
+                    detail += f" Discovered tools: {', '.join(discovered)}."
+                return {"type": "connect", "detail": detail, "role": role,
+                        "agent": cred.agent_sub, "agent_label": label,
+                        "mcp_url": MCP_SERVER_URL, "token_preview": _tp(cred),
+                        "presented": presented(cred, MCP_SERVER_URL),
+                        "tools": discovered or []}
+
+            # Open the default (account) agent first to discover the tool set.
+            cred0, sess0 = await open_role(default_role)
+            listed = await sess0.list_tools()
+            tools = _mcp_tools_to_anthropic(listed.tools)
+            yield _connect_step(default_role, cred0, [t["name"] for t in tools])
+
+            # Seed from this session's prior turns so the agent has memory.
+            messages: list[dict[str, Any]] = list(_SESSIONS.get(session_id, []))
+            messages.append({"role": "user", "content": prompt})
+            if len(messages) > 1:
+                yield {"type": "memory",
+                       "detail": f"Continuing session '{session_id}' with "
+                                 f"{len(messages) - 1} prior message(s) of context.",
+                       "prior_messages": len(messages) - 1}
+
+            for _turn in range(MAX_TURNS):
+                resp = await asyncio.to_thread(
+                    lambda: client.messages.create(
+                        model=ANTHROPIC_MODEL, max_tokens=1024,
+                        system=SYSTEM_PROMPT, tools=tools, messages=messages))
+
+                assistant_content: list[dict[str, Any]] = []
+                tool_uses = []
+                for block in resp.content:
+                    if block.type == "text":
+                        assistant_content.append({"type": "text", "text": block.text})
+                        if block.text.strip():
+                            agent_texts.append(block.text)
+                            yield {"type": "agent", "text": block.text}
+                    elif block.type == "tool_use":
+                        assistant_content.append({
+                            "type": "tool_use", "id": block.id,
+                            "name": block.name, "input": block.input})
+                        tool_uses.append(block)
+
+                messages.append({"role": "assistant", "content": assistant_content})
+
+                if resp.stop_reason != "tool_use":
+                    break
+
+                tool_results = []
+                for tu in tool_uses:
+                    # Route the call to the task agent that owns this tool. Open
+                    # that agent's own MCP session (PEP #1) the first time.
+                    role = fleet.tool_role.get(tu.name, default_role)
+                    cred = fleet.roles[role]
+                    label = fleet.role_label.get(role, role)
+                    if role not in sessions:
+                        credR, _ = await open_role(role)
+                        yield _connect_step(role, credR, None)
+                    sess = sessions[role]
                     yield {
-                        "type": "memory",
-                        "detail": f"Continuing session '{session_id}' with "
-                                  f"{len(messages) - 1} prior message(s) of context.",
-                        "prior_messages": len(messages) - 1,
+                        "type": "tool_call", "name": tu.name, "input": tu.input,
+                        "role": role, "agent": cred.agent_sub, "agent_label": label,
+                        "mcp_url": MCP_SERVER_URL, "token_preview": _tp(cred),
+                        "presented": presented(cred, MCP_SERVER_URL),
                     }
+                    result = await sess.call_tool(tu.name, tu.input)
+                    text = _extract_text(result.content)
+                    parsed = _safe_json(text)
+                    yield {
+                        "type": "tool_result", "name": tu.name,
+                        "role": role, "agent_label": label,
+                        "authorized": (parsed or {}).get("authorized"),
+                        "policy_reason": (parsed or {}).get("policy_reason")
+                                         or (parsed or {}).get("message"),
+                        "pep": (parsed or {}).get("pep"),
+                        "pep_action": (parsed or {}).get("pep_action"),
+                        "bank_response": parsed if parsed is not None else text,
+                        "result": parsed if parsed is not None else text,
+                    }
+                    tool_results.append({
+                        "type": "tool_result", "tool_use_id": tu.id, "content": text})
 
-                for _turn in range(MAX_TURNS):
-                    # Run the (blocking) Anthropic call off the event loop so the
-                    # already-yielded events flush to the client while it thinks.
-                    resp = await asyncio.to_thread(
-                        lambda: client.messages.create(
-                            model=ANTHROPIC_MODEL, max_tokens=1024,
-                            system=SYSTEM_PROMPT, tools=tools, messages=messages))
+                messages.append({"role": "user", "content": tool_results})
 
-                    assistant_content: list[dict[str, Any]] = []
-                    tool_uses = []
-                    for block in resp.content:
-                        if block.type == "text":
-                            assistant_content.append({"type": "text", "text": block.text})
-                            if block.text.strip():
-                                agent_texts.append(block.text)
-                                yield {"type": "agent", "text": block.text}
-                        elif block.type == "tool_use":
-                            assistant_content.append({
-                                "type": "tool_use", "id": block.id,
-                                "name": block.name, "input": block.input,
-                            })
-                            tool_uses.append(block)
-
-                    messages.append({"role": "assistant", "content": assistant_content})
-
-                    if resp.stop_reason != "tool_use":
-                        break
-
-                    tool_results = []
-                    for tu in tool_uses:
-                        yield {
-                            "type": "tool_call", "name": tu.name, "input": tu.input,
-                            "mcp_url": MCP_SERVER_URL, "token_preview": token_preview,
-                            "presented": presented(MCP_SERVER_URL),
-                        }
-                        result = await session.call_tool(tu.name, tu.input)
-                        text = _extract_text(result.content)
-                        parsed = _safe_json(text)
-                        yield {
-                            "type": "tool_result", "name": tu.name,
-                            "authorized": (parsed or {}).get("authorized"),
-                            "policy_reason": (parsed or {}).get("policy_reason")
-                                             or (parsed or {}).get("message"),
-                            "pep": (parsed or {}).get("pep"),
-                            "pep_action": (parsed or {}).get("pep_action"),
-                            "bank_response": parsed if parsed is not None else text,
-                            "result": parsed if parsed is not None else text,
-                        }
-                        tool_results.append({
-                            "type": "tool_result", "tool_use_id": tu.id, "content": text,
-                        })
-
-                    messages.append({"role": "user", "content": tool_results})
-
-                # Persist the conversation so the next turn has memory.
-                _SESSIONS[session_id] = _trim_history(messages)
-                if len(_SESSIONS) > MAX_SESSIONS:
-                    _SESSIONS.pop(next(iter(_SESSIONS)))
+            # Persist the conversation so the next turn has memory.
+            _SESSIONS[session_id] = _trim_history(messages)
+            if len(_SESSIONS) > MAX_SESSIONS:
+                _SESSIONS.pop(next(iter(_SESSIONS)))
     except Exception as exc:  # noqa: BLE001 - surface a clean gateway denial to the UI
         detail = _describe_connect_error(exc)
         logger.warning("MCP connect/session failed: %s", exc)

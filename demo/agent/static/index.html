@@ -286,26 +286,30 @@ function toolToAuthzen(name, input){
 // ---- interaction graph -------------------------------------------------------
 const GW=140, GH=46;
 const GN = {
-  alice:     {x:6,   y:26,  ic:'🧑', t:'Alice',           s:'principal · human'},
-  principal: {x:230, y:26,  ic:'🤖', t:'Principal Agent', s:'concierge'},
-  task:      {x:454, y:26,  ic:'🤖', t:'Task Agent',      s:'onboarding'},
+  alice:     {x:6,   y:60,  ic:'🧑', t:'Alice',           s:'principal · human'},
+  principal: {x:210, y:60,  ic:'🤖', t:'Principal Agent', s:'concierge'},
+  account:   {x:420, y:14,  ic:'🤖', t:'Account Agent',   s:'open · list · balance'},
+  payments:  {x:420, y:104, ic:'🤖', t:'Payments Agent',  s:'make_payment'},
   pep1:      {x:806, y:26,  ic:'🛡️', t:'PEP #1',          s:'Kong · MCP edge'},
   mcp:       {x:806, y:118, ic:'🧰', t:'MCP',             s:'bank tools'},
   pep2:      {x:806, y:210, ic:'🛡️', t:'PEP #2',          s:'Kong · API edge'},
   bankapi:   {x:806, y:302, ic:'🏦', t:'Bank API',        s:'resource server'},
-  attester:  {x:230, y:150, ic:'📜', t:'Attester',        s:'client attestation'},
-  as:        {x:454, y:158, ic:'🎫', t:'PingFederate AS', s:'token exchange'},
+  attester:  {x:210, y:186, ic:'📜', t:'Attester',        s:'client attestation'},
+  as:        {x:420, y:210, ic:'🎫', t:'PingFederate AS', s:'token exchange'},
   pdp:       {x:600, y:302, ic:'⚖️', t:'Ping Authorize',  s:'policy decision point'},
 };
 const GE = [
   ['alice','principal','acts for'],
-  ['principal','task','delegates'],
-  ['task','pep1','presents DPoP token'],
+  ['principal','account','delegates'],
+  ['principal','payments','delegates'],
+  ['account','pep1','presents token'],
+  ['payments','pep1','presents token'],
   ['pep1','mcp','MCP session'],
   ['mcp','pep2','tools/call'],
   ['pep2','bankapi','bank call'],
-  ['principal','attester','attested','thin'],
-  ['task','as','token exchange','thin'],
+  ['principal','attester','attests','thin'],
+  ['account','as','token exchange','thin'],
+  ['payments','as','','thin'],
   ['pep1','pdp','decision','dash'],
   ['pep2','pdp','decision','dash'],
   ['as','pdp','governs issuance','dash'],
@@ -352,7 +356,9 @@ function setNode(node, state, flag){
   if(state) n.classList.add(state);
   if(flag!==undefined){ const f=n.querySelector('.flag, .gflag'); if(f) f.textContent = flag; }
 }
-function resetPipeline(){ ['alice','principal','task','attester','as','pep1','mcp','pep2','bankapi','pdp'].forEach(n=>setNode(n,'','')); }
+function resetPipeline(){ ['alice','principal','account','payments','attester','as','pep1','mcp','pep2','bankapi','pdp'].forEach(n=>setNode(n,'','')); }
+// A transcript step's `role` maps directly to a graph node id (principal/account/payments).
+function agentNode(role){ return (role==='principal'||role==='account'||role==='payments') ? role : null; }
 buildGraph();
 
 function scopeChips(scope){
@@ -404,7 +410,7 @@ function render(steps) {
         `<div class="label">🧠 Memory</div>${esc(s.detail||'')}
          <div class="explain">The agent recalls this session's earlier turns, so it can follow up in context. Identity is still re-established (fresh token, re-authorized) every turn.</div>`));
     } else if (s.type === 'attestation') {
-      setNode('task','done'); setNode('attester','done','attests');
+      { const n = agentNode(s.role); if (n) setNode(n,'done'); } setNode('attester','done','attests');
       const w = s.workload || {};
       const wrows = Object.keys(w).map(k =>
         `<div class="ck">${esc(k)}</div><div class="cv">${esc(String(w[k]))}</div>`).join('');
@@ -428,7 +434,7 @@ function render(steps) {
         `<div class="label">🎫 ${esc(s.title||'Client attestation')}</div>${esc(s.detail)}${meta}
          <div class="explain">Instead of a shared secret, a trusted attester vouches for the agent's identity and AgentCore attributes and binds its DPoP key — so PingFederate can verify <b>what</b> the agent is, not just that it holds a password.</div>${wire}`));
     } else if (s.type === 'auth') {
-      setNode('alice','done'); setNode('task','done');
+      setNode('alice','done'); { const n = agentNode(s.role); if (n) setNode(n,'done'); }
       const meta = `<div class="claims" style="margin-top:8px">
         <div class="ck">client_id</div><div class="cv">${esc(s.client_id||'')} <span style="color:var(--muted)">(agent operator)</span></div>
         <div class="ck">agent</div><div class="cv act">${esc(s.agent||'')}</div>
@@ -439,8 +445,7 @@ function render(steps) {
          <div class="explain">The agent is its own identity and holds a private key; the token it gets next will be bound to that key.</div>`));
     } else if (s.type === 'token_exchange') {
       setNode('alice','done'); setNode('as','done','issued');
-      if (s.hop >= 1) setNode('principal','done');
-      if (s.hop >= 2) setNode('task','done');
+      { const n = agentNode(s.role); if (n) setNode(n,'done'); }
       CTX.sub = s.sub; CTX.act = s.act_sub || s.act; CTX.scope = s.scope;
       CTX.client_id = s.client_id || (s.claims && s.claims.client_id);
       // Build the delegation chain: principal ◀ earliest-delegator ◀ … ◀ current
@@ -470,6 +475,7 @@ function render(steps) {
          ${chain}${tokenPanel(s)}
          <div class="explain">Delegation, not impersonation: each hop <b>nests</b> the <code>act</code> claim, so the token records the whole chain — every downstream action is attributable to the human <i>and</i> every agent that delegated.${hopBadge}</div>${wire}`));
     } else if (s.type === 'connect') {
+      { const n = agentNode(s.role); if (n) setNode(n,'done'); }
       setNode('pep1','permit','permit'); setNode('mcp','done'); setNode('pdp','permit','PERMIT');
       const p = s.presented || {};
       const url = s.mcp_url || '/mcp';
@@ -485,7 +491,7 @@ function render(steps) {
           json:{ decision:true } },
       ]);
       out.appendChild(el('step connect',
-        `<div class="label">③ Gateway connect · PEP #1 (MCP edge)</div>${esc(s.detail)}
+        `<div class="label">③ Gateway connect · PEP #1 (MCP edge)${s.agent_label ? ' · ' + esc(s.agent_label) : ''}</div>${esc(s.detail)}
          ${presentedChip(p)}
          <div class="explain">Kong authenticated the real DPoP-bound token and asked the PDP to permit MCP access before the session opened.</div>${wire}`));
     } else if (s.type === 'connect_error') {
@@ -499,6 +505,8 @@ function render(steps) {
     } else if (s.type === 'tool_call') {
       const p = s.presented || {};
       const url = s.mcp_url || '/mcp';
+      { const n = agentNode(s.role); if (n) setNode(n,'done'); }
+      const byAgent = s.agent_label ? ` <span style="color:var(--muted);font-weight:400">· via ${esc(s.agent_label)}</span>` : '';
       const wire = wireDetails('wire detail — real MCP call + PEP #2 decision', [
         { label:'1 · Request the agent actually sends', desc:'tools/call over MCP to Kong, carrying the real DPoP-bound token',
           http:`POST ${url}`,
@@ -508,9 +516,9 @@ function render(steps) {
           http:'POST /access/v1/evaluation', json: toolToAuthzen(s.name, s.input) },
       ]);
       out.appendChild(el('step tool_call',
-        `<div class="label">🧰 Tool call → ${esc(s.name)}</div><pre>${pretty(s.input)}</pre>
+        `<div class="label">🧰 Tool call → ${esc(s.name)}${byAgent}</div><pre>${pretty(s.input)}</pre>
          ${presentedChip(p)}
-         <div class="hops"><span class="hop">Agent</span><span class="hop">PEP #1</span><span class="hop">MCP</span><span class="hop">PEP #2</span><span class="hop">Bank API</span></div>${wire}`));
+         <div class="hops"><span class="hop">${esc(s.agent_label||'Agent')}</span><span class="hop">PEP #1</span><span class="hop">MCP</span><span class="hop">PEP #2</span><span class="hop">Bank API</span></div>${wire}`));
     } else if (s.type === 'tool_result') {
       const allowed = s.authorized;
       const pep = s.pep ? `<span class="pep">at ${esc(s.pep)}${s.pep_action ? ' · action=' + esc(s.pep_action) : ''}</span>` : '';
