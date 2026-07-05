@@ -108,6 +108,10 @@ class Credential:
     jkt: str
     _key: ec.EllipticCurvePrivateKey
     steps: list[dict[str, Any]] = field(default_factory=list)
+    # The delegated actor chain [current actor, …, earliest delegator] as read
+    # from the token's nested `act` — so downstream steps can show the whole
+    # chain the gateway/PEP actually receives, not just the current actor.
+    actor_chain: list[str] = field(default_factory=list)
 
     def public_jwk(self) -> dict[str, str]:
         return _pub_jwk(self._key)
@@ -203,7 +207,8 @@ def _establish_pf(*, agent_id: str, agent_type: str, agent_label: str, role: str
          "te_endpoint": PF_TOKEN_URL, "role": role, "agent_label": agent_label, "mode": "pingfederate"},
     ]
     return Credential(access_token=token, principal_sub=claims.get("sub", PRINCIPAL_SUB),
-                      agent_sub=agent_id, jkt=local_jkt, _key=local, steps=steps)
+                      agent_sub=agent_id, jkt=local_jkt, _key=local, steps=steps,
+                      actor_chain=chain_labels)
 
 
 def establish_identity(*, agent_id: str, agent_type: str, agent_label: str,
@@ -274,4 +279,4 @@ def establish_identity(*, agent_id: str, agent_type: str, agent_label: str,
          "role": role, "agent_label": agent_label, "mode": "local"},
     ]
     return Credential(access_token=token, principal_sub=PRINCIPAL_SUB, agent_sub=agent_id,
-                      jkt=local_jkt, _key=local, steps=steps)
+                      jkt=local_jkt, _key=local, steps=steps, actor_chain=chain_labels)

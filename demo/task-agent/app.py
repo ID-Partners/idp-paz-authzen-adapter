@@ -49,9 +49,15 @@ def _presented(cred, url: str) -> dict[str, Any]:
     tp = cred.access_token
     tp = (tp[:28] + "…" + tp[-14:]) if len(tp) > 44 else tp
     proof = cred._dpop_proof("POST", url)
+    # The full delegation chain the PEP receives, read outside-in from the token's
+    # nested act: principal ◀ earliest delegator ◀ … ◀ current actor. actor_chain
+    # is [current, …, earliest], so reverse it and prepend the principal.
+    chain = list(getattr(cred, "actor_chain", None) or [cred.agent_sub])
+    parties = [cred.principal_sub, *reversed(chain)]
     return {"scheme": "DPoP", "authorization": f"DPoP {tp}",
             "dpop_proof": proof[:28] + "…" + proof[-14:], "jkt": cred.jkt,
-            "sub": cred.principal_sub, "act": cred.agent_sub}
+            "sub": cred.principal_sub, "act": cred.agent_sub,
+            "actor_chain": chain, "act_chain": " ◀ ".join(parties)}
 
 
 @app.get("/ping")

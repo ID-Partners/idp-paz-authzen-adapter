@@ -400,8 +400,23 @@ function presentedChip(p){
       <div class="ck">Authorization</div><div class="cv">${esc(p.authorization)}</div>
       <div class="ck">DPoP</div><div class="cv">${esc(p.dpop_proof||'')} <span style="color:var(--muted)">(fresh per-request proof, signed by the agent key)</span></div>
       <div class="ck">cnf.jkt</div><div class="cv jkt">${esc(short(p.jkt,40))}</div>
-      <div class="ck">sub ◀ act</div><div class="cv"><span class="sub">${esc(p.sub||'')}</span> ◀ <span class="act">${esc(p.act||'')}</span></div>
+      <div class="ck">delegation chain</div><div class="cv">${chainHtml(p)}</div>
     </div></div>`;
+}
+
+// Render the full act delegation chain the PEP receives: principal ◀ delegator ◀
+// … ◀ current actor. Prefer p.act_chain (built from the token's nested act);
+// fall back to the flat sub ◀ act.
+function chainHtml(p){
+  let parties = null;
+  if (p.act_chain) parties = p.act_chain.split(' ◀ ');
+  else parties = [p.sub||'', p.act||''];
+  return parties.map((name,i)=>{
+    const cls = i===0 ? 'sub' : (i===parties.length-1 ? 'act' : 'act');
+    const tag = i===0 ? ' <span style="color:var(--muted)">(principal)</span>'
+              : (i===parties.length-1 ? ' <span style="color:var(--muted)">(acting)</span>' : '');
+    return `<span class="${cls}">${esc(name)}</span>${tag}`;
+  }).join(' <span style="color:var(--muted)">◀</span> ');
 }
 
 function render(steps) {
