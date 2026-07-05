@@ -7,6 +7,7 @@ import json
 import os
 from typing import Any
 
+import httpx
 from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
 
@@ -48,11 +49,38 @@ def _client_kwargs(cred: Credential, user_token: str | None) -> dict[str, Any]:
     return {"headers": headers}
 
 
+async def _preflight_login_gate(cred: Credential, user_token: str | None) -> None:
+    """Probe the gateway's step-up gate directly. The MCP client wraps a 401 in an
+    opaque ExceptionGroup, so we make a plain request first to read Kong's
+    login_required challenge cleanly and raise LoginRequired for it."""
+    proof = cred._dpop_proof("POST", MCP_SERVER_URL)
+    headers = {"Authorization": f"DPoP {cred.access_token}", "DPoP": proof,
+               "Content-Type": "application/json",
+               "Accept": "application/json, text/event-stream"}
+    if user_token:
+        headers["X-User-Token"] = user_token
+    ping = {"jsonrpc": "2.0", "id": "preflight", "method": "ping"}
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as c:
+            r = await c.post(MCP_SERVER_URL, json=ping, headers=headers)
+    except Exception:  # noqa: BLE001 - network issues surface on the real call
+        return
+    if r.status_code == 401:
+        body = {}
+        try:
+            body = r.json()
+        except Exception:  # noqa: BLE001
+            pass
+        if body.get("error") == "login_required":
+            raise LoginRequired(body.get("reason", "login required"))
+
+
 async def call_tool(cred: Credential, tool: str, arguments: dict[str, Any],
                     user_token: str | None = None) -> dict[str, Any]:
     """Open this agent's own MCP session and invoke one tool. Returns
     {result, authorized, pep, policy_reason, connected}. Raises LoginRequired if
     the gateway challenges for a logged-in user (401)."""
+    await _preflight_login_gate(cred, user_token)
     try:
         async with streamablehttp_client(MCP_SERVER_URL, **_client_kwargs(cred, user_token)) as (read, write, _):
             async with ClientSession(read, write) as session:
