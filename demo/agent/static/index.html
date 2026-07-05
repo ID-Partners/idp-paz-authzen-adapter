@@ -191,6 +191,7 @@
            placeholder="Ask the agent to open an account and make a payment…" />
     <button class="send" type="submit">Send</button>
     <button class="newconv" type="button" id="newconv" title="Start a fresh conversation">New conversation</button>
+    <button class="newconv" type="button" id="resetbank" title="Reset the bank's balances/accounts to the seeded start">↺ Reset demo</button>
   </form>
 
   <div id="transcript" class="transcript"></div>
@@ -647,6 +648,30 @@ newConvBtn.addEventListener('click', async () => {
     body: JSON.stringify({ session_id: SID }) }); } catch (e) {}
   SID = newSid(); localStorage.setItem('bankagent_sid', SID);
   out.innerHTML = ''; resetPipeline(); input.focus();
+});
+
+const resetBankBtn = document.getElementById('resetbank');
+resetBankBtn.addEventListener('click', async () => {
+  resetBankBtn.disabled = true;
+  const prev = resetBankBtn.textContent; resetBankBtn.textContent = 'Resetting…';
+  try {
+    // also clear the conversation so the agent doesn't reference stale balances
+    await fetch('/reset', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ session_id: SID }) }).catch(()=>{});
+    SID = newSid(); localStorage.setItem('bankagent_sid', SID);
+    const r = await fetch('/reset-bank', { method:'POST' });
+    const data = await r.json();
+    out.innerHTML = ''; resetPipeline();
+    if (data.error) {
+      out.appendChild(el('step tool_result convo', `<div class="label">⚠ Reset failed</div><pre>${esc(data.error)}</pre>`));
+    } else {
+      const accts = (data.accounts||[]).map(a => `${a.id}: $${Number(a.balance).toLocaleString()}`).join(' · ');
+      out.appendChild(el('step final agent convo', `<div class="label">↺ Demo reset</div>Bank data restored to the seeded start. ${esc(accts)}`));
+    }
+  } catch (err) {
+    out.appendChild(el('step tool_result convo', `<div class="label">⚠ Reset failed</div><pre>${esc(err)}</pre>`));
+  } finally {
+    resetBankBtn.disabled = false; resetBankBtn.textContent = prev; input.focus();
+  }
 });
 </script>
 </body>

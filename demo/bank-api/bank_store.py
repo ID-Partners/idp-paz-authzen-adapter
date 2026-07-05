@@ -38,6 +38,11 @@ class Customer:
 
 class BankStore:
     def __init__(self) -> None:
+        self.reset()
+
+    def reset(self) -> None:
+        """Restore the bank to its seeded starting state (fresh balances, only the
+        two seeded accounts) — powers the demo's 'Reset demo' control."""
         self._customers: dict[str, Customer] = {}
         self._accounts: dict[str, Account] = {}
         self._acct_seq = itertools.count(1002)

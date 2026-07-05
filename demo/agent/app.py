@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import os
 
+import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -27,6 +28,8 @@ from agent_core import agent_events, reset_session, run_agent
 app = FastAPI(title="Northwind Bank Agent (AgentCore-compatible)")
 
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
+# The Bank API's admin reset (direct, internal — a demo convenience, not governed).
+BANK_API_URL = os.environ.get("BANK_API_URL", "http://bank-api.railway.internal:8070")
 
 
 @app.get("/ping")
@@ -83,6 +86,18 @@ async def stream(request: Request):
     return StreamingResponse(gen(), media_type="text/event-stream", headers={
         "Cache-Control": "no-cache", "Connection": "keep-alive",
         "X-Accel-Buffering": "no"})
+
+
+@app.post("/reset-bank")
+async def reset_bank():
+    """Reset the bank's demo data (balances/accounts) back to the seeded start."""
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as c:
+            r = await c.post(BANK_API_URL.rstrip("/") + "/admin/reset")
+            r.raise_for_status()
+            return r.json()
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse(status_code=502, content={"error": f"reset failed: {exc}"})
 
 
 @app.post("/reset")

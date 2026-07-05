@@ -47,6 +47,17 @@ def health():
     return {"status": "ok"}
 
 
+@app.post("/admin/reset")
+def admin_reset():
+    """Re-seed the in-memory bank to its starting state (fresh balances, only the
+    two seeded accounts). Demo convenience — not a real banking operation."""
+    store.reset()
+    accts = store.list_accounts("cust-alice")
+    logger.info("Bank store reset to seed state")
+    return {"status": "reset",
+            "accounts": [{"id": a.id, "balance": a.balance} for a in accts]}
+
+
 @app.get("/customers/{customer_id}/accounts")
 def list_accounts(customer_id: str,
                   x_auth_principal: str | None = Header(default=None),
