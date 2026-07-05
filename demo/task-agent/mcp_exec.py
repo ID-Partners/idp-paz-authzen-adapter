@@ -95,6 +95,8 @@ async def call_tool(cred: Credential, tool: str, arguments: dict[str, Any],
                     "policy_reason": (parsed or {}).get("policy_reason") or (parsed or {}).get("message"),
                     "pep": (parsed or {}).get("pep"),
                     "pep_action": (parsed or {}).get("pep_action"),
+                    "insufficient_scope": (parsed or {}).get("insufficient_scope"),
+                    "scope_required": (parsed or {}).get("scope_required"),
                 }
     except LoginRequired:
         raise

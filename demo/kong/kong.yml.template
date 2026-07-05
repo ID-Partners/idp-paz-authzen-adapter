@@ -54,3 +54,7 @@ services:
           style: "rest"
           require_token: true
           require_dpop: false
+          # Step-up: a transfer requires the user to have consented to this scope.
+          # Missing → 401 insufficient_scope, and the app steps Alice up at PingFed.
+          stepup_scope: "banking:payments:transfer"
+          stepup_action: "make_payment"

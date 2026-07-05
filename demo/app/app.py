@@ -23,6 +23,7 @@ import hashlib
 import os
 import secrets
 import time
+import urllib.parse
 
 import httpx
 import jwt  # PyJWT
@@ -50,6 +51,10 @@ PRINCIPAL_AGENT_URL = os.environ.get("PRINCIPAL_AGENT_URL",
                                      "http://bank-agent.railway.internal:8000").rstrip("/")
 APP_SECRET = os.environ.get("APP_SECRET", "northwind-bff-secret")
 SESSION_TTL = int(os.environ.get("SESSION_TTL", "28800"))  # 8h
+# Everyday scopes Alice consents to at first login. The sensitive
+# banking:payments:transfer is NOT here — it requires a step-up (re-auth).
+DEFAULT_SCOPES = os.environ.get("DEFAULT_SCOPES",
+                                "openid banking:accounts:list banking:accounts:originate")
 SESSION_COOKIE = "nw_session"
 TX_COOKIE = "nw_oidc_tx"  # short-lived: holds PKCE verifier + state during the redirect
 
@@ -87,16 +92,26 @@ def health():
 
 
 @app.get("/login")
-def login():
-    """Kick off the OIDC authorization-code + PKCE flow at PingFederate."""
+def login(request: Request):
+    """Kick off the OIDC authorization-code + PKCE flow at PingFederate.
+
+    By default Alice consents to the everyday scopes. A `?stepup=<scope>` request
+    is a step-up: it adds the elevated scope (e.g. banking:payments:transfer) and
+    forces re-authentication (prompt=login) — RFC 9470 step-up for a risky action.
+    """
     verifier = _b64u(secrets.token_bytes(40))
     challenge = _b64u(hashlib.sha256(verifier.encode()).digest())
     state = secrets.token_urlsafe(16)
     nonce = secrets.token_urlsafe(16)
-    authz = (f"{PF_AUTHORIZE}?client_id={OIDC_CLIENT_ID}&response_type=code"
-             f"&redirect_uri={REDIRECT_URI}&scope=openid"
-             f"&code_challenge={challenge}&code_challenge_method=S256"
-             f"&state={state}&nonce={nonce}")
+    stepup = (request.query_params.get("stepup") or "").strip()
+    scope = DEFAULT_SCOPES + ((" " + stepup) if stepup else "")
+    params = {"client_id": OIDC_CLIENT_ID, "response_type": "code",
+              "redirect_uri": REDIRECT_URI, "scope": scope,
+              "code_challenge": challenge, "code_challenge_method": "S256",
+              "state": state, "nonce": nonce}
+    if stepup:
+        params["prompt"] = "login"   # force re-auth to approve the sensitive scope
+    authz = PF_AUTHORIZE + "?" + urllib.parse.urlencode(params)
     resp = RedirectResponse(authz, status_code=302)
     # Stash the PKCE verifier + state in a short-lived signed cookie.
     resp.set_cookie(TX_COOKIE, _sign({"v": verifier, "state": state, "nonce": nonce}, 600),

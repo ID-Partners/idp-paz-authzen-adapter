@@ -261,6 +261,28 @@ function AuthzenPDP:access(conf)
     return
   end
 
+  -- 3b) Step-up scope: a sensitive action (make_payment) requires a scope the
+  --     USER (Alice) consented to. Check HER token (X-User-Token); if she lacks
+  --     it, return a 401 insufficient_scope challenge so the app can step her up
+  --     at PingFederate to approve the scope, then retry.
+  if conf.stepup_scope and conf.stepup_scope ~= "" and action == (conf.stepup_action or "make_payment") then
+    local ut = kong.request.get_header("x-user-token")
+    local uclaims = ut and jwt_claims(ut) or nil
+    local uscope = uclaims and (uclaims.scope or uclaims.scp) or ""
+    if type(uscope) == "table" then uscope = table.concat(uscope, " ") end
+    if not string.find(" " .. uscope .. " ", " " .. conf.stepup_scope .. " ", 1, true) then
+      return kong.response.exit(401, {
+        error = "insufficient_scope",
+        scope = conf.stepup_scope,
+        pep = pep,
+        reason = "This action requires the '" .. conf.stepup_scope .. "' scope; sign in to approve it.",
+      }, {
+        ["Content-Type"] = "application/json",
+        ["WWW-Authenticate"] = 'Bearer error="insufficient_scope", scope="' .. conf.stepup_scope .. '"',
+      })
+    end
+  end
+
   local authzen_req = {
     subject = {
       type = "agent",

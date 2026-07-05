@@ -850,6 +850,15 @@ async function streamRun(prompt, spin){
         setTimeout(()=>{ location.href = ev.login_url || '/login'; }, 1800);
         return;
       }
+      if(ev.type === 'scope_challenge'){
+        // A sensitive action needs a scope Alice hasn't approved — step her up at
+        // PingFederate for that scope, then resume the request.
+        sessionStorage.setItem('pending_prompt', prompt);
+        setNode('pep2','deny','insufficient_scope');
+        out.appendChild(el('step tool_result convo', `<div class="label">🔐 Step-up required — scope <code>${esc(ev.scope||'')}</code></div><div>${esc(ev.detail||'')} You'll re-authenticate at PingFederate to approve this scope, then the payment continues.</div>`));
+        setTimeout(()=>{ location.href = '/login?stepup=' + encodeURIComponent(ev.scope||'banking:payments:transfer'); }, 2200);
+        return;
+      }
       if(ev.type === 'final'){ finalText = ev.final || ''; continue; }
       renderLive(ev);
       await new Promise(r => setTimeout(r, 150));   // small stagger so nodes light in sequence

@@ -25,6 +25,10 @@ return {
           -- Require a logged-in end user (X-User-Token). If absent, return a
           -- 401 login-required challenge (RFC 9470 step-up) so the app logs in.
           { require_user_login = { type = "boolean", default = false } },
+          -- Step-up scope: for `stepup_action`, the user's token (X-User-Token)
+          -- must carry this scope; if not, return 401 insufficient_scope.
+          { stepup_scope = { type = "string", default = "" } },
+          { stepup_action = { type = "string", default = "make_payment" } },
         },
       },
     },

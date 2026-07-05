@@ -53,9 +53,14 @@ def mint_claims_token(principal: str, agent: str = AGENT_ID) -> str:
 
 
 async def call(method: str, path: str, token: str,
-               json_body: dict[str, Any] | None = None) -> httpx.Response:
+               json_body: dict[str, Any] | None = None,
+               user_token: str | None = None) -> httpx.Response:
     url = f"{BANK_API_BASE_URL}{path}"
     headers = {"Authorization": f"Bearer {token}"}
+    # Forward the logged-in principal's (Alice's) token so PEP #2 can check the
+    # scopes she consented to (e.g. banking:payments:transfer for a transfer).
+    if user_token:
+        headers["X-User-Token"] = user_token
     logger.info("RS call via Kong (PEP #2): %s %s", method, url)
     async with httpx.AsyncClient(timeout=10.0, verify=False) as client:
         return await client.request(method, url, headers=headers, json=json_body)
@@ -73,6 +78,14 @@ def summarize(resp: httpx.Response) -> dict[str, Any]:
     except Exception:  # noqa: BLE001
         body = {}
 
+    # A step-up scope challenge: the gateway needs a scope Alice hasn't consented
+    # to yet (e.g. banking:payments:transfer). Surface it so the agent can push a
+    # step-up back to the app → PingFederate.
+    if body.get("error") == "insufficient_scope":
+        return {"authorized": False, "insufficient_scope": True,
+                "scope_required": body.get("scope"), "pep": body.get("pep") or pep,
+                "message": f"STEP-UP REQUIRED at {pep}: scope '{body.get('scope')}' needed",
+                "policy_reason": body.get("reason") or "insufficient scope"}
     if resp.status_code == 401:
         return {"authorized": False, "pep": pep,
                 "message": f"UNAUTHENTICATED at {pep}: {body.get('reason', 'no valid token')}",

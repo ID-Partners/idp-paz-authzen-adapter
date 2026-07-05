@@ -272,6 +272,20 @@ async def agent_events(prompt: str, session_id: str = "demo",
                        "final": "🔒 The account gateway requires you to sign in before I can act "
                                 "on your behalf. Redirecting you to the PingFederate login…"}
                 return
+
+            # The gateway needs a scope the user hasn't consented to (a sensitive
+            # transfer). Relay a step-up so the app sends Alice to PingFederate to
+            # approve that scope, then resumes.
+            if md.get("scope_challenge"):
+                sc = md["scope_challenge"]
+                scope = sc.get("scope")
+                yield {"type": "scope_challenge", "role": route["role"],
+                       "agent_label": route["label"], "scope": scope, "pep": sc.get("pep"),
+                       "detail": sc.get("detail", "A step-up scope is required.")}
+                yield {"type": "final", "session_id": session_id,
+                       "final": f"🔒 That transfer needs your approval for the '{scope}' scope. "
+                                f"Taking you to PingFederate to sign in and approve it…"}
+                return
             yield {"type": "a2a_result", "tool": tu.name, "role": route["role"],
                    "agent_label": route["label"], "ok": True,
                    "authorized": md.get("authorized"), "pep": md.get("pep"),

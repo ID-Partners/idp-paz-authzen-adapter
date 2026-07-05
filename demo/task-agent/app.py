@@ -168,6 +168,25 @@ async def a2a(request: Request):
         logger.warning("MCP call failed: %s", exc)
         return _rpc_error(rpc_id, -32000, f"{CFG['label']} could not reach the bank: {exc}")
 
+    # The gateway needs a scope the signed-in user hasn't consented to yet
+    # (e.g. banking:payments:transfer). Relay a scope step-up so the app can send
+    # Alice back to PingFederate to approve it, then retry.
+    if outcome.get("insufficient_scope"):
+        scope = outcome.get("scope_required")
+        steps.append({
+            "type": "scope_challenge", "role": AGENT_ROLE, "agent_label": CFG["label"],
+            "scope": scope, "pep": outcome.get("pep"),
+            "detail": f"PEP #2 rejected {operation} with 401 insufficient_scope: it needs the "
+                      f"'{scope}' scope, which the signed-in user hasn't approved. Step-up required."})
+        return JSONResponse(status_code=200, content={
+            "jsonrpc": "2.0", "id": rpc_id, "result": {
+                "message": {"role": "agent", "parts": [{"kind": "data",
+                    "data": {"error": "insufficient_scope", "scope": scope}}]},
+                "metadata": {"agent": CFG["id"], "agent_label": CFG["label"], "role": AGENT_ROLE,
+                             "steps": steps,
+                             "scope_challenge": {"scope": scope, "pep": outcome.get("pep"),
+                                 "detail": f"This action needs the '{scope}' scope."}}}})
+
     steps.append({
         "type": "tool_result", "name": operation, "role": AGENT_ROLE, "agent_label": CFG["label"],
         "authorized": outcome.get("authorized"), "policy_reason": outcome.get("policy_reason"),

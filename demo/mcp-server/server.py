@@ -65,6 +65,16 @@ def _incoming_token(ctx: Context | None, principal: str) -> str:
     return rs_client.mint_claims_token(principal)
 
 
+def _incoming_user_token(ctx: Context | None) -> str | None:
+    """The logged-in principal's (Alice's) PF token, forwarded on so PEP #2 can
+    check her consented scopes (X-User-Token from the inbound MCP request)."""
+    try:
+        req = ctx.request_context.request  # type: ignore[union-attr]
+        return req.headers.get("x-user-token") if req else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
 @mcp.tool()
 async def list_accounts(customer_id: str, ctx: Context = None) -> dict:
     """List the accounts held by a customer.
@@ -73,7 +83,8 @@ async def list_accounts(customer_id: str, ctx: Context = None) -> dict:
         customer_id: The bank customer identifier, e.g. "cust-alice".
     """
     token = _incoming_token(ctx, customer_id)
-    resp = await rs_client.call("GET", f"/customers/{customer_id}/accounts", token)
+    resp = await rs_client.call("GET", f"/customers/{customer_id}/accounts", token,
+                                user_token=_incoming_user_token(ctx))
     return rs_client.summarize(resp)
 
 
@@ -86,7 +97,8 @@ async def get_balance(customer_id: str, account_id: str, ctx: Context = None) ->
         account_id: The account to read, e.g. "CHK-1001".
     """
     token = _incoming_token(ctx, customer_id)
-    resp = await rs_client.call("GET", f"/accounts/{account_id}/balance", token)
+    resp = await rs_client.call("GET", f"/accounts/{account_id}/balance", token,
+                                user_token=_incoming_user_token(ctx))
     return rs_client.summarize(resp)
 
 
@@ -102,7 +114,8 @@ async def open_account(customer_id: str, account_type: str = "savings",
     """
     token = _incoming_token(ctx, customer_id)
     resp = await rs_client.call("POST", "/accounts", token, json_body={
-        "customer_id": customer_id, "account_type": account_type, "nickname": nickname})
+        "customer_id": customer_id, "account_type": account_type, "nickname": nickname},
+        user_token=_incoming_user_token(ctx))
     return rs_client.summarize(resp)
 
 
@@ -124,7 +137,7 @@ async def make_payment(customer_id: str, from_account: str, to_account: str,
     resp = await rs_client.call("POST", "/payments", token, json_body={
         "customer_id": customer_id, "from_account": from_account,
         "to_account": to_account, "amount": amount, "currency": currency,
-        "description": description})
+        "description": description}, user_token=_incoming_user_token(ctx))
     return rs_client.summarize(resp)
 
 
