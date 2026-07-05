@@ -16,11 +16,12 @@
   header { padding:16px 24px; border-bottom:1px solid var(--border); }
   header h1 { font-size:16px; margin:0; font-weight:600; }
   header .tag { font-size:12px; color:var(--muted); }
-  .wrap { max-width:1360px; margin:0 auto; padding:24px; }
-  /* two-column: diagram pinned on the left, chat + detail scroll on the right */
-  .layout { display:flex; gap:28px; align-items:flex-start; }
-  .col-left { flex:1 1 50%; min-width:0; position:sticky; top:16px; align-self:flex-start; }
-  .col-right { flex:1 1 50%; min-width:0; display:flex; flex-direction:column; }
+  .wrap { max-width:1920px; margin:0 auto; padding:24px; }
+  /* two-column: diagram pinned on the left (grows into spare width on wide
+     screens), chat + detail scroll on the right at a comfortable reading width */
+  .layout { display:flex; gap:32px; align-items:flex-start; }
+  .col-left { flex:1 1 auto; min-width:0; position:sticky; top:16px; align-self:flex-start; }
+  .col-right { flex:0 1 560px; min-width:360px; display:flex; flex-direction:column; }
   .col-right form#chat { position:sticky; top:0; z-index:3; background:var(--bg);
                          padding:6px 0 10px; }
   @media (max-width:980px){
@@ -300,16 +301,15 @@ const GN = {
 };
 const GE = [
   ['alice','principal','acts for'],
-  ['principal','account','delegates'],
-  ['principal','payments','delegates'],
+  ['principal','as','token exchange ×3','thin'],
+  ['principal','account','delegates token'],
+  ['principal','payments','delegates token'],
   ['account','pep1','presents token'],
   ['payments','pep1','presents token'],
   ['pep1','mcp','MCP session'],
   ['mcp','pep2','tools/call'],
   ['pep2','bankapi','bank call'],
   ['principal','attester','attests','thin'],
-  ['account','as','token exchange','thin'],
-  ['payments','as','','thin'],
   ['pep1','pdp','decision','dash'],
   ['pep2','pdp','decision','dash'],
   ['as','pdp','governs issuance','dash'],
@@ -414,11 +414,14 @@ function render(steps) {
       const w = s.workload || {};
       const wrows = Object.keys(w).map(k =>
         `<div class="ck">${esc(k)}</div><div class="cv">${esc(String(w[k]))}</div>`).join('');
+      const keys = (s.entity_jkt || s.local_jkt) ? `<div class="claims" style="margin-top:8px">
+        <div class="ck">entity key</div><div class="cv jkt">${esc(short(s.entity_jkt,40))} <span style="color:var(--muted)">(stable federation identity)</span></div>
+        <div class="ck">local key</div><div class="cv jkt">${esc(short(s.local_jkt,40))} <span style="color:var(--muted)">(ephemeral DPoP — bound by cnf.jwk)</span></div></div>` : '';
       const meta = `<div class="claims" style="margin-top:8px">
         <div class="ck">attester (iss)</div><div class="cv">${esc(s.attester||'')}</div>
-        <div class="ck">sub</div><div class="cv">${esc(s.client_id||'')} <span style="color:var(--muted)">(agent client_id)</span></div>
+        <div class="ck">agent</div><div class="cv act">${esc(s.agent||'')} <span style="color:var(--muted)">(${esc(s.agent_type||'')})</span></div>
         <div class="ck">auth_method</div><div class="cv">${esc(s.auth_method||'')}</div>
-        <div class="ck">typ</div><div class="cv">${esc(s.typ||'')}</div></div>
+        <div class="ck">typ</div><div class="cv">${esc(s.typ||'')}</div></div>${keys}
         <div class="rar"><div class="ck" style="font-size:11px">workload — attested AgentCore attributes</div>
           <div class="claims">${wrows}</div></div>`;
       const wire = wireDetails('wire detail — the attestation the agent presents', [
@@ -436,10 +439,10 @@ function render(steps) {
     } else if (s.type === 'auth') {
       setNode('alice','done'); { const n = agentNode(s.role); if (n) setNode(n,'done'); }
       const meta = `<div class="claims" style="margin-top:8px">
-        <div class="ck">client_id</div><div class="cv">${esc(s.client_id||'')} <span style="color:var(--muted)">(agent operator)</span></div>
         <div class="ck">agent</div><div class="cv act">${esc(s.agent||'')}</div>
-        <div class="ck">grant</div><div class="cv">${esc(s.grant||'')}</div>
-        <div class="ck">DPoP jkt</div><div class="cv jkt">${esc(short(s.jkt,32))}</div></div>`;
+        <div class="ck">entity key</div><div class="cv jkt">${esc(short(s.entity_jkt||s.jkt,36))} <span style="color:var(--muted)">(identity)</span></div>
+        <div class="ck">local DPoP key</div><div class="cv jkt">${esc(short(s.local_jkt||s.jkt,36))} <span style="color:var(--muted)">(attested this session)</span></div>
+        <div class="ck">auth_method</div><div class="cv">${esc(s.auth_method||s.grant||'')}</div></div>`;
       out.appendChild(el('step auth',
         `<div class="label">① ${esc(s.title||'Agent authenticates')}</div>${esc(s.detail)}${meta}
          <div class="explain">The agent is its own identity and holds a private key; the token it gets next will be bound to that key.</div>`));

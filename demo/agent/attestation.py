@@ -102,7 +102,8 @@ def attester_jwks() -> dict[str, Any]:
 
 
 def _agentcore_workload(*, agent_id: str, agent_type: str, principal_sub: str,
-                        instance_id: str, model: str | None) -> dict[str, Any]:
+                        instance_id: str, model: str | None,
+                        entity_key_thumbprint: str | None = None) -> dict[str, Any]:
     """Assemble the `workload` claim from the AgentCore agent's attributes.
 
     These are the attributes an attester vouches for about the running agent —
@@ -113,6 +114,9 @@ def _agentcore_workload(*, agent_id: str, agent_type: str, principal_sub: str,
         "software_id": agent_id,
         "software_version": AGENT_VERSION,
         "agent_type": agent_type,
+        # the agent's stable ENTITY key (its federation identity), distinct from
+        # the ephemeral local/DPoP key that cnf.jwk binds below.
+        **({"entity_key_thumbprint": entity_key_thumbprint} if entity_key_thumbprint else {}),
         # runtime / deployment context (AgentCore runtime attributes)
         "environment": os.environ.get("RAILWAY_ENVIRONMENT_NAME")
         or os.environ.get("ENVIRONMENT", "production"),
@@ -148,12 +152,15 @@ def mint_agent_attestation(*, client_id: str, agent_id: str, agent_type: str,
                            principal_sub: str, agent_public_jwk: dict[str, Any],
                            authorization_details: list[dict[str, Any]],
                            instance_id: str | None = None,
-                           model: str | None = None) -> Attestation:
+                           model: str | None = None,
+                           entity_key_thumbprint: str | None = None) -> Attestation:
     """Issue an Attestation JWT for the agent, shaped as pf-oidf-modules validates.
 
-    `agent_public_jwk` MUST be the agent's DPoP instance key — it becomes
+    `agent_public_jwk` MUST be the agent's LOCAL DPoP instance key — it becomes
     `cnf.jwk`, so the DPoP proof (signed by that key) proves possession.
-    `authorization_details` is the RFC 9396 ceiling the attester entitles.
+    `entity_key_thumbprint` is the agent's stable ENTITY key (its federation
+    identity), recorded in the workload. `authorization_details` is the RFC 9396
+    ceiling the attester entitles.
     """
     now = int(time.time())
     instance_id = instance_id or str(uuid.uuid4())
@@ -162,10 +169,10 @@ def mint_agent_attestation(*, client_id: str, agent_id: str, agent_type: str,
         "sub": client_id,                       # the agent client_id (== request client_id)
         "iat": now,
         "exp": now + ATTESTATION_TTL,
-        "cnf": {"jwk": agent_public_jwk},       # binds the agent's DPoP key
+        "cnf": {"jwk": agent_public_jwk},       # binds the agent's LOCAL/DPoP key
         "workload": _agentcore_workload(
             agent_id=agent_id, agent_type=agent_type, principal_sub=principal_sub,
-            instance_id=instance_id, model=model),
+            instance_id=instance_id, model=model, entity_key_thumbprint=entity_key_thumbprint),
         "authorization_details": authorization_details,  # the attested ceiling
     }
     header = {"alg": "ES256", "typ": ATTESTATION_TYP, "kid": _ATTESTER_KID}

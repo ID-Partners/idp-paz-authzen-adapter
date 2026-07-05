@@ -489,13 +489,16 @@ def _pub_jwk(key: ec.EllipticCurvePrivateKey) -> dict[str, str]:
             "x": _int_to_b64url(p.x), "y": _int_to_b64url(p.y)}
 
 
-def _attestation_step(att, agent_id: str, agent_type: str, role: str | None = None) -> dict[str, Any]:
+def _attestation_step(att, agent_id: str, agent_type: str, entity_jkt: str,
+                      local_jkt: str, role: str | None = None) -> dict[str, Any]:
     step = {
         "type": "attestation", "title": "Client attestation",
-        "detail": f"Attester '{att.attester_issuer}' issued an attestation JWT vouching for "
-                  f"{agent_id} ({agent_type}), binding its DPoP key (cnf.jkt) and ceiling.",
+        "detail": f"Attester '{att.attester_issuer}' issued an attestation JWT for {agent_id} "
+                  f"({agent_type}): it binds the agent's LOCAL DPoP key (cnf.jwk) to its "
+                  f"ENTITY key and states its ceiling.",
         "attester": att.attester_issuer, "client_id": AGENT_CLIENT_ID,
         "agent": agent_id, "agent_type": agent_type,
+        "entity_jkt": entity_jkt, "local_jkt": local_jkt,
         "auth_method": "attest_jwt_client_auth_dpop", "typ": att.header.get("typ"),
         "workload": att.claims.get("workload"),
         "attestation_header": att.header, "attestation_claims": att.claims,
@@ -507,12 +510,14 @@ def _attestation_step(att, agent_id: str, agent_type: str, role: str | None = No
     return step
 
 
-def _auth_step(agent_id: str, jkt: str, role: str | None = None) -> dict[str, Any]:
+def _auth_step(agent_id: str, entity_jkt: str, local_jkt: str, role: str | None = None) -> dict[str, Any]:
     step = {
         "type": "auth", "title": "Agent authenticates",
-        "detail": f"{agent_id} authenticated with its attestation "
-                  f"(attest_jwt_client_auth_dpop) and a fresh DPoP key — no client secret.",
-        "client_id": AGENT_CLIENT_ID, "agent": agent_id, "jkt": jkt,
+        "detail": f"{agent_id} authenticated with its attestation (attest_jwt_client_auth_dpop): "
+                  f"its stable entity key identifies it, and a fresh local DPoP key sender-"
+                  f"constrains this session — no client secret.",
+        "client_id": AGENT_CLIENT_ID, "agent": agent_id,
+        "jkt": local_jkt, "entity_jkt": entity_jkt, "local_jkt": local_jkt,
         "grant": "client_credentials", "auth_method": "attest_jwt_client_auth_dpop", "mode": "local",
     }
     if role:
@@ -593,39 +598,49 @@ def acquire_agent_fleet() -> AgentFleet:
     header = {"alg": "ES256", "typ": "JWT"}
     steps: list[dict[str, Any]] = []
 
-    # Principal Agent (concierge): attestation + authenticate + Alice → concierge.
+    # Each agent has its OWN entity key (stable federation identity) AND a fresh
+    # local DPoP key (ephemeral, sender-constrains the session); the attester binds
+    # the local key to the entity in the attestation.
+    # Principal Agent (concierge): entity + local keys, attestation, Alice → concierge.
+    conc_entity = _new_key(); conc_entity_jkt = _jkt(conc_entity)
     conc_key = _new_key(); conc_jkt = _jkt(conc_key); conc_jwk = _pub_jwk(conc_key)
     conc_att = mint_agent_attestation(
         client_id=AGENT_CLIENT_ID, agent_id=PRINCIPAL_AGENT_ID, agent_type="orchestrator",
         principal_sub=PRINCIPAL_SUB, agent_public_jwk=conc_jwk,
-        authorization_details=_authorization_details(), model=AGENT_MODEL)
-    steps.append(_attestation_step(conc_att, PRINCIPAL_AGENT_ID, "orchestrator", role="principal"))
-    steps.append(_auth_step(PRINCIPAL_AGENT_ID, conc_jkt, role="principal"))
+        authorization_details=_authorization_details(), model=AGENT_MODEL,
+        entity_key_thumbprint=conc_entity_jkt)
+    steps.append(_attestation_step(conc_att, PRINCIPAL_AGENT_ID, "orchestrator",
+                                   conc_entity_jkt, conc_jkt, role="principal"))
+    steps.append(_auth_step(PRINCIPAL_AGENT_ID, conc_entity_jkt, conc_jkt, role="principal"))
     act1 = _build_act_chain([PRINCIPAL_AGENT_ID])
     tok1, claims1 = _mint_token(signing_key, header, act1, conc_jkt, now)
     steps.append(_te_step(actor=PRINCIPAL_AGENT_ID, delegator=PRINCIPAL_SUB, hop=1, hops=2,
                           token=tok1, claims=claims1, jkt=conc_jkt, jwk=conc_jwk, now=now,
-                          role="principal", title="Alice → Principal Agent (token exchange)",
+                          role="principal", title="Alice → Principal Agent (token exchange @ AS)",
                           subject_desc="<principal access token — Alice>"))
 
-    # Each task agent: attestation + concierge → task-agent delegation → credential.
+    # Each task agent: the Principal Agent calls the AS to exchange its token for a
+    # task-agent-scoped delegated token (nested act). Each task agent has its own
+    # entity + local keys and attestation → its own credential.
     roles: dict[str, AgentCredential] = {}
     tool_role_map: dict[str, str] = {}
     role_label: dict[str, str] = {}
     for cfg in TASK_AGENTS:
+        entity = _new_key(); entity_jkt = _jkt(entity)
         key = _new_key(); jkt = _jkt(key); jwk = _pub_jwk(key)
         att = mint_agent_attestation(
             client_id=AGENT_CLIENT_ID, agent_id=cfg["id"], agent_type=cfg["type"],
             principal_sub=PRINCIPAL_SUB, agent_public_jwk=jwk,
-            authorization_details=_authorization_details(), model=AGENT_MODEL)
-        steps.append(_attestation_step(att, cfg["id"], cfg["type"], role=cfg["role"]))
+            authorization_details=_authorization_details(), model=AGENT_MODEL,
+            entity_key_thumbprint=entity_jkt)
+        steps.append(_attestation_step(att, cfg["id"], cfg["type"], entity_jkt, jkt, role=cfg["role"]))
         act = _build_act_chain([PRINCIPAL_AGENT_ID, cfg["id"]])
         tok, claims = _mint_token(signing_key, header, act, jkt, now)
         steps.append(_te_step(actor=cfg["id"], delegator=PRINCIPAL_AGENT_ID, hop=2, hops=2,
                               token=tok, claims=claims, jkt=jkt, jwk=jwk, now=now,
                               role=cfg["role"], label=cfg["label"],
-                              title=f"Principal Agent → {cfg['label']} (token exchange)",
-                              subject_desc="<delegated token from hop 1 (concierge)>"))
+                              title=f"Principal Agent exchanges @ AS → {cfg['label']} token",
+                              subject_desc="<Principal Agent's delegated token (hop 1)>"))
         roles[cfg["role"]] = AgentCredential(
             access_token=tok, principal_sub=PRINCIPAL_SUB, agent_sub=cfg["id"],
             scope=DEFAULT_SCOPE, jkt=jkt, mode="local", _key=key, steps=[])
