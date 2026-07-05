@@ -161,12 +161,58 @@
   .components td.c1 { font-weight:600; white-space:nowrap; }
   .components .role { color:var(--muted); }
   .components a { color:var(--pdp); text-decoration:none; }
+  /* login gate */
+  .login-overlay { position:fixed; inset:0; z-index:1000; display:flex; align-items:center;
+    justify-content:center; background:radial-gradient(1200px 600px at 50% -10%, #12202e, #070a0e 70%); }
+  .login-card { width:340px; max-width:92vw; background:var(--panel,#0d1117); border:1px solid var(--border);
+    border-radius:14px; padding:28px 26px; box-shadow:0 24px 60px rgba(0,0,0,.5); }
+  .login-brand { font-size:22px; font-weight:700; }
+  .login-sub { color:var(--muted); font-size:13px; margin:4px 0 20px; }
+  .login-card label { display:block; font-size:12px; color:var(--muted); margin:0 0 12px; }
+  .login-card input { width:100%; margin-top:5px; padding:10px 12px; border-radius:8px;
+    border:1px solid var(--border); background:#06090d; color:inherit; font-size:14px; box-sizing:border-box; }
+  .login-btn { width:100%; margin-top:6px; padding:11px; border:none; border-radius:8px; cursor:pointer;
+    background:var(--pdp,#3b82f6); color:#fff; font-size:14px; font-weight:600; }
+  .login-btn:disabled { opacity:.6; cursor:default; }
+  .login-err { color:#ff7b72; font-size:12.5px; min-height:16px; margin-bottom:8px; }
+  .login-hint { color:var(--muted); font-size:12px; text-align:center; margin-top:14px; }
+  .whoami { display:inline-flex; align-items:center; gap:8px; font-size:12.5px; color:var(--muted); }
+  .whoami b { color:inherit; }
+  .whoami .avatar { width:22px; height:22px; border-radius:50%; background:var(--pdp,#3b82f6); color:#fff;
+    display:inline-flex; align-items:center; justify-content:center; font-size:11px; font-weight:700; }
+  .whoami .logout { background:none; border:1px solid var(--border); color:var(--muted); border-radius:6px;
+    padding:3px 8px; font-size:11.5px; cursor:pointer; }
+  header { display:flex; align-items:center; justify-content:space-between; gap:16px; flex-wrap:wrap; }
 </style>
 </head>
 <body>
+
+<div id="login" class="login-overlay">
+  <form id="loginform" class="login-card">
+    <div class="login-brand">🏦 Northwind Bank</div>
+    <div class="login-sub">Sign in to your AI account assistant</div>
+    <label>Username
+      <input id="lu" autocomplete="username" value="alice" autofocus />
+    </label>
+    <label>Password
+      <input id="lp" type="password" autocomplete="current-password" placeholder="demo" />
+    </label>
+    <div id="loginerr" class="login-err"></div>
+    <button id="loginbtn" class="login-btn" type="submit">Sign in</button>
+    <div class="login-hint">Demo credentials — <b>alice</b> / <b>demo</b></div>
+  </form>
+</div>
+
 <header>
-  <h1>🏦 Northwind Bank — AI Account Assistant</h1>
-  <span class="tag">Agent identity · RFC 8693 token exchange · DPoP · Kong PDP enforcement (MCP + API)</span>
+  <div>
+    <h1>🏦 Northwind Bank — AI Account Assistant</h1>
+    <span class="tag">Agent identity · RFC 8693 token exchange · DPoP · Kong PDP enforcement (MCP + API)</span>
+  </div>
+  <span id="whoami" class="whoami" hidden>
+    <span class="avatar" id="waAvatar">A</span>
+    <span>Signed in as <b id="waName">Alice</b> <span id="waSub" style="color:var(--muted)"></span></span>
+    <button type="button" class="logout" id="logout">Sign out</button>
+  </span>
 </header>
 <div class="wrap">
  <div class="layout">
@@ -243,6 +289,66 @@ const newConvBtn = document.getElementById('newconv');
 function newSid(){ return 'web-' + Math.random().toString(36).slice(2,10) + Date.now().toString(36); }
 let SID = localStorage.getItem('bankagent_sid') || newSid();
 localStorage.setItem('bankagent_sid', SID);
+
+// --- Principal login ---------------------------------------------------------
+const SESSION_KEY = 'bankagent_session';
+let AUTH = sessionStorage.getItem(SESSION_KEY) || '';
+const loginOverlay = document.getElementById('login');
+const loginForm = document.getElementById('loginform');
+const loginErr = document.getElementById('loginerr');
+const loginBtn = document.getElementById('loginbtn');
+const whoami = document.getElementById('whoami');
+
+// Attach the session bearer to app requests so the server can gate on it.
+function authHeaders(extra){
+  return Object.assign({'Content-Type':'application/json'},
+    AUTH ? {'Authorization':'Bearer '+AUTH} : {}, extra||{});
+}
+function showApp(p){
+  loginOverlay.style.display = 'none';
+  whoami.hidden = false;
+  const name = (p && p.name) || 'Alice';
+  document.getElementById('waName').textContent = name;
+  document.getElementById('waSub').textContent = p && p.sub ? '('+p.sub+')' : '';
+  document.getElementById('waAvatar').textContent = (name[0]||'A').toUpperCase();
+  input.focus();
+}
+function showLogin(){
+  whoami.hidden = true;
+  loginOverlay.style.display = 'flex';
+  document.getElementById('lp').value = '';
+  setTimeout(()=>document.getElementById('lu').focus(), 50);
+}
+async function ensureAuth(){
+  if(AUTH){
+    try {
+      const r = await fetch('/me', {headers: authHeaders()});
+      if(r.ok){ showApp((await r.json()).principal); return; }
+    } catch(e){}
+    AUTH = ''; sessionStorage.removeItem(SESSION_KEY);
+  }
+  showLogin();
+}
+loginForm.addEventListener('submit', async (e)=>{
+  e.preventDefault();
+  loginErr.textContent = ''; loginBtn.disabled = true; loginBtn.textContent = 'Signing in…';
+  try {
+    const r = await fetch('/login', { method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ username: document.getElementById('lu').value,
+                             password: document.getElementById('lp').value }) });
+    const d = await r.json().catch(()=>({}));
+    if(!r.ok){ loginErr.textContent = d.error || 'Sign-in failed'; return; }
+    AUTH = d.token; sessionStorage.setItem(SESSION_KEY, AUTH);
+    showApp(d.principal);
+  } catch(err){ loginErr.textContent = 'Network error — try again'; }
+  finally { loginBtn.disabled = false; loginBtn.textContent = 'Sign in'; }
+});
+document.getElementById('logout').addEventListener('click', ()=>{
+  AUTH = ''; sessionStorage.removeItem(SESSION_KEY);
+  out.innerHTML = ''; if(typeof resetPipeline==='function') resetPipeline();
+  showLogin();
+});
+ensureAuth();
 
 document.querySelectorAll('.examples button').forEach(b => {
   b.addEventListener('click', () => { input.value = b.dataset.prompt; input.focus(); });
@@ -625,13 +731,16 @@ function renderLive(ev){
 async function streamRun(prompt, spin){
   let res;
   try {
-    res = await fetch('/stream', { method:'POST', headers:{'Content-Type':'application/json'},
+    res = await fetch('/stream', { method:'POST', headers: authHeaders(),
       body: JSON.stringify({ prompt, session_id: SID }) });
   } catch(e){ res = null; }
+  if(res && res.status === 401){ spin.remove(); AUTH=''; sessionStorage.removeItem(SESSION_KEY);
+    out.appendChild(el('step tool_result convo', `<div class="label">🔒 Session expired — please sign in again.</div>`));
+    showLogin(); return; }
   if(!res || !res.ok || !res.body){
     spin.remove();
     const data = await (await fetch('/invocations', { method:'POST',
-      headers:{'Content-Type':'application/json'}, body: JSON.stringify({ prompt, session_id: SID }) })).json();
+      headers: authHeaders(), body: JSON.stringify({ prompt, session_id: SID }) })).json();
     if(data.error){ out.appendChild(el('step tool_result convo', `<div class="label">⚠ Error</div><pre>${esc(data.error)}</pre>`)); return; }
     render(data.transcript || []);
     out.appendChild(el('step final agent convo', `<div class="label">✅ Agent — final answer</div>${esc(data.final)}`));
