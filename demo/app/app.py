@@ -149,6 +149,23 @@ def me(request: Request):
     return {"principal": {"sub": s.get("sub"), "name": s.get("name"), "acr": s.get("acr")}}
 
 
+@app.get("/session/token")
+def session_token(request: Request):
+    """Return the decoded details of Alice's PingFederate token held in her
+    session, so the UI can pop it open and show the real claims."""
+    s = _session(request)
+    if not s:
+        return JSONResponse(status_code=401, content={"error": "not signed in"})
+    pf_at = s.get("pf_at", "")
+    out: dict = {"principal": {"sub": s.get("sub"), "name": s.get("name"), "acr": s.get("acr")},
+                 "has_token": bool(pf_at), "issued_by": "PingFederate (OIDC login)"}
+    if pf_at.count(".") == 2:
+        out["header"] = jwt.get_unverified_header(pf_at)
+        out["claims"] = jwt.decode(pf_at, options={"verify_signature": False})
+        out["token_preview"] = pf_at[:32] + "…" + pf_at[-20:]
+    return out
+
+
 @app.post("/logout")
 def logout():
     resp = JSONResponse({"status": "logged out"})

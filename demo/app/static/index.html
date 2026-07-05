@@ -183,6 +183,30 @@
   .whoami .logout { background:none; border:1px solid var(--border); color:var(--muted); border-radius:6px;
     padding:3px 8px; font-size:11.5px; cursor:pointer; }
   header { display:flex; align-items:center; justify-content:space-between; gap:16px; flex-wrap:wrap; }
+  /* token modal */
+  .modal-backdrop { position:fixed; inset:0; z-index:1100; background:rgba(3,6,9,.72);
+    display:none; align-items:center; justify-content:center; padding:24px; }
+  .modal-backdrop.open { display:flex; }
+  .modal { width:560px; max-width:94vw; max-height:86vh; overflow:auto; background:var(--panel,#0d1117);
+    border:1px solid var(--border); border-radius:14px; box-shadow:0 24px 60px rgba(0,0,0,.6); }
+  .modal-head { display:flex; align-items:center; justify-content:space-between; gap:12px;
+    padding:16px 20px; border-bottom:1px solid var(--border); position:sticky; top:0; background:var(--panel,#0d1117); }
+  .modal-head h3 { margin:0; font-size:15px; }
+  .modal-head .x { background:none; border:1px solid var(--border); color:var(--muted); border-radius:6px;
+    padding:4px 9px; cursor:pointer; font-size:14px; }
+  .modal-body { padding:16px 20px; }
+  .tok-sub { color:var(--muted); font-size:12px; margin:0 0 12px; }
+  .tok-section { font-size:11px; text-transform:uppercase; letter-spacing:.5px; color:var(--muted);
+    margin:16px 0 6px; }
+  .tok-claims { width:100%; border-collapse:collapse; font-size:12.5px; }
+  .tok-claims td { padding:5px 8px; border-bottom:1px solid var(--border); vertical-align:top;
+    font-family:ui-monospace,Menlo,monospace; }
+  .tok-claims td.k { color:var(--pdp,#3b82f6); white-space:nowrap; width:34%; }
+  .tok-claims td.v { color:var(--text); word-break:break-all; }
+  .tok-raw { font-family:ui-monospace,Menlo,monospace; font-size:11px; color:#7ee787; background:#06090d;
+    border:1px solid var(--border); border-radius:8px; padding:10px; word-break:break-all; }
+  .tok-badge { display:inline-block; font-size:11px; padding:2px 8px; border-radius:20px;
+    background:rgba(59,130,246,.15); color:#8fbcff; border:1px solid rgba(59,130,246,.35); }
 </style>
 </head>
 <body>
@@ -207,6 +231,7 @@
   <span id="whoami" class="whoami" hidden>
     <span class="avatar" id="waAvatar">A</span>
     <span>Signed in as <b id="waName">Alice</b> <span id="waSub" style="color:var(--muted)"></span></span>
+    <button type="button" class="logout" id="viewtoken" title="Show the PingFederate token in this session">🔑 View token</button>
     <button type="button" class="logout" id="logout">Sign out</button>
   </span>
   <span id="signedout" class="whoami" hidden>
@@ -215,6 +240,18 @@
             onclick="location.href='/login'">🎫 Sign in with PingFederate</button>
   </span>
 </header>
+
+<div id="tokenModal" class="modal-backdrop">
+  <div class="modal">
+    <div class="modal-head">
+      <h3>🔑 Your PingFederate session token</h3>
+      <button type="button" class="x" id="tokClose">✕ Close</button>
+    </div>
+    <div class="modal-body" id="tokBody">
+      <p class="tok-sub">Loading…</p>
+    </div>
+  </div>
+</div>
 <div class="wrap">
  <div class="layout">
   <div class="col-left">
@@ -304,16 +341,19 @@ if(loginOverlay) loginOverlay.style.display = 'none';
 const whoami = document.getElementById('whoami');
 const signedout = document.getElementById('signedout');
 function authHeaders(extra){ return Object.assign({'Content-Type':'application/json'}, extra||{}); }
+// NB: the `hidden` attribute is overridden by `.whoami{display:inline-flex}` (author
+// CSS beats the UA [hidden] rule), so toggle display explicitly — otherwise both the
+// signed-in chip and the "Sign in" button show at once (conflicting status).
 function showApp(p){
   if(loginOverlay) loginOverlay.style.display = 'none';
-  signedout.hidden = true; whoami.hidden = false;
+  signedout.style.display = 'none'; whoami.style.display = 'inline-flex';
   const name = (p && p.name) || 'Alice';
   document.getElementById('waName').textContent = name;
   document.getElementById('waSub').textContent = p && p.sub ? '('+p.sub+')' : '';
   document.getElementById('waAvatar').textContent = (name[0]||'A').toUpperCase();
   input.focus();
 }
-function showLogin(){ whoami.hidden = true; signedout.hidden = false; }
+function showLogin(){ whoami.style.display = 'none'; signedout.style.display = 'inline-flex'; }
 async function ensureAuth(){
   try {
     const r = await fetch('/me');
@@ -326,6 +366,41 @@ document.getElementById('logout').addEventListener('click', async ()=>{
   out.innerHTML = ''; if(typeof resetPipeline==='function') resetPipeline();
   showLogin();
 });
+
+// --- Token details modal -----------------------------------------------------
+const tokenModal = document.getElementById('tokenModal');
+const tokBody = document.getElementById('tokBody');
+function rowsFrom(obj){
+  return Object.entries(obj||{}).map(([k,v])=>{
+    let val = (typeof v === 'object') ? JSON.stringify(v) : String(v);
+    if((k==='iat'||k==='exp'||k==='auth_time'||k==='nbf') && /^\d+$/.test(val))
+      val = val + '  ('+ new Date(val*1000).toISOString().replace('T',' ').slice(0,19) +' UTC)';
+    return `<tr><td class="k">${esc(k)}</td><td class="v">${esc(val)}</td></tr>`;
+  }).join('');
+}
+async function openToken(){
+  tokenModal.classList.add('open');
+  tokBody.innerHTML = '<p class="tok-sub">Loading…</p>';
+  let d; try { const r = await fetch('/session/token'); if(!r.ok){ showLogin(); tokenModal.classList.remove('open'); location.href='/login'; return; } d = await r.json(); }
+  catch(e){ tokBody.innerHTML = '<p class="tok-sub">Could not load token.</p>'; return; }
+  const c = d.claims || {};
+  tokBody.innerHTML = `
+    <p class="tok-sub">This is the real access token PingFederate issued when
+      <b>${esc((d.principal||{}).name||'Alice')}</b> signed in. The app holds it in an
+      httponly session cookie and forwards it to the gateway as the logged-in user.
+      <span class="tok-badge">${esc(d.issued_by||'PingFederate')}</span></p>
+    ${d.claims ? `<div class="tok-section">Claims</div>
+      <table class="tok-claims">${rowsFrom(c)}</table>` : '<p class="tok-sub">No JWT in session.</p>'}
+    ${d.header ? `<div class="tok-section">JOSE header</div>
+      <table class="tok-claims">${rowsFrom(d.header)}</table>` : ''}
+    ${d.token_preview ? `<div class="tok-section">Raw token</div>
+      <div class="tok-raw">${esc(d.token_preview)}</div>` : ''}`;
+}
+function closeToken(){ tokenModal.classList.remove('open'); }
+document.getElementById('viewtoken').addEventListener('click', openToken);
+document.getElementById('tokClose').addEventListener('click', closeToken);
+tokenModal.addEventListener('click', (e)=>{ if(e.target===tokenModal) closeToken(); });
+document.addEventListener('keydown', (e)=>{ if(e.key==='Escape') closeToken(); });
 ensureAuth();
 
 document.querySelectorAll('.examples button').forEach(b => {
