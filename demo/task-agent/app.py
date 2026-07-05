@@ -1,0 +1,164 @@
+"""
+A Task Agent as its own service, invoked by the Principal Agent (concierge) over
+**A2A** (Agent2Agent — JSON-RPC over HTTP with an Agent Card).
+
+Run as the Account Agent or the Payments Agent via AGENT_ROLE. On each A2A
+`message/send`, this agent establishes its OWN identity (entity + local keys,
+client attestation, a delegated DPoP-bound token whose nested `act` chain adds it
+over the concierge), opens its OWN MCP session to the bank through Kong, executes
+the requested operation, and returns the result plus its identity/wire steps so
+the concierge can surface them.
+"""
+from __future__ import annotations
+
+import logging
+import os
+from typing import Any
+
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+
+from identity import establish_identity
+from mcp_exec import MCP_SERVER_URL, call_tool
+
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s %(levelname)s %(name)s %(message)s")
+logger = logging.getLogger("task-agent")
+
+ROLES = {
+    "account": {
+        "id": os.environ.get("ACCOUNT_AGENT_ID", "urn:agent:northwind-account:v1"),
+        "type": "account-opening", "label": "Account Agent",
+        "skills": ["list_accounts", "get_balance", "open_account"],
+        "description": "Opens accounts and reads balances on behalf of the customer."},
+    "payments": {
+        "id": os.environ.get("PAYMENTS_AGENT_ID", "urn:agent:northwind-payments:v1"),
+        "type": "payments", "label": "Payments Agent",
+        "skills": ["make_payment"],
+        "description": "Initiates payments/transfers on behalf of the customer."},
+}
+
+AGENT_ROLE = os.environ.get("AGENT_ROLE", "account").lower()
+CFG = ROLES.get(AGENT_ROLE, ROLES["account"])
+PUBLIC_URL = os.environ.get("PUBLIC_URL", "")   # this service's own base URL (for the card)
+
+app = FastAPI(title=f"Northwind {CFG['label']}")
+
+
+def _presented(cred, url: str) -> dict[str, Any]:
+    tp = cred.access_token
+    tp = (tp[:28] + "…" + tp[-14:]) if len(tp) > 44 else tp
+    proof = cred._dpop_proof("POST", url)
+    return {"scheme": "DPoP", "authorization": f"DPoP {tp}",
+            "dpop_proof": proof[:28] + "…" + proof[-14:], "jkt": cred.jkt,
+            "sub": cred.principal_sub, "act": cred.agent_sub}
+
+
+@app.get("/ping")
+def ping():
+    return {"status": "healthy", "role": AGENT_ROLE}
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "role": AGENT_ROLE, "agent": CFG["id"]}
+
+
+@app.get("/.well-known/agent-card.json")
+def agent_card(request: Request):
+    """A2A Agent Card — how the concierge discovers this agent and its skills."""
+    base = PUBLIC_URL or str(request.base_url).rstrip("/")
+    return {
+        "protocolVersion": "0.2.0",
+        "name": CFG["label"],
+        "description": CFG["description"],
+        "url": f"{base}/a2a",
+        "preferredTransport": "JSONRPC",
+        "provider": {"organization": "Northwind Bank"},
+        "version": "1.0.0",
+        "capabilities": {"streaming": False},
+        "defaultInputModes": ["application/json"],
+        "defaultOutputModes": ["application/json"],
+        "skills": [{"id": s, "name": s.replace("_", " "),
+                    "description": f"{s} at Northwind Bank", "tags": ["banking", AGENT_ROLE]}
+                   for s in CFG["skills"]],
+        "securitySchemes": {"delegatedToken": {"type": "http", "scheme": "bearer",
+                            "description": "The concierge's delegated (RFC 8693) DPoP-bound token"}},
+        "security": [{"delegatedToken": []}],
+    }
+
+
+def _rpc_error(rpc_id, code, message):
+    return JSONResponse(status_code=200, content={
+        "jsonrpc": "2.0", "id": rpc_id, "error": {"code": code, "message": message}})
+
+
+@app.post("/a2a")
+async def a2a(request: Request):
+    """A2A JSON-RPC endpoint. Supports message/send carrying {operation, arguments}."""
+    body = await request.json()
+    rpc_id = body.get("id")
+    if body.get("method") != "message/send":
+        return _rpc_error(rpc_id, -32601, f"unsupported method '{body.get('method')}'")
+
+    params = body.get("params", {})
+    message = params.get("message", {})
+    data = {}
+    for part in message.get("parts", []):
+        if part.get("kind") == "data" and isinstance(part.get("data"), dict):
+            data = part["data"]
+            break
+    operation = data.get("operation")
+    arguments = data.get("arguments", {}) or {}
+    if operation not in CFG["skills"]:
+        return _rpc_error(rpc_id, -32602,
+                          f"{CFG['label']} does not handle '{operation}' "
+                          f"(skills: {', '.join(CFG['skills'])})")
+
+    # The concierge's delegated token arrives as the A2A bearer credential.
+    subj = request.headers.get("authorization", "")
+    subj_note = "present" if subj else "absent"
+    logger.info("A2A message/send op=%s (delegation token %s)", operation, subj_note)
+
+    # 1) This task agent establishes its own identity + delegated token.
+    cred = establish_identity(agent_id=CFG["id"], agent_type=CFG["type"],
+                              agent_label=CFG["label"], role=AGENT_ROLE, mcp_url=MCP_SERVER_URL)
+    steps: list[dict[str, Any]] = list(cred.steps)
+    steps.append({
+        "type": "connect", "role": AGENT_ROLE, "agent": CFG["id"], "agent_label": CFG["label"],
+        "detail": f"{CFG['label']} ({CFG['id']}) opened its own MCP session via Kong (PEP #1) "
+                  f"with its own DPoP-bound token.",
+        "mcp_url": MCP_SERVER_URL, "token_preview": _presented(cred, MCP_SERVER_URL)["authorization"],
+        "presented": _presented(cred, MCP_SERVER_URL)})
+    steps.append({
+        "type": "tool_call", "name": operation, "input": arguments, "role": AGENT_ROLE,
+        "agent": CFG["id"], "agent_label": CFG["label"], "mcp_url": MCP_SERVER_URL,
+        "presented": _presented(cred, MCP_SERVER_URL)})
+
+    # 2) Execute the banking operation through the gateways.
+    try:
+        outcome = await call_tool(cred, operation, arguments)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("MCP call failed: %s", exc)
+        return _rpc_error(rpc_id, -32000, f"{CFG['label']} could not reach the bank: {exc}")
+
+    steps.append({
+        "type": "tool_result", "name": operation, "role": AGENT_ROLE, "agent_label": CFG["label"],
+        "authorized": outcome.get("authorized"), "policy_reason": outcome.get("policy_reason"),
+        "pep": outcome.get("pep"), "pep_action": outcome.get("pep_action"),
+        "bank_response": outcome.get("result"), "result": outcome.get("result")})
+
+    return JSONResponse(status_code=200, content={
+        "jsonrpc": "2.0", "id": rpc_id, "result": {
+            "message": {"role": "agent", "parts": [{"kind": "data", "data": outcome.get("result")}]},
+            "metadata": {"agent": CFG["id"], "agent_label": CFG["label"], "role": AGENT_ROLE,
+                         "authorized": outcome.get("authorized"), "pep": outcome.get("pep"),
+                         "policy_reason": outcome.get("policy_reason"), "steps": steps}}})
+
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", "8100"))
+    host = os.environ.get("HOST", "::")   # IPv6 for Railway private networking
+    logger.info("Starting %s (%s) on %s:%s → MCP %s", CFG["label"], CFG["id"], host, port, MCP_SERVER_URL)
+    uvicorn.run(app, host=host, port=port)

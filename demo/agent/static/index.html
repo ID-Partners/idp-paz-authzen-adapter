@@ -301,9 +301,9 @@ const GN = {
 };
 const GE = [
   ['alice','principal','acts for'],
-  ['principal','as','token exchange ×3','thin'],
-  ['principal','account','delegates token'],
-  ['principal','payments','delegates token'],
+  ['principal','as','token exchange','thin'],
+  ['principal','account','A2A · delegates'],
+  ['principal','payments','A2A · delegates'],
   ['account','pep1','presents token'],
   ['payments','pep1','presents token'],
   ['pep1','mcp','MCP session'],
@@ -409,6 +409,31 @@ function render(steps) {
       out.appendChild(el('step memory',
         `<div class="label">🧠 Memory</div>${esc(s.detail||'')}
          <div class="explain">The agent recalls this session's earlier turns, so it can follow up in context. Identity is still re-established (fresh token, re-authorized) every turn.</div>`));
+    } else if (s.type === 'agent_card') {
+      { const n = agentNode(s.role); if (n) setNode(n,'done'); }
+      const wire = wireDetails('A2A Agent Card', [
+        { label:'Agent Card', desc:'how the concierge discovers this agent and its skills',
+          http:`GET ${s.base_url||''}/.well-known/agent-card.json`, json: s.card || {} },
+      ]);
+      out.appendChild(el('step connect',
+        `<div class="label">🪪 Discovered ${esc(s.agent_label)} · A2A</div>${esc(s.detail||'')}
+         <div class="explain">Each task agent is its own service. The concierge finds it via its <b>A2A Agent Card</b> (skills: ${esc((s.skills||[]).join(', '))}) and will call it over the wire.</div>${wire}`));
+    } else if (s.type === 'a2a_call') {
+      { const n = agentNode(s.role); if (n) setNode(n,'done'); }
+      const wire = wireDetails('wire detail — A2A message/send', [
+        { label:`Concierge → ${s.agent_label}`, desc:'A2A JSON-RPC over HTTPS; the concierge presents its delegated token as the bearer',
+          http:`POST ${s.a2a_url||''}   Authorization: Bearer <concierge delegated token>`,
+          json:{ jsonrpc:'2.0', method:'message/send', params:{ message:{ role:'user',
+                 parts:[{ kind:'data', data:{ operation:s.tool, arguments:s.input } }] } } } },
+      ]);
+      out.appendChild(el('step tool_call',
+        `<div class="label">🤝 A2A → ${esc(s.agent_label)} · ${esc(s.tool)}</div>${esc(s.detail||'')}
+         <div class="explain">This is a real agent-to-agent call over the network — the concierge hands the task to a separate agent service, carrying the delegated token so that agent can extend the actor chain.</div>${wire}`));
+    } else if (s.type === 'a2a_result') {
+      const badge = s.ok ? `<span class="decision allow">✔ returned</span>` : `<span class="decision deny">✘ failed</span>`;
+      out.appendChild(el('step tool_result',
+        `<div class="label">🤝 A2A ← ${esc(s.agent_label)}</div>${badge}
+         <div class="reason">${esc(s.detail||'')}</div>`));
     } else if (s.type === 'attestation') {
       { const n = agentNode(s.role); if (n) setNode(n,'done'); } setNode('attester','done','attests');
       const w = s.workload || {};

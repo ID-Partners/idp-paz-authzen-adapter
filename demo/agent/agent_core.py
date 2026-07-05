@@ -17,28 +17,46 @@ decisions.
 from __future__ import annotations
 
 import asyncio
-import contextlib
-import inspect
 import json
 import logging
 import os
 from typing import Any, AsyncIterator
 
 import anthropic
-from mcp import ClientSession
-from mcp.client.streamable_http import streamablehttp_client
 
-from auth import acquire_agent_fleet
+from a2a_client import a2a_send, fetch_agent_card
+from auth import TASK_AGENTS, acquire_principal_credential
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(name)s %(message)s")
 logger = logging.getLogger("bank-agent")
 
-# The MCP endpoint the agent connects to. In the governed demo this points at
-# the Kong gateway's /mcp route (PEP #1), not the MCP server directly.
-MCP_SERVER_URL = os.environ.get("MCP_SERVER_URL", "http://localhost:8090/mcp")
 ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-5")
 MAX_TURNS = int(os.environ.get("AGENT_MAX_TURNS", "12"))
+
+# The banking capabilities the concierge exposes to the LLM. It does NOT call the
+# bank itself — each capability is fulfilled by delegating over A2A to the task
+# agent whose Agent Card advertises that skill (see TASK_AGENTS / agent_events).
+BANK_TOOLS = [
+    {"name": "list_accounts", "description": "List the customer's accounts and balances.",
+     "input_schema": {"type": "object", "properties": {"customer_id": {"type": "string"}},
+                      "required": ["customer_id"]}},
+    {"name": "get_balance", "description": "Get the balance of one of the customer's accounts.",
+     "input_schema": {"type": "object", "properties": {
+         "customer_id": {"type": "string"}, "account_id": {"type": "string"}},
+                      "required": ["customer_id", "account_id"]}},
+    {"name": "open_account", "description": "Open a new bank account for the customer.",
+     "input_schema": {"type": "object", "properties": {
+         "customer_id": {"type": "string"},
+         "account_type": {"type": "string", "description": "e.g. savings or checking"},
+         "nickname": {"type": "string"}}, "required": ["customer_id", "account_type"]}},
+    {"name": "make_payment", "description": "Move money between the customer's accounts.",
+     "input_schema": {"type": "object", "properties": {
+         "customer_id": {"type": "string"}, "from_account": {"type": "string"},
+         "to_account": {"type": "string"}, "amount": {"type": "number"},
+         "currency": {"type": "string"}, "description": {"type": "string"}},
+                      "required": ["customer_id", "from_account", "to_account", "amount"]}},
+]
 
 # --- conversation memory ------------------------------------------------------
 # Per-session conversation history so the agent remembers earlier turns. This is
@@ -66,9 +84,10 @@ def reset_session(session_id: str) -> None:
     _SESSIONS.pop(session_id, None)
 
 SYSTEM_PROMPT = """\
-You are a helpful banking assistant for Northwind Bank. You act on behalf of an
-authenticated customer and can open accounts and move money using the tools
-provided over MCP.
+You are the Principal Agent (a banking concierge) for Northwind Bank. You act on
+behalf of an authenticated customer and orchestrate specialist task agents (an
+account agent and a payments agent) to open accounts and move money using the
+tools provided.
 
 Rules:
 - The current customer's id is "cust-alice". Always pass customer_id="cust-alice".
@@ -126,150 +145,117 @@ async def agent_events(prompt: str, session_id: str = "demo") -> AsyncIterator[d
     """
     client = _anthropic_client()
 
-    # 1) Provision the agent fleet: the Principal Agent (concierge) delegates to
-    #    the Account Agent and the Payments Agent, each with its own key, DPoP
-    #    binding and nested actor chain. Emit all the identity steps.
-    fleet = acquire_agent_fleet()
-    for step in fleet.steps:
+    # 1) Establish the Principal Agent (concierge)'s own authority: attestation +
+    #    the Alice → concierge token exchange at the AS.
+    principal = acquire_principal_credential()
+    for step in principal.steps:
         yield step
 
-    def _tp(cred) -> str:
-        t = cred.access_token
-        return (t[:28] + "…" + t[-14:]) if len(t) > 44 else t
+    # 2) Discover the task agents over A2A (their Agent Cards). Build a
+    #    skill → task-agent routing table from what each agent advertises.
+    skill_route: dict[str, dict[str, Any]] = {}
+    for cfg in TASK_AGENTS:
+        try:
+            card = await fetch_agent_card(cfg["url"])
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("A2A discovery failed for %s: %s", cfg["label"], exc)
+            yield {"type": "connect_error",
+                   "detail": f"Could not reach {cfg['label']} at {cfg['url']} over A2A: {exc}"}
+            continue
+        skills = [s.get("id") for s in card.get("skills", []) if s.get("id")]
+        a2a_url = card.get("url") or (cfg["url"].rstrip("/") + "/a2a")
+        for sk in skills:
+            skill_route[sk] = {"url": a2a_url, "role": cfg["role"],
+                               "label": cfg["label"], "agent_id": cfg["id"]}
+        yield {"type": "agent_card", "role": cfg["role"], "agent_label": cfg["label"],
+               "agent": cfg["id"], "base_url": cfg["url"], "a2a_url": a2a_url,
+               "skills": skills, "card": card,
+               "detail": f"Discovered {cfg['label']} via its A2A Agent Card at "
+                         f"{cfg['url']}/.well-known/agent-card.json ({len(skills)} skills)."}
 
-    def presented(cred, url: str, method: str = "POST") -> dict[str, Any]:
-        proof = cred._dpop_proof(method, url)
-        return {
-            "scheme": "DPoP", "authorization": f"DPoP {_tp(cred)}",
-            "dpop_proof": (proof[:28] + "…" + proof[-14:]),
-            "jkt": cred.jkt, "sub": cred.principal_sub,
-            "act": cred.agent_sub, "scope": cred.scope,
-        }
-
-    def _auth_kwargs(cred) -> dict[str, Any]:
-        if "auth" in inspect.signature(streamablehttp_client).parameters:
-            return {"auth": cred.httpx_auth()}
-        proof = cred._dpop_proof("POST", MCP_SERVER_URL)
-        return {"headers": {"Authorization": f"DPoP {cred.access_token}", "DPoP": proof}}
-
-    # Each task agent gets its OWN MCP session (its own DPoP-bound delegated
-    # token), so PEP #1/#2 see the acting agent's token. Sessions open on demand.
-    default_role = next(iter(fleet.roles))
-    sessions: dict[str, Any] = {}
+    tools = [t for t in BANK_TOOLS if t["name"] in skill_route]
     agent_texts: list[str] = []
-    tools: list[dict[str, Any]] = []
-    try:
-        async with contextlib.AsyncExitStack() as stack:
-            async def open_role(role: str):
-                cred = fleet.roles[role]
-                read, write, _ = await stack.enter_async_context(
-                    streamablehttp_client(MCP_SERVER_URL, **_auth_kwargs(cred)))
-                sess = await stack.enter_async_context(ClientSession(read, write))
-                await sess.initialize()
-                sessions[role] = sess
-                return cred, sess
-
-            def _connect_step(role: str, cred, discovered: list[str] | None):
-                label = fleet.role_label.get(role, role)
-                detail = (f"{label} ({cred.agent_sub}) opened its MCP session via Kong "
-                          f"(PEP #1) with its own DPoP-bound token.")
-                if discovered:
-                    detail += f" Discovered tools: {', '.join(discovered)}."
-                return {"type": "connect", "detail": detail, "role": role,
-                        "agent": cred.agent_sub, "agent_label": label,
-                        "mcp_url": MCP_SERVER_URL, "token_preview": _tp(cred),
-                        "presented": presented(cred, MCP_SERVER_URL),
-                        "tools": discovered or []}
-
-            # Open the default (account) agent first to discover the tool set.
-            cred0, sess0 = await open_role(default_role)
-            listed = await sess0.list_tools()
-            tools = _mcp_tools_to_anthropic(listed.tools)
-            yield _connect_step(default_role, cred0, [t["name"] for t in tools])
-
-            # Seed from this session's prior turns so the agent has memory.
-            messages: list[dict[str, Any]] = list(_SESSIONS.get(session_id, []))
-            messages.append({"role": "user", "content": prompt})
-            if len(messages) > 1:
-                yield {"type": "memory",
-                       "detail": f"Continuing session '{session_id}' with "
-                                 f"{len(messages) - 1} prior message(s) of context.",
-                       "prior_messages": len(messages) - 1}
-
-            for _turn in range(MAX_TURNS):
-                resp = await asyncio.to_thread(
-                    lambda: client.messages.create(
-                        model=ANTHROPIC_MODEL, max_tokens=1024,
-                        system=SYSTEM_PROMPT, tools=tools, messages=messages))
-
-                assistant_content: list[dict[str, Any]] = []
-                tool_uses = []
-                for block in resp.content:
-                    if block.type == "text":
-                        assistant_content.append({"type": "text", "text": block.text})
-                        if block.text.strip():
-                            agent_texts.append(block.text)
-                            yield {"type": "agent", "text": block.text}
-                    elif block.type == "tool_use":
-                        assistant_content.append({
-                            "type": "tool_use", "id": block.id,
-                            "name": block.name, "input": block.input})
-                        tool_uses.append(block)
-
-                messages.append({"role": "assistant", "content": assistant_content})
-
-                if resp.stop_reason != "tool_use":
-                    break
-
-                tool_results = []
-                for tu in tool_uses:
-                    # Route the call to the task agent that owns this tool. Open
-                    # that agent's own MCP session (PEP #1) the first time.
-                    role = fleet.tool_role.get(tu.name, default_role)
-                    cred = fleet.roles[role]
-                    label = fleet.role_label.get(role, role)
-                    if role not in sessions:
-                        credR, _ = await open_role(role)
-                        yield _connect_step(role, credR, None)
-                    sess = sessions[role]
-                    yield {
-                        "type": "tool_call", "name": tu.name, "input": tu.input,
-                        "role": role, "agent": cred.agent_sub, "agent_label": label,
-                        "mcp_url": MCP_SERVER_URL, "token_preview": _tp(cred),
-                        "presented": presented(cred, MCP_SERVER_URL),
-                    }
-                    result = await sess.call_tool(tu.name, tu.input)
-                    text = _extract_text(result.content)
-                    parsed = _safe_json(text)
-                    yield {
-                        "type": "tool_result", "name": tu.name,
-                        "role": role, "agent_label": label,
-                        "authorized": (parsed or {}).get("authorized"),
-                        "policy_reason": (parsed or {}).get("policy_reason")
-                                         or (parsed or {}).get("message"),
-                        "pep": (parsed or {}).get("pep"),
-                        "pep_action": (parsed or {}).get("pep_action"),
-                        "bank_response": parsed if parsed is not None else text,
-                        "result": parsed if parsed is not None else text,
-                    }
-                    tool_results.append({
-                        "type": "tool_result", "tool_use_id": tu.id, "content": text})
-
-                messages.append({"role": "user", "content": tool_results})
-
-            # Persist the conversation so the next turn has memory.
-            _SESSIONS[session_id] = _trim_history(messages)
-            if len(_SESSIONS) > MAX_SESSIONS:
-                _SESSIONS.pop(next(iter(_SESSIONS)))
-    except Exception as exc:  # noqa: BLE001 - surface a clean gateway denial to the UI
-        detail = _describe_connect_error(exc)
-        logger.warning("MCP connect/session failed: %s", exc)
-        yield {"type": "connect_error", "detail": detail}
+    if not tools:
         yield {"type": "final", "session_id": session_id,
-               "final": "I authenticated and obtained a delegated, DPoP-bound token, but "
-                        "the policy gateway refused the MCP connection, so I couldn't run "
-                        "any banking tools. " + detail}
+               "final": "No task agents were reachable over A2A, so I couldn't act on the "
+                        "bank. The concierge authenticated, but its specialist agents are down."}
         return
+
+    # 3) Seed conversation memory, then run the LLM loop.
+    messages: list[dict[str, Any]] = list(_SESSIONS.get(session_id, []))
+    messages.append({"role": "user", "content": prompt})
+    if len(messages) > 1:
+        yield {"type": "memory",
+               "detail": f"Continuing session '{session_id}' with "
+                         f"{len(messages) - 1} prior message(s) of context.",
+               "prior_messages": len(messages) - 1}
+
+    for _turn in range(MAX_TURNS):
+        resp = await asyncio.to_thread(
+            lambda: client.messages.create(
+                model=ANTHROPIC_MODEL, max_tokens=1024,
+                system=SYSTEM_PROMPT, tools=tools, messages=messages))
+
+        assistant_content: list[dict[str, Any]] = []
+        tool_uses = []
+        for block in resp.content:
+            if block.type == "text":
+                assistant_content.append({"type": "text", "text": block.text})
+                if block.text.strip():
+                    agent_texts.append(block.text)
+                    yield {"type": "agent", "text": block.text}
+            elif block.type == "tool_use":
+                assistant_content.append({"type": "tool_use", "id": block.id,
+                                          "name": block.name, "input": block.input})
+                tool_uses.append(block)
+
+        messages.append({"role": "assistant", "content": assistant_content})
+        if resp.stop_reason != "tool_use":
+            break
+
+        tool_results = []
+        for tu in tool_uses:
+            route = skill_route.get(tu.name)
+            if not route:
+                text = json.dumps({"error": f"no task agent advertises '{tu.name}'"})
+                tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": text})
+                continue
+
+            # The concierge invokes the owning task agent over A2A, presenting its
+            # delegated token as the bearer (the task agent's exchange subject).
+            yield {"type": "a2a_call", "tool": tu.name, "input": tu.input, "role": route["role"],
+                   "agent_label": route["label"], "agent": route["agent_id"], "a2a_url": route["url"],
+                   "detail": f"Concierge → {route['label']} over A2A (message/send): {tu.name}."}
+            try:
+                result = await a2a_send(route["url"], tu.name, tu.input, bearer=principal.token)
+            except Exception as exc:  # noqa: BLE001
+                yield {"type": "a2a_result", "tool": tu.name, "role": route["role"],
+                       "agent_label": route["label"], "ok": False,
+                       "detail": f"{route['label']} A2A call failed: {exc}"}
+                text = json.dumps({"error": str(exc)})
+                tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": text})
+                continue
+
+            md = result.get("metadata", {}) or {}
+            # Surface the task agent's own identity/gateway/tool steps.
+            for st in md.get("steps", []):
+                yield st
+            yield {"type": "a2a_result", "tool": tu.name, "role": route["role"],
+                   "agent_label": route["label"], "ok": True,
+                   "authorized": md.get("authorized"), "pep": md.get("pep"),
+                   "detail": f"{route['label']} completed the task and returned over A2A."}
+
+            parts = (result.get("message", {}) or {}).get("parts", [])
+            bank = next((p.get("data") for p in parts if p.get("kind") == "data"), None)
+            text = json.dumps(bank) if bank is not None else json.dumps(md)
+            tool_results.append({"type": "tool_result", "tool_use_id": tu.id, "content": text})
+
+        messages.append({"role": "user", "content": tool_results})
+
+    # Persist the conversation so the next turn has memory.
+    _SESSIONS[session_id] = _trim_history(messages)
+    if len(_SESSIONS) > MAX_SESSIONS:
+        _SESSIONS.pop(next(iter(_SESSIONS)))
 
     yield {"type": "final", "session_id": session_id,
            "final": "\n\n".join(agent_texts) or "Done."}

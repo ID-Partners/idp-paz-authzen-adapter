@@ -64,11 +64,15 @@ DELEGATION_CHAIN = [PRINCIPAL_AGENT_ID, TASK_AGENT_ID]
 # to the right agent (see tool_role / acquire_agent_fleet).
 ACCOUNT_AGENT_ID = os.environ.get("ACCOUNT_AGENT_ID", "urn:agent:northwind-account:v1")
 PAYMENTS_AGENT_ID = os.environ.get("PAYMENTS_AGENT_ID", "urn:agent:northwind-payments:v1")
+# Task agents now run as their OWN services; the concierge reaches them over A2A.
+ACCOUNT_AGENT_URL = os.environ.get("ACCOUNT_AGENT_URL", "http://localhost:8100")
+PAYMENTS_AGENT_URL = os.environ.get("PAYMENTS_AGENT_URL", "http://localhost:8101")
 TASK_AGENTS = [
     {"role": "account", "id": ACCOUNT_AGENT_ID, "type": "account-opening",
-     "label": "Account Agent", "tools": ["list_accounts", "get_balance", "open_account"]},
+     "label": "Account Agent", "url": ACCOUNT_AGENT_URL,
+     "tools": ["list_accounts", "get_balance", "open_account"]},
     {"role": "payments", "id": PAYMENTS_AGENT_ID, "type": "payments",
-     "label": "Payments Agent", "tools": ["make_payment"]},
+     "label": "Payments Agent", "url": PAYMENTS_AGENT_URL, "tools": ["make_payment"]},
 ]
 
 
@@ -649,3 +653,38 @@ def acquire_agent_fleet() -> AgentFleet:
             tool_role_map[t] = cfg["role"]
 
     return AgentFleet(roles=roles, tool_role=tool_role_map, role_label=role_label, steps=steps)
+
+
+@dataclass
+class PrincipalCredential:
+    """The Principal Agent (concierge)'s own identity: its delegated token (used
+    as the A2A bearer to invoke task agents) plus the transcript steps."""
+    token: str
+    steps: list[dict[str, Any]]
+
+
+def acquire_principal_credential() -> PrincipalCredential:
+    """Establish ONLY the concierge's authority: attestation + the Alice →
+    Principal Agent token exchange at the AS. The concierge presents this token to
+    the task agents over A2A; each task agent then exchanges it for its own."""
+    now = int(time.time())
+    signing_key = _new_key()
+    header = {"alg": "ES256", "typ": "JWT"}
+    entity = _new_key(); entity_jkt = _jkt(entity)
+    key = _new_key(); jkt = _jkt(key); jwk = _pub_jwk(key)
+    att = mint_agent_attestation(
+        client_id=AGENT_CLIENT_ID, agent_id=PRINCIPAL_AGENT_ID, agent_type="orchestrator",
+        principal_sub=PRINCIPAL_SUB, agent_public_jwk=jwk,
+        authorization_details=_authorization_details(), model=AGENT_MODEL,
+        entity_key_thumbprint=entity_jkt)
+    steps = [
+        _attestation_step(att, PRINCIPAL_AGENT_ID, "orchestrator", entity_jkt, jkt, role="principal"),
+        _auth_step(PRINCIPAL_AGENT_ID, entity_jkt, jkt, role="principal"),
+    ]
+    act = _build_act_chain([PRINCIPAL_AGENT_ID])
+    tok, claims = _mint_token(signing_key, header, act, jkt, now)
+    steps.append(_te_step(actor=PRINCIPAL_AGENT_ID, delegator=PRINCIPAL_SUB, hop=1, hops=1,
+                          token=tok, claims=claims, jkt=jkt, jwk=jwk, now=now, role="principal",
+                          title="Alice → Principal Agent (token exchange @ AS)",
+                          subject_desc="<principal access token — Alice>"))
+    return PrincipalCredential(token=tok, steps=steps)
