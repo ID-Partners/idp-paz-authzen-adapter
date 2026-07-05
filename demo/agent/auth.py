@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import logging
 import os
 import time
@@ -91,6 +92,10 @@ AGENT_CLIENT_SECRET = os.environ.get("AGENT_CLIENT_SECRET", "")
 
 # --- token shape ---
 TOKEN_MODE = os.environ.get("TOKEN_MODE", "local").lower()
+# pingfederate mode: the concierge gets a REAL token from PF via the attester svc.
+ATTESTER_URL = os.environ.get("ATTESTER_URL", "http://attester.railway.internal:8110")
+PF_TOKEN_URL = os.environ.get("PF_TOKEN_URL", "")
+PF_CLIENT_SECRET = os.environ.get("PF_CLIENT_SECRET", "demo-secret-123")
 OIDC_ISSUER = os.environ.get("OIDC_ISSUER", "https://pingfederate-production.up.railway.app")
 RS_AUDIENCE = os.environ.get("RS_AUDIENCE", "https://api.northwind.example/bank")
 DEFAULT_SCOPE = os.environ.get(
@@ -663,10 +668,67 @@ class PrincipalCredential:
     steps: list[dict[str, Any]]
 
 
+def _acquire_principal_pf() -> PrincipalCredential:
+    """Get the concierge's REAL token from PingFederate: the attester service signs
+    its attestation, PF (as the concierge's own client) validates it and issues the
+    token (sub=Alice, act=concierge)."""
+    local = _new_key(); local_jkt = _jkt(local); local_jwk = _pub_jwk(local)
+    now = int(time.time())
+    workload = {"software_id": PRINCIPAL_AGENT_ID, "agent_type": "orchestrator",
+                "on_behalf_of": PRINCIPAL_SUB}
+    with httpx.Client(timeout=20.0, verify=False) as c:
+        ar = c.post(ATTESTER_URL.rstrip("/") + "/attest",
+                    json={"client_id": PRINCIPAL_AGENT_ID, "cnf": local_jwk,
+                          "workload": workload, "authorization_details": _authorization_details()})
+        ar.raise_for_status(); att = ar.json()
+        dpop = jwt.encode({"htm": "POST", "htu": PF_TOKEN_URL, "jti": str(uuid.uuid4()), "iat": now},
+                          local, algorithm="ES256", headers={"typ": "dpop+jwt", "jwk": local_jwk})
+        tr = c.post(PF_TOKEN_URL, data={"grant_type": "client_credentials",
+                    "client_id": PRINCIPAL_AGENT_ID, "client_secret": PF_CLIENT_SECRET},
+                    headers={"OAuth-Client-Attestation": att["attestation"], "DPoP": dpop})
+        tr.raise_for_status(); token = tr.json()["access_token"]
+    claims = jwt.decode(token, options={"verify_signature": False})
+    act = claims.get("act")
+    if isinstance(act, str):
+        try: act = json.loads(act)
+        except Exception: act = {"sub": act}  # noqa: BLE001
+    labels = _actor_chain_labels(act) if isinstance(act, dict) else [PRINCIPAL_AGENT_ID]
+    steps = [
+        {"type": "attestation", "title": "Client attestation (signed by the attester service)",
+         "detail": f"Attester '{att.get('attester_issuer')}' signed the concierge's attestation "
+                   f"binding its DPoP key — the private key stays in the attester.",
+         "attester": att.get("attester_issuer"), "client_id": PRINCIPAL_AGENT_ID,
+         "agent": PRINCIPAL_AGENT_ID, "agent_type": "orchestrator", "local_jkt": local_jkt,
+         "auth_method": "attest_jwt_client_auth_dpop", "typ": (att.get("header") or {}).get("typ"),
+         "workload": (att.get("claims") or {}).get("workload"),
+         "attestation_header": att.get("header"), "attestation_claims": att.get("claims"),
+         "attester_jwks": att.get("attester_jwks"), "role": "principal", "mode": "pingfederate"},
+        {"type": "auth", "title": "Principal Agent authenticates to PingFederate",
+         "detail": f"{PRINCIPAL_AGENT_ID} authenticated to PingFederate as its own client via the "
+                   f"attestation (attest_jwt_client_auth_dpop).",
+         "client_id": PRINCIPAL_AGENT_ID, "agent": PRINCIPAL_AGENT_ID, "jkt": local_jkt,
+         "local_jkt": local_jkt, "grant": "client_credentials",
+         "auth_method": "attest_jwt_client_auth_dpop", "role": "principal", "mode": "pingfederate"},
+        {"type": "token_exchange", "title": "PingFederate issued the Principal Agent's token",
+         "detail": f"PingFederate issued a REAL delegated token: sub={claims.get('sub')}, "
+                   f"act = {' ◀ '.join(labels)}.",
+         "sub": claims.get("sub"), "act": act, "act_sub": (act or {}).get("sub") if isinstance(act, dict) else act,
+         "actor_chain": labels, "hop": 1, "hops": 1, "delegator": None,
+         "scope": claims.get("scope"), "cnf_jkt": (claims.get("cnf") or {}).get("jkt"),
+         "aud": claims.get("aud"), "client_id": claims.get("client_id"),
+         "token_preview": token[:20] + "…" + token[-12:], "claims": claims,
+         "token_header": jwt.get_unverified_header(token), "te_endpoint": PF_TOKEN_URL,
+         "role": "principal", "mode": "pingfederate"},
+    ]
+    return PrincipalCredential(token=token, steps=steps)
+
+
 def acquire_principal_credential() -> PrincipalCredential:
     """Establish ONLY the concierge's authority: attestation + the Alice →
     Principal Agent token exchange at the AS. The concierge presents this token to
     the task agents over A2A; each task agent then exchanges it for its own."""
+    if TOKEN_MODE == "pingfederate" and PF_TOKEN_URL:
+        return _acquire_principal_pf()
     now = int(time.time())
     signing_key = _new_key()
     header = {"alg": "ES256", "typ": "JWT"}

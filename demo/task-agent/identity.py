@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import os
 import time
 import uuid
@@ -33,6 +34,13 @@ from attestation import mint_agent_attestation
 
 PRINCIPAL_SUB = os.environ.get("PRINCIPAL_SUB", "cust-alice")
 PRINCIPAL_AGENT_ID = os.environ.get("PRINCIPAL_AGENT_ID", "urn:agent:northwind-concierge:v1")
+# "pingfederate" mode: get a REAL delegated token from PingFederate — the attester
+# service signs the attestation, PF validates it and issues the token. "local"
+# (default) self-issues an equivalently-shaped token.
+TOKEN_MODE = os.environ.get("TOKEN_MODE", "local").lower()
+ATTESTER_URL = os.environ.get("ATTESTER_URL", "http://attester.railway.internal:8110")
+PF_TOKEN_URL = os.environ.get("PF_TOKEN_URL", "")
+PF_CLIENT_SECRET = os.environ.get("PF_CLIENT_SECRET", "demo-secret-123")
 AGENT_CLIENT_ID = os.environ.get("AGENT_CLIENT_ID", "bank-agent")
 AGENT_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-5")
 # The MCP resource this agent calls — the token it mints is audience-scoped to it.
@@ -127,14 +135,87 @@ class DPoPAuth(httpx.Auth):
         yield request
 
 
+def _establish_pf(*, agent_id: str, agent_type: str, agent_label: str, role: str) -> Credential:
+    """Get a REAL delegated token from PingFederate: the attester service signs an
+    attestation binding this agent's DPoP key, then PF (as this agent's own OAuth
+    client) validates it and issues the token (sub=Alice, act=this agent, cnf.jkt)."""
+    now = int(time.time())
+    local = _new_key(); local_jkt = _jkt(local); local_jwk = _pub_jwk(local)
+    workload = {"software_id": agent_id, "agent_type": agent_type,
+                "on_behalf_of": PRINCIPAL_SUB,
+                "environment": os.environ.get("RAILWAY_ENVIRONMENT_NAME", "production")}
+    ad = _authorization_details()
+    with httpx.Client(timeout=20.0, verify=False) as c:
+        # 1) Attester service signs the attestation (its key never leaves it).
+        ar = c.post(ATTESTER_URL.rstrip("/") + "/attest",
+                    json={"client_id": agent_id, "cnf": local_jwk,
+                          "workload": workload, "authorization_details": ad})
+        ar.raise_for_status()
+        att = ar.json()
+        attestation = att["attestation"]
+        # 2) Present the attestation + a DPoP proof to PingFederate's token endpoint.
+        dpop = jwt.encode({"htm": "POST", "htu": PF_TOKEN_URL,
+                           "jti": str(uuid.uuid4()), "iat": now},
+                          local, algorithm="ES256",
+                          headers={"typ": "dpop+jwt", "jwk": local_jwk})
+        tr = c.post(PF_TOKEN_URL,
+                    data={"grant_type": "client_credentials", "client_id": agent_id,
+                          "client_secret": PF_CLIENT_SECRET},
+                    headers={"OAuth-Client-Attestation": attestation, "DPoP": dpop})
+        tr.raise_for_status()
+        token = tr.json()["access_token"]
+
+    claims = jwt.decode(token, options={"verify_signature": False})
+    act = claims.get("act")
+    if isinstance(act, str):
+        try:
+            act = json.loads(act)
+        except Exception:  # noqa: BLE001
+            act = {"sub": act}
+    chain_labels = _actor_chain_labels(act) if isinstance(act, dict) else [agent_id]
+    tp = token[:20] + "…" + token[-12:]
+    steps = [
+        {"type": "attestation", "title": "Client attestation (signed by the attester service)",
+         "detail": f"Attester '{att.get('attester_issuer')}' signed an attestation JWT for "
+                   f"{agent_id}, binding its DPoP key (cnf) — the private key stays in the attester.",
+         "attester": att.get("attester_issuer"), "client_id": agent_id, "agent": agent_id,
+         "agent_type": agent_type, "local_jkt": local_jkt,
+         "auth_method": "attest_jwt_client_auth_dpop", "typ": (att.get("header") or {}).get("typ"),
+         "workload": (att.get("claims") or {}).get("workload"),
+         "attestation_header": att.get("header"), "attestation_claims": att.get("claims"),
+         "attestation_preview": attestation[:24] + "…" + attestation[-12:],
+         "attester_jwks": att.get("attester_jwks"), "role": role, "mode": "pingfederate"},
+        {"type": "auth", "title": "Agent authenticates to PingFederate",
+         "detail": f"{agent_id} authenticated to PingFederate as its own OAuth client using the "
+                   f"attestation (attest_jwt_client_auth_dpop) — no client secret exposed to the model.",
+         "client_id": agent_id, "agent": agent_id, "jkt": local_jkt, "local_jkt": local_jkt,
+         "grant": "client_credentials", "auth_method": "attest_jwt_client_auth_dpop",
+         "role": role, "mode": "pingfederate"},
+        {"type": "token_exchange", "title": f"PingFederate issued {agent_label}'s delegated token",
+         "detail": f"PingFederate validated the attestation and issued a REAL delegated token: "
+                   f"sub={claims.get('sub')}, act = {' ◀ '.join(chain_labels)} — delegation, not impersonation.",
+         "sub": claims.get("sub"), "act": act, "act_sub": (act or {}).get("sub") if isinstance(act, dict) else act,
+         "actor_chain": chain_labels, "hop": 2, "hops": 2, "delegator": PRINCIPAL_AGENT_ID,
+         "scope": claims.get("scope"), "cnf_jkt": (claims.get("cnf") or {}).get("jkt"),
+         "aud": claims.get("aud"), "client_id": claims.get("client_id"),
+         "authorization_details": claims.get("authorization_details"),
+         "token_preview": tp, "claims": claims, "token_header": jwt.get_unverified_header(token),
+         "te_endpoint": PF_TOKEN_URL, "role": role, "agent_label": agent_label, "mode": "pingfederate"},
+    ]
+    return Credential(access_token=token, principal_sub=claims.get("sub", PRINCIPAL_SUB),
+                      agent_sub=agent_id, jkt=local_jkt, _key=local, steps=steps)
+
+
 def establish_identity(*, agent_id: str, agent_type: str, agent_label: str,
                        role: str, mcp_url: str) -> Credential:
     """Mint this task agent's identity + its delegated, DPoP-bound token.
 
-    The token's `act` chain nests this agent over the concierge; its audience is
-    the MCP resource this agent calls. Returns a Credential plus the transcript
-    steps (attestation, authenticate, token exchange) for the UI.
+    In pingfederate mode, get a REAL token from PF via the attester; otherwise
+    self-issue an equivalently-shaped token. Returns a Credential + transcript steps.
     """
+    if TOKEN_MODE == "pingfederate" and PF_TOKEN_URL:
+        return _establish_pf(agent_id=agent_id, agent_type=agent_type,
+                             agent_label=agent_label, role=role)
     now = int(time.time())
     entity = _new_key(); entity_jkt = _jkt(entity)
     local = _new_key(); local_jkt = _jkt(local); local_jwk = _pub_jwk(local)
