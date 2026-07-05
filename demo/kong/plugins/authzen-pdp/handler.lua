@@ -170,6 +170,27 @@ end
 function AuthzenPDP:access(conf)
   local pep = conf.pep_label or "kong-pep"
 
+  -- 0) Step-up: require a logged-in END USER (RFC 9470 step-up challenge). The
+  --    principal (Alice) authenticates at PingFederate; the app forwards her PF
+  --    token down the agent chain as X-User-Token. Without a valid one, the
+  --    gateway pushes back a login challenge so the app sends her to log in.
+  if conf.require_user_login then
+    local ut = kong.request.get_header("x-user-token")
+    local uclaims = ut and jwt_claims(ut) or nil
+    if not uclaims or not uclaims.sub then
+      return kong.response.exit(401, {
+        error = "login_required",
+        pep = pep,
+        reason = "The gateway requires an authenticated user (no valid X-User-Token).",
+        acr_values = "urn:pingidentity:loa:password",
+      }, {
+        ["Content-Type"] = "application/json",
+        ["WWW-Authenticate"] = 'Bearer error="insufficient_user_authentication", '
+          .. 'error_description="Login required", acr_values="urn:pingidentity:loa:password"',
+      })
+    end
+  end
+
   -- 1) token + claims
   local token, scheme = extract_token(kong.request.get_header("authorization"))
   if not token then

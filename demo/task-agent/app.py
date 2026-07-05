@@ -19,7 +19,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from identity import establish_identity
-from mcp_exec import MCP_SERVER_URL, call_tool
+from mcp_exec import MCP_SERVER_URL, LoginRequired, call_tool
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -124,7 +124,11 @@ async def a2a(request: Request):
     # The concierge's delegated token arrives as the A2A bearer credential.
     subj = request.headers.get("authorization", "")
     subj_note = "present" if subj else "absent"
-    logger.info("A2A message/send op=%s (delegation token %s)", operation, subj_note)
+    # The logged-in principal (Alice)'s PF token rides along as X-User-Token; the
+    # gateway requires it and will challenge for a login if it's missing.
+    user_token = request.headers.get("x-user-token") or None
+    logger.info("A2A message/send op=%s (delegation token %s, user token %s)",
+                operation, subj_note, "present" if user_token else "absent")
 
     # 1) This task agent establishes its own identity + delegated token.
     cred = establish_identity(agent_id=CFG["id"], agent_type=CFG["type"],
@@ -143,7 +147,23 @@ async def a2a(request: Request):
 
     # 2) Execute the banking operation through the gateways.
     try:
-        outcome = await call_tool(cred, operation, arguments)
+        outcome = await call_tool(cred, operation, arguments, user_token=user_token)
+    except LoginRequired:
+        # The gateway (PEP #1) required a logged-in user and none was presented.
+        # Relay a login challenge so the app can send Alice to PingFederate.
+        logger.info("Gateway challenged for login (op=%s, no user token)", operation)
+        steps.append({
+            "type": "login_challenge", "role": AGENT_ROLE, "agent_label": CFG["label"],
+            "detail": f"Kong (PEP #1) rejected {CFG['label']}'s call: the gateway policy "
+                      f"requires a signed-in user (RFC 9470 step-up). Challenging for login."})
+        return JSONResponse(status_code=200, content={
+            "jsonrpc": "2.0", "id": rpc_id, "result": {
+                "message": {"role": "agent", "parts": [{"kind": "data",
+                    "data": {"error": "login_required"}}]},
+                "metadata": {"agent": CFG["id"], "agent_label": CFG["label"], "role": AGENT_ROLE,
+                             "steps": steps,
+                             "login_challenge": {"login_url": "/login",
+                                 "detail": "The account gateway requires you to sign in."}}}})
     except Exception as exc:  # noqa: BLE001
         logger.warning("MCP call failed: %s", exc)
         return _rpc_error(rpc_id, -32000, f"{CFG['label']} could not reach the bank: {exc}")

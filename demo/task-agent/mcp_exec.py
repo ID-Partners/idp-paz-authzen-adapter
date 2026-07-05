@@ -15,6 +15,10 @@ from identity import Credential
 MCP_SERVER_URL = os.environ.get("MCP_SERVER_URL", "http://kong.railway.internal:8000/mcp")
 
 
+class LoginRequired(Exception):
+    """The gateway required a logged-in user (401) and none was presented."""
+
+
 def _extract_text(content) -> str:
     if isinstance(content, str):
         return content
@@ -33,27 +37,41 @@ def _safe_json(text: str) -> dict[str, Any] | None:
         return None
 
 
-def _client_kwargs(cred: Credential) -> dict[str, Any]:
-    if "auth" in inspect.signature(streamablehttp_client).parameters:
-        return {"auth": cred.httpx_auth()}
+def _client_kwargs(cred: Credential, user_token: str | None) -> dict[str, Any]:
+    # X-User-Token carries the logged-in principal (Alice)'s PF token; the gateway
+    # requires it (RFC 9470 step-up) and challenges with 401 if it's absent.
+    extra = {"X-User-Token": user_token} if user_token else {}
     proof = cred._dpop_proof("POST", MCP_SERVER_URL)
-    return {"headers": {"Authorization": f"DPoP {cred.access_token}", "DPoP": proof}}
+    headers = {"Authorization": f"DPoP {cred.access_token}", "DPoP": proof, **extra}
+    if "auth" in inspect.signature(streamablehttp_client).parameters:
+        return {"auth": cred.httpx_auth(), "headers": extra or None}
+    return {"headers": headers}
 
 
-async def call_tool(cred: Credential, tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
+async def call_tool(cred: Credential, tool: str, arguments: dict[str, Any],
+                    user_token: str | None = None) -> dict[str, Any]:
     """Open this agent's own MCP session and invoke one tool. Returns
-    {result, authorized, pep, policy_reason, connected}."""
-    async with streamablehttp_client(MCP_SERVER_URL, **_client_kwargs(cred)) as (read, write, _):
-        async with ClientSession(read, write) as session:
-            await session.initialize()
-            await session.list_tools()
-            result = await session.call_tool(tool, arguments)
-            text = _extract_text(result.content)
-            parsed = _safe_json(text)
-            return {
-                "result": parsed if parsed is not None else text,
-                "authorized": (parsed or {}).get("authorized"),
-                "policy_reason": (parsed or {}).get("policy_reason") or (parsed or {}).get("message"),
-                "pep": (parsed or {}).get("pep"),
-                "pep_action": (parsed or {}).get("pep_action"),
-            }
+    {result, authorized, pep, policy_reason, connected}. Raises LoginRequired if
+    the gateway challenges for a logged-in user (401)."""
+    try:
+        async with streamablehttp_client(MCP_SERVER_URL, **_client_kwargs(cred, user_token)) as (read, write, _):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                await session.list_tools()
+                result = await session.call_tool(tool, arguments)
+                text = _extract_text(result.content)
+                parsed = _safe_json(text)
+                return {
+                    "result": parsed if parsed is not None else text,
+                    "authorized": (parsed or {}).get("authorized"),
+                    "policy_reason": (parsed or {}).get("policy_reason") or (parsed or {}).get("message"),
+                    "pep": (parsed or {}).get("pep"),
+                    "pep_action": (parsed or {}).get("pep_action"),
+                }
+    except LoginRequired:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        msg = str(exc)
+        if "401" in msg or "login_required" in msg.lower() or "Unauthorized" in msg:
+            raise LoginRequired(msg) from exc
+        raise

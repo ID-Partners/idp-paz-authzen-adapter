@@ -134,7 +134,8 @@ def _extract_text(content_block) -> str:
     return "\n".join(parts)
 
 
-async def agent_events(prompt: str, session_id: str = "demo") -> AsyncIterator[dict[str, Any]]:
+async def agent_events(prompt: str, session_id: str = "demo",
+                       user_token: str | None = None) -> AsyncIterator[dict[str, Any]]:
     """Run one agent turn, yielding each transcript step AS IT HAPPENS.
 
     Emits identity steps, the gateway connect, the agent's reasoning, each tool
@@ -227,7 +228,8 @@ async def agent_events(prompt: str, session_id: str = "demo") -> AsyncIterator[d
                    "agent_label": route["label"], "agent": route["agent_id"], "a2a_url": route["url"],
                    "detail": f"Concierge → {route['label']} over A2A (message/send): {tu.name}."}
             try:
-                result = await a2a_send(route["url"], tu.name, tu.input, bearer=principal.token)
+                result = await a2a_send(route["url"], tu.name, tu.input,
+                                        bearer=principal.token, user_token=user_token)
             except Exception as exc:  # noqa: BLE001
                 yield {"type": "a2a_result", "tool": tu.name, "role": route["role"],
                        "agent_label": route["label"], "ok": False,
@@ -240,6 +242,19 @@ async def agent_events(prompt: str, session_id: str = "demo") -> AsyncIterator[d
             # Surface the task agent's own identity/gateway/tool steps.
             for st in md.get("steps", []):
                 yield st
+
+            # The gateway required a logged-in user and none was presented — it
+            # pushed back a login challenge (RFC 9470). Relay it so the app can
+            # send Alice to PingFederate to authenticate, then retry.
+            if md.get("login_challenge"):
+                lc = md["login_challenge"]
+                yield {"type": "login_challenge", "role": route["role"],
+                       "agent_label": route["label"], "login_url": lc.get("login_url", "/login"),
+                       "detail": lc.get("detail", "The gateway requires a signed-in user.")}
+                yield {"type": "final", "session_id": session_id,
+                       "final": "🔒 The account gateway requires you to sign in before I can act "
+                                "on your behalf. Redirecting you to the PingFederate login…"}
+                return
             yield {"type": "a2a_result", "tool": tu.name, "role": route["role"],
                    "agent_label": route["label"], "ok": True,
                    "authorized": md.get("authorized"), "pep": md.get("pep"),
@@ -261,12 +276,13 @@ async def agent_events(prompt: str, session_id: str = "demo") -> AsyncIterator[d
            "final": "\n\n".join(agent_texts) or "Done."}
 
 
-async def run_agent(prompt: str, session_id: str = "demo") -> dict[str, Any]:
+async def run_agent(prompt: str, session_id: str = "demo",
+                    user_token: str | None = None) -> dict[str, Any]:
     """Non-streaming wrapper (AgentCore /invocations contract): collect the
     streamed events into a full transcript + final answer."""
     transcript: list[dict[str, Any]] = []
     final = "Done."
-    async for ev in agent_events(prompt, session_id):
+    async for ev in agent_events(prompt, session_id, user_token=user_token):
         if ev.get("type") == "final":
             final = ev.get("final", final)
         else:

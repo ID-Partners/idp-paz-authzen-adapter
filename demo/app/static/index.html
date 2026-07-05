@@ -209,6 +209,11 @@
     <span>Signed in as <b id="waName">Alice</b> <span id="waSub" style="color:var(--muted)"></span></span>
     <button type="button" class="logout" id="logout">Sign out</button>
   </span>
+  <span id="signedout" class="whoami" hidden>
+    <span style="color:var(--muted)">Not signed in</span>
+    <button type="button" class="login-btn" style="width:auto;padding:7px 14px;margin:0"
+            onclick="location.href='/login'">🎫 Sign in with PingFederate</button>
+  </span>
 </header>
 <div class="wrap">
  <div class="layout">
@@ -290,19 +295,25 @@ localStorage.setItem('bankagent_sid', SID);
 // The BFF holds the session in an httponly cookie; the browser sends it
 // automatically (same origin), so app calls need no bearer header. Sign-in is a
 // redirect to PingFederate (button → /login → PF → /callback → back here).
+// The app is NOT gated: Alice can browse and even ask the agent while signed
+// out — the gateway (Kong PEP #1) is what requires a logged-in user and pushes
+// back a login challenge, which redirects her to PingFederate. The header shows
+// either her identity or a "Sign in" button.
 const loginOverlay = document.getElementById('login');
+if(loginOverlay) loginOverlay.style.display = 'none';
 const whoami = document.getElementById('whoami');
+const signedout = document.getElementById('signedout');
 function authHeaders(extra){ return Object.assign({'Content-Type':'application/json'}, extra||{}); }
 function showApp(p){
-  loginOverlay.style.display = 'none';
-  whoami.hidden = false;
+  if(loginOverlay) loginOverlay.style.display = 'none';
+  signedout.hidden = true; whoami.hidden = false;
   const name = (p && p.name) || 'Alice';
   document.getElementById('waName').textContent = name;
   document.getElementById('waSub').textContent = p && p.sub ? '('+p.sub+')' : '';
   document.getElementById('waAvatar').textContent = (name[0]||'A').toUpperCase();
   input.focus();
 }
-function showLogin(){ whoami.hidden = true; loginOverlay.style.display = 'flex'; }
+function showLogin(){ whoami.hidden = true; signedout.hidden = false; }
 async function ensureAuth(){
   try {
     const r = await fetch('/me');
@@ -725,6 +736,11 @@ async function streamRun(prompt, spin){
       if(!dline) continue;
       let ev; try { ev = JSON.parse(dline.slice(5).trim()); } catch(e){ continue; }
       if(!firstSeen){ spin.remove(); firstSeen = true; }
+      if(ev.type === 'login_challenge'){
+        out.appendChild(el('step tool_result convo', `<div class="label">🔒 Gateway login challenge</div><div>${esc(ev.detail||'The account gateway requires a signed-in user.')} Redirecting to PingFederate…</div>`));
+        setTimeout(()=>{ location.href = ev.login_url || '/login'; }, 1800);
+        return;
+      }
       if(ev.type === 'final'){ finalText = ev.final || ''; continue; }
       renderLive(ev);
       await new Promise(r => setTimeout(r, 150));   // small stagger so nodes light in sequence

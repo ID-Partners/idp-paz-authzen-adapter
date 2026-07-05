@@ -22,6 +22,9 @@ return {
           { require_token = { type = "boolean", default = true } },
           -- Enforce the DPoP sender-constraint binding (cnf.jkt) on the token.
           { require_dpop = { type = "boolean", default = false } },
+          -- Require a logged-in end user (X-User-Token). If absent, return a
+          -- 401 login-required challenge (RFC 9470 step-up) so the app logs in.
+          { require_user_login = { type = "boolean", default = false } },
         },
       },
     },

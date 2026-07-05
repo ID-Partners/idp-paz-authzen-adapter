@@ -34,6 +34,9 @@ services:
           style: "mcp"
           require_token: true
           require_dpop: false
+          # Step-up: require a logged-in end user (X-User-Token). If absent, the
+          # gateway challenges (401 login_required) so the app forces a PF login.
+          require_user_login: true
 
   - name: bank-api-svc
     url: __BANK_API_URL__

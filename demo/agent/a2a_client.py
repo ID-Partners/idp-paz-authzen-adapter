@@ -24,9 +24,13 @@ async def fetch_agent_card(base_url: str) -> dict[str, Any]:
 
 
 async def a2a_send(a2a_url: str, operation: str, arguments: dict[str, Any],
-                   bearer: str | None = None) -> dict[str, Any]:
+                   bearer: str | None = None, user_token: str | None = None) -> dict[str, Any]:
     """A2A message/send carrying {operation, arguments}. Returns the JSON-RPC
-    `result` (message + metadata). Raises on transport or JSON-RPC error."""
+    `result` (message + metadata). Raises on transport or JSON-RPC error.
+
+    `user_token` is the logged-in principal's (Alice's) PF access token; it rides
+    along as X-User-Token so the task agent can present it to the gateway, which
+    requires a logged-in user (RFC 9470 step-up)."""
     payload = {
         "jsonrpc": "2.0", "id": str(uuid.uuid4()), "method": "message/send",
         "params": {"message": {"role": "user", "messageId": str(uuid.uuid4()),
@@ -36,6 +40,8 @@ async def a2a_send(a2a_url: str, operation: str, arguments: dict[str, Any],
     headers = {"Content-Type": "application/json"}
     if bearer:
         headers["Authorization"] = f"Bearer {bearer}"
+    if user_token:
+        headers["X-User-Token"] = user_token
     async with httpx.AsyncClient(timeout=60.0) as c:
         r = await c.post(a2a_url, json=payload, headers=headers)
         r.raise_for_status()

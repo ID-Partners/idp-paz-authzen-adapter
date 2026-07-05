@@ -58,8 +58,9 @@ async def invocations(request: Request):
     session_id = payload.get("session_id", "demo")
     if not prompt:
         return JSONResponse(status_code=400, content={"error": "missing 'prompt'"})
+    user_token = request.headers.get("x-user-token") or None
     try:
-        result = await run_agent(prompt, session_id)
+        result = await run_agent(prompt, session_id, user_token=user_token)
     except Exception as exc:  # noqa: BLE001 - surface errors to the demo UI
         return JSONResponse(status_code=500, content={"error": str(exc)})
     return result
@@ -75,10 +76,11 @@ async def stream(request: Request):
     session_id = payload.get("session_id", "demo")
     if not prompt:
         return JSONResponse(status_code=400, content={"error": "missing 'prompt'"})
+    user_token = request.headers.get("x-user-token") or None
 
     async def gen():
         try:
-            async for ev in agent_events(prompt, session_id):
+            async for ev in agent_events(prompt, session_id, user_token=user_token):
                 yield f"data: {_json.dumps(ev)}\n\n"
         except Exception as exc:  # noqa: BLE001
             yield "data: " + _json.dumps({

@@ -165,9 +165,10 @@ def _forward_headers(s: dict) -> dict:
 
 @app.post("/invocations")
 async def invocations(request: Request):
-    s = _session(request)
-    if not s:
-        return JSONResponse(status_code=401, content={"error": "login required"})
+    # Not gated at the app: a logged-out request is allowed through so the GATEWAY
+    # enforces the login (RFC 9470) and challenges. The user token is forwarded
+    # only when Alice has a session.
+    s = _session(request) or {}
     body = await request.body()
     try:
         async with httpx.AsyncClient(timeout=180.0) as c:
@@ -180,9 +181,8 @@ async def invocations(request: Request):
 
 @app.post("/stream")
 async def stream(request: Request):
-    s = _session(request)
-    if not s:
-        return JSONResponse(status_code=401, content={"error": "login required"})
+    # See /invocations: the gateway, not the app, enforces the login challenge.
+    s = _session(request) or {}
     body = await request.body()
 
     async def gen():
