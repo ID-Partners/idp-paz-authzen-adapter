@@ -181,7 +181,14 @@ function AuthzenPDP:access(conf)
   local claims = token and jwt_claims(token) or {}
   claims = claims or {}
   local sub = claims.sub
-  local act = type(claims.act) == "table" and claims.act.sub or nil
+  -- `act` (RFC 8693) may be a nested object (self-issued tokens) OR a JSON string
+  -- (PingFederate's JWT ATM emits object-valued claims as strings) — handle both.
+  local act_claim = claims.act
+  if type(act_claim) == "string" then
+    local ok, decoded = pcall(cjson.decode, act_claim)
+    if ok then act_claim = decoded end
+  end
+  local act = type(act_claim) == "table" and act_claim.sub or nil
   local scope = claims.scope or claims.scp
   if type(scope) == "table" then scope = table.concat(scope, " ") end
   local client_id = claims.client_id or claims.azp
