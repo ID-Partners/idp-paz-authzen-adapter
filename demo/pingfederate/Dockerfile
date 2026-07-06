@@ -1,6 +1,11 @@
 # Staging PF: stock PF 13.0.3 + prod config-archive + license + the REBUILT oidf module (with SD-JWT).
 FROM pingidentity/pingfederate:13.0.3-alpine_3.23.4-al21-latest
 USER root
+# Config restore via PF's native drop-in-deployer: the DataDeployer timer
+# (running inside the JVM with system authority) imports any data.zip dropped
+# here on boot — no admin API, no license-acceptance gate, no admin password.
+# ForceImport/ForceUnsupportedImport are set in the DataDeployer.xml overlay
+# below, and the master-key overlay lets prod's encrypted secrets decrypt.
 COPY --chown=9031:0 data.zip /opt/in/instance/server/default/data/drop-in-deployer/data.zip
 # Overlay prod's master key + system keys BEFORE the deployer runs, so prod's encrypted
 # secrets decrypt natively (running master key == archive key; no re-encryption needed).
@@ -23,3 +28,4 @@ RUN printf '\noidf.mock.attesters=/opt/out/instance/server/default/conf/oidf-moc
 # so a presentation that withholds them (external / unknown profile) is rejected (insufficient_disclosure).
 RUN printf '\noidf.attestation.required.claims=workload\n' >> /opt/staging/instance/bin/run.properties.subst.default
 USER 9031:0
+# Stock entrypoint: the drop-in-deployer imports data.zip during boot.
