@@ -10,13 +10,16 @@ banking operation and (b) record who did it on whose behalf for the audit trail.
 Kong forwards the delegation identity as headers derived from the delegated
 access token's claims:
 
-    X-Auth-Principal : the human principal   (token `sub`,   e.g. cust-alice)
+    X-Auth-Principal : the human principal   (token `sub`,   e.g. alice)
     X-Auth-Agent     : the acting agent      (token `act.sub`)
     X-Auth-Scope     : the granted scope(s)
 
 So the RS can log "Agent <act.sub> acted on behalf of Principal <sub>" without
-re-doing authentication. In a hardened deployment the RS would also independently
-validate the token audience; here it trusts the gateway and records the chain.
+re-doing authentication, and it ENFORCES that the customer_id in each request is
+the authenticated principal (X-Auth-Principal) — the token, not an agent-supplied
+parameter, decides whose accounts are in scope. In a hardened deployment the RS
+would also independently validate the token audience; here it trusts the gateway
+for authentication and records/enforces the chain.
 """
 from __future__ import annotations
 
@@ -42,6 +45,27 @@ def _audit(action: str, principal: str | None, agent: str | None, detail: str) -
                 action, principal or "?", agent or "?", detail)
 
 
+def _forbid_foreign_customer(customer_id: str, principal: str | None) -> JSONResponse | None:
+    """Enforce that the action targets the AUTHENTICATED principal's own data.
+
+    The customer_id an agent supplies must equal the delegated token's `sub`
+    (forwarded by the gateway as X-Auth-Principal). Otherwise an agent acting for
+    one customer could reach another customer's accounts — the token, not the
+    request parameter, decides whose data is in scope. When no principal header is
+    present (e.g. a direct dev call that didn't pass through the gateway) we don't
+    block, so local testing without Kong still works."""
+    if principal and customer_id != principal:
+        logger.warning("DENY foreign customer: principal=%s attempted customer=%s",
+                       principal, customer_id)
+        return JSONResponse(status_code=403, content={
+            "success": False,
+            "error": "forbidden",
+            "message": (f"The authenticated user '{principal}' may not act on behalf "
+                        f"of customer '{customer_id}'."),
+        })
+    return None
+
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
@@ -52,7 +76,7 @@ def admin_reset():
     """Re-seed the in-memory bank to its starting state (fresh balances, only the
     two seeded accounts). Demo convenience — not a real banking operation."""
     store.reset()
-    accts = store.list_accounts("cust-alice")
+    accts = store.list_accounts("alice")
     logger.info("Bank store reset to seed state")
     return {"status": "reset",
             "accounts": [{"id": a.id, "balance": a.balance} for a in accts]}
@@ -62,6 +86,11 @@ def admin_reset():
 def list_accounts(customer_id: str,
                   x_auth_principal: str | None = Header(default=None),
                   x_auth_agent: str | None = Header(default=None)):
+    denied = _forbid_foreign_customer(customer_id, x_auth_principal)
+    if denied is not None:
+        _audit("list_accounts", x_auth_principal, x_auth_agent,
+               f"DENIED foreign customer={customer_id}")
+        return denied
     customer = store.get_customer(customer_id)
     if customer is None:
         return JSONResponse(status_code=404, content={"error": f"Unknown customer {customer_id}"})
@@ -79,6 +108,11 @@ def get_balance(account_id: str,
     acct = store.get_account(account_id)
     if acct is None:
         return JSONResponse(status_code=404, content={"error": f"Account {account_id} not found"})
+    denied = _forbid_foreign_customer(acct.customer_id, x_auth_principal)
+    if denied is not None:
+        _audit("get_balance", x_auth_principal, x_auth_agent,
+               f"DENIED account={account_id} owned by {acct.customer_id}")
+        return denied
     _audit("get_balance", x_auth_principal, x_auth_agent, f"account={account_id}")
     return {"account_id": acct.id, "balance": acct.balance, "currency": acct.currency}
 
@@ -93,6 +127,11 @@ class OpenAccountBody(BaseModel):
 def open_account(body: OpenAccountBody,
                  x_auth_principal: str | None = Header(default=None),
                  x_auth_agent: str | None = Header(default=None)):
+    denied = _forbid_foreign_customer(body.customer_id, x_auth_principal)
+    if denied is not None:
+        _audit("open_account", x_auth_principal, x_auth_agent,
+               f"DENIED foreign customer={body.customer_id}")
+        return denied
     customer = store.get_customer(body.customer_id)
     if customer is None:
         return JSONResponse(status_code=404, content={"error": f"Unknown customer {body.customer_id}"})
@@ -118,6 +157,11 @@ class PaymentBody(BaseModel):
 def make_payment(body: PaymentBody,
                  x_auth_principal: str | None = Header(default=None),
                  x_auth_agent: str | None = Header(default=None)):
+    denied = _forbid_foreign_customer(body.customer_id, x_auth_principal)
+    if denied is not None:
+        _audit("make_payment", x_auth_principal, x_auth_agent,
+               f"DENIED foreign customer={body.customer_id}")
+        return denied
     src = store.get_account(body.from_account)
     if src is None or src.customer_id != body.customer_id:
         return JSONResponse(status_code=404,

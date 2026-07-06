@@ -70,7 +70,7 @@ services:
       AGENT_ID: "urn:agent:northwind-onboarding:v1"
       AGENT_CLIENT_ID: "${AGENT_CLIENT_ID:-bank-agent}"
       AGENT_CLIENT_SECRET: "${AGENT_CLIENT_SECRET:-}"
-      PRINCIPAL_SUB: "cust-alice"
+      PRINCIPAL_SUB: "alice"
       RS_AUDIENCE: "${RS_AUDIENCE:-https://api.northwind.example/bank}"
       # model
       ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY}"

@@ -83,14 +83,16 @@ def _trim_history(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def reset_session(session_id: str) -> None:
     _SESSIONS.pop(session_id, None)
 
-SYSTEM_PROMPT = """\
+SYSTEM_PROMPT_TEMPLATE = """\
 You are the Principal Agent (a banking concierge) for Northwind Bank. You act on
 behalf of an authenticated customer and orchestrate specialist task agents (an
 account agent and a payments agent) to open accounts and move money using the
 tools provided.
 
 Rules:
-- The current customer's id is "cust-alice". Always pass customer_id="cust-alice".
+- The current customer's id is "{customer_id}" (the authenticated user you are
+  acting for). Always pass customer_id="{customer_id}". You may not act for any
+  other customer; the bank rejects a customer_id that isn't the signed-in user.
 - Be concise and explain each step you take to the customer.
 - Every tool enforces the bank's authorization policy (Ping Authorize). If a tool
   returns "authorized": false or a message beginning "POLICY DENIED", do NOT
@@ -100,6 +102,18 @@ Rules:
   the payment into the new account from the customer's existing checking account
   (CHK-1001).
 """
+
+
+def _token_sub(token: str | None) -> str | None:
+    """The `sub` (authenticated principal) of a JWT, without verifying signature —
+    for deriving who the concierge is acting for. Display/routing use only."""
+    if not token:
+        return None
+    try:
+        import jwt  # PyJWT (already a dependency via auth.py)
+        return jwt.decode(token, options={"verify_signature": False}).get("sub")
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _anthropic_client() -> anthropic.Anthropic:
@@ -170,6 +184,13 @@ async def agent_events(prompt: str, session_id: str = "demo",
     for step in principal.steps:
         yield step
 
+    # The customer the concierge acts for IS the authenticated principal — the
+    # `sub` of the delegated token (derived from Alice's login via RFC 8693), not
+    # a hardcoded id. This is the customer_id passed to every bank tool; the Bank
+    # API enforces it equals the authenticated principal (X-Auth-Principal).
+    customer_id = _token_sub(principal.token) or _token_sub(user_token) or "alice"
+    system_prompt = SYSTEM_PROMPT_TEMPLATE.format(customer_id=customer_id)
+
     # 2) Discover the task agents over A2A (their Agent Cards). Build a
     #    skill → task-agent routing table from what each agent advertises.
     skill_route: dict[str, dict[str, Any]] = {}
@@ -213,7 +234,7 @@ async def agent_events(prompt: str, session_id: str = "demo",
         resp = await asyncio.to_thread(
             lambda: client.messages.create(
                 model=ANTHROPIC_MODEL, max_tokens=1024,
-                system=SYSTEM_PROMPT, tools=tools, messages=messages))
+                system=system_prompt, tools=tools, messages=messages))
 
         assistant_content: list[dict[str, Any]] = []
         tool_uses = []

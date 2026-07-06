@@ -32,7 +32,7 @@ from cryptography.hazmat.primitives.asymmetric import ec
 
 from attestation import mint_agent_attestation
 
-PRINCIPAL_SUB = os.environ.get("PRINCIPAL_SUB", "cust-alice")
+PRINCIPAL_SUB = os.environ.get("PRINCIPAL_SUB", "alice")   # the human (== OIDC sub)
 PRINCIPAL_AGENT_ID = os.environ.get("PRINCIPAL_AGENT_ID", "urn:agent:northwind-concierge:v1")
 # "pingfederate" mode: get a REAL delegated token from PingFederate — the attester
 # service signs the attestation, PF validates it and issues the token. "local"

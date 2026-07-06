@@ -69,7 +69,8 @@ authorization mechanics of AI agents** visible:
 
 ## The scenario
 
-Customer **Alice** (`cust-alice`) already has a checking account `CHK-1001`
+Customer **Alice** (`alice` — her OIDC `sub`, which is also her bank customer id)
+already has a checking account `CHK-1001`
 (AUD 5,000). She asks the agent:
 
 > *"Open a new savings account and move \$500 into it from my checking account."*
@@ -154,7 +155,7 @@ Five services in the `idp-agentic-banking-demo` project. Required variables:
 * **Gateway auth**: `curl` the Bank API through Kong with no token → `401`; with
   a delegated token for a permitted op → `200`; the \$9,000 payment → `403`
   carrying the Ping Authorize reason.
-* **Delegation**: decode the issued token — assert `sub == cust-alice` **and**
-  `act.sub == <agent>`, `cnf.jkt` present.
+* **Delegation**: decode the issued token — assert `sub == alice` (the
+  authenticated principal) **and** `act.sub == <agent>`, `cnf.jkt` present.
 * **Full demo**: open the agent URL; \$500 run permits end-to-end, \$9,000 run
   opens the account but the payment is denied at PEP #2.

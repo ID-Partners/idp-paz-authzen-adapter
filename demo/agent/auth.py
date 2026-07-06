@@ -47,7 +47,7 @@ from attestation import mint_agent_attestation
 logger = logging.getLogger("bank-agent.auth")
 
 # --- identities (three distinct parties; see module docstring) ---
-PRINCIPAL_SUB = os.environ.get("PRINCIPAL_SUB", "cust-alice")        # the human
+PRINCIPAL_SUB = os.environ.get("PRINCIPAL_SUB", "alice")             # the human (== OIDC sub)
 AGENT_ID = os.environ.get("AGENT_ID", "urn:agent:northwind-onboarding:v1")  # act.sub
 # The delegation chain: Alice authorises a Principal Agent (concierge), which
 # delegates to a Task Agent that does the actual bank work. Each token-exchange

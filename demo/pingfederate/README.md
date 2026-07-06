@@ -3,7 +3,8 @@
 Real PingFederate 13.0.3 + the `pf-oidf-modules` client-attestation module, acting as the
 **Authorization Server** for the agentic banking demo. It validates each agent's OAuth 2.0
 client attestation (attested + signed by the [attester](../attester) service) and issues a
-**real delegated JWT** — `sub=cust-alice`, a per-agent `act` claim, and a `cnf.jkt`
+**real delegated JWT** — `sub=alice` (the authenticated user, derived from her login
+token via RFC 8693 token exchange), a per-agent `act` claim, and a `cnf.jkt`
 DPoP binding — which the agent then presents at the Kong gateway.
 
 Deployed as the `pingfederate` service in the agentic Railway project (`ac9af096…`), reached
@@ -31,8 +32,9 @@ Each agent authenticates as its **own** OAuth client, so PF stamps its own `act.
 | `urn:agent:northwind-account:v1` | `attestJwtAcct` | `client_credentials\|attestJwtAcct` |
 | `urn:agent:northwind-payments:v1` | `attestJwtPmts` | `client_credentials\|attestJwtPmts` |
 
-Each JWT ATM emits `sub=cust-alice`, the client's own `act` (as a JSON **string** — Kong's
-plugin json-decodes it), and the presented `cnf.jkt`.
+Each JWT ATM emits `sub=alice` (from the exchanged subject token — the authenticated
+user), the client's own `act` (as a JSON **string** — Kong's plugin json-decodes it),
+and the presented `cnf.jkt`.
 
 ## ⚠️ PingFederate on Railway is EPHEMERAL — no volume
 

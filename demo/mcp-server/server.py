@@ -80,7 +80,7 @@ async def list_accounts(customer_id: str, ctx: Context = None) -> dict:
     """List the accounts held by a customer.
 
     Args:
-        customer_id: The bank customer identifier, e.g. "cust-alice".
+        customer_id: The bank customer identifier — the authenticated principal, e.g. "alice".
     """
     token = _incoming_token(ctx, customer_id)
     resp = await rs_client.call("GET", f"/customers/{customer_id}/accounts", token,

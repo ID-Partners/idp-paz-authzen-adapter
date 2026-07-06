@@ -49,7 +49,10 @@ class BankStore:
         self._seed()
 
     def _seed(self) -> None:
-        alice = Customer(id="cust-alice", name="Alice Ferrand",
+        # Customer id == the authenticated OIDC principal (`sub`) so the identity
+        # the user logs in as IS the identity the bank authorizes — see the
+        # X-Auth-Principal enforcement in app.py.
+        alice = Customer(id="alice", name="Alice Ferrand",
                          email="alice@example.com", kyc_verified=True)
         self._customers[alice.id] = alice
         chk = Account(id="CHK-1001", customer_id=alice.id, type="checking",
