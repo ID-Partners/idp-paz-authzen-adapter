@@ -130,9 +130,11 @@ async def a2a(request: Request):
     logger.info("A2A message/send op=%s (delegation token %s, user token %s)",
                 operation, subj_note, "present" if user_token else "absent")
 
-    # 1) This task agent establishes its own identity + delegated token.
+    # 1) This task agent establishes its own identity + delegated token — a real
+    #    RFC 8693 exchange of Alice's login token when she's signed in.
     cred = establish_identity(agent_id=CFG["id"], agent_type=CFG["type"],
-                              agent_label=CFG["label"], role=AGENT_ROLE, mcp_url=MCP_SERVER_URL)
+                              agent_label=CFG["label"], role=AGENT_ROLE, mcp_url=MCP_SERVER_URL,
+                              user_token=user_token)
     steps: list[dict[str, Any]] = list(cred.steps)
     steps.append({
         "type": "connect", "role": AGENT_ROLE, "agent": CFG["id"], "agent_label": CFG["label"],

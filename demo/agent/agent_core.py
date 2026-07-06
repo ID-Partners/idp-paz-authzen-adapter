@@ -164,8 +164,9 @@ async def agent_events(prompt: str, session_id: str = "demo",
         return
 
     # 1) Establish the Principal Agent (concierge)'s own authority: attestation +
-    #    the Alice → concierge token exchange at the AS.
-    principal = acquire_principal_credential()
+    #    a REAL RFC 8693 token exchange at the AS — Alice's login token is the
+    #    subject_token, so the issued token's sub is her authenticated identity.
+    principal = acquire_principal_credential(user_token=user_token)
     for step in principal.steps:
         yield step
 

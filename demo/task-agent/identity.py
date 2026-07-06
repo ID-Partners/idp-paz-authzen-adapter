@@ -139,10 +139,16 @@ class DPoPAuth(httpx.Auth):
         yield request
 
 
-def _establish_pf(*, agent_id: str, agent_type: str, agent_label: str, role: str) -> Credential:
+def _establish_pf(*, agent_id: str, agent_type: str, agent_label: str, role: str,
+                  user_token: str | None = None) -> Credential:
     """Get a REAL delegated token from PingFederate: the attester service signs an
     attestation binding this agent's DPoP key, then PF (as this agent's own OAuth
-    client) validates it and issues the token (sub=Alice, act=this agent, cnf.jkt)."""
+    client) validates it and issues the token.
+
+    With `user_token` (Alice's PF login token), this is a real RFC 8693 TOKEN
+    EXCHANGE: her token is the subject_token, PF validates it and derives the
+    issued token's sub from HER authenticated identity. Without it, fall back to
+    client_credentials (static sub)."""
     now = int(time.time())
     local = _new_key(); local_jkt = _jkt(local); local_jwk = _pub_jwk(local)
     workload = {"software_id": agent_id, "agent_type": agent_type,
@@ -162,9 +168,17 @@ def _establish_pf(*, agent_id: str, agent_type: str, agent_label: str, role: str
                            "jti": str(uuid.uuid4()), "iat": now},
                           local, algorithm="ES256",
                           headers={"typ": "dpop+jwt", "jwk": local_jwk})
-        tr = c.post(PF_TOKEN_URL,
-                    data={"grant_type": "client_credentials", "client_id": agent_id,
-                          "client_secret": PF_CLIENT_SECRET},
+        if user_token:
+            grant = "urn:ietf:params:oauth:grant-type:token-exchange"
+            data = {"grant_type": grant,
+                    "subject_token": user_token,
+                    "subject_token_type": "urn:ietf:params:oauth:token-type:access_token",
+                    "client_id": agent_id, "client_secret": PF_CLIENT_SECRET}
+        else:
+            grant = "client_credentials"
+            data = {"grant_type": grant, "client_id": agent_id,
+                    "client_secret": PF_CLIENT_SECRET}
+        tr = c.post(PF_TOKEN_URL, data=data,
                     headers={"OAuth-Client-Attestation": attestation, "DPoP": dpop})
         tr.raise_for_status()
         token = tr.json()["access_token"]
@@ -193,16 +207,28 @@ def _establish_pf(*, agent_id: str, agent_type: str, agent_label: str, role: str
          "detail": f"{agent_id} authenticated to PingFederate as its own OAuth client using the "
                    f"attestation (attest_jwt_client_auth_dpop) — no client secret exposed to the model.",
          "client_id": agent_id, "agent": agent_id, "jkt": local_jkt, "local_jkt": local_jkt,
-         "grant": "client_credentials", "auth_method": "attest_jwt_client_auth_dpop",
+         "grant": grant, "auth_method": "attest_jwt_client_auth_dpop",
          "role": role, "mode": "pingfederate"},
-        {"type": "token_exchange", "title": f"PingFederate issued {agent_label}'s delegated token",
-         "detail": f"PingFederate validated the attestation and issued a REAL delegated token: "
-                   f"sub={claims.get('sub')}, act = {' ◀ '.join(chain_labels)} — delegation, not impersonation.",
+        {"type": "token_exchange",
+         "title": (f"Token exchange (RFC 8693) @ PingFederate → {agent_label} token"
+                   if user_token else f"PingFederate issued {agent_label}'s delegated token"),
+         "detail": (f"REAL RFC 8693 exchange: {agent_id} presented Alice's login token as the "
+                    f"subject_token; PingFederate VALIDATED it and derived sub={claims.get('sub')} from her "
+                    f"authenticated identity, act = {' ◀ '.join(chain_labels)} — delegation, not impersonation."
+                    if user_token else
+                    f"PingFederate validated the attestation and issued a REAL delegated token: "
+                    f"sub={claims.get('sub')}, act = {' ◀ '.join(chain_labels)} — delegation, not impersonation."),
          "sub": claims.get("sub"), "act": act, "act_sub": (act or {}).get("sub") if isinstance(act, dict) else act,
          "actor_chain": chain_labels, "hop": 2, "hops": 2, "delegator": PRINCIPAL_AGENT_ID,
          "scope": claims.get("scope"), "cnf_jkt": (claims.get("cnf") or {}).get("jkt"),
          "aud": claims.get("aud"), "client_id": claims.get("client_id"),
          "authorization_details": claims.get("authorization_details"),
+         "grant": grant,
+         "subject_token_preview": (user_token[:20] + "…" + user_token[-12:]) if user_token else None,
+         "te_request": ({"grant_type": grant,
+                         "subject_token": "<Alice's PF login token>",
+                         "subject_token_type": "urn:ietf:params:oauth:token-type:access_token",
+                         "client_id": agent_id} if user_token else None),
          "token_preview": tp, "claims": claims, "token_header": jwt.get_unverified_header(token),
          "te_endpoint": PF_TOKEN_URL, "role": role, "agent_label": agent_label, "mode": "pingfederate"},
     ]
@@ -212,15 +238,16 @@ def _establish_pf(*, agent_id: str, agent_type: str, agent_label: str, role: str
 
 
 def establish_identity(*, agent_id: str, agent_type: str, agent_label: str,
-                       role: str, mcp_url: str) -> Credential:
+                       role: str, mcp_url: str, user_token: str | None = None) -> Credential:
     """Mint this task agent's identity + its delegated, DPoP-bound token.
 
-    In pingfederate mode, get a REAL token from PF via the attester; otherwise
-    self-issue an equivalently-shaped token. Returns a Credential + transcript steps.
+    In pingfederate mode, get a REAL token from PF via the attester — an RFC 8693
+    token exchange when Alice's login token is available; otherwise self-issue an
+    equivalently-shaped token. Returns a Credential + transcript steps.
     """
     if TOKEN_MODE == "pingfederate" and PF_TOKEN_URL:
         return _establish_pf(agent_id=agent_id, agent_type=agent_type,
-                             agent_label=agent_label, role=role)
+                             agent_label=agent_label, role=role, user_token=user_token)
     now = int(time.time())
     entity = _new_key(); entity_jkt = _jkt(entity)
     local = _new_key(); local_jkt = _jkt(local); local_jwk = _pub_jwk(local)

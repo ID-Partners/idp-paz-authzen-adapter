@@ -668,10 +668,11 @@ class PrincipalCredential:
     steps: list[dict[str, Any]]
 
 
-def _acquire_principal_pf() -> PrincipalCredential:
+def _acquire_principal_pf(user_token: str | None = None) -> PrincipalCredential:
     """Get the concierge's REAL token from PingFederate: the attester service signs
     its attestation, PF (as the concierge's own client) validates it and issues the
-    token (sub=Alice, act=concierge)."""
+    token. With `user_token` (Alice's login token) this is a real RFC 8693 token
+    exchange — sub is derived from HER authenticated identity."""
     local = _new_key(); local_jkt = _jkt(local); local_jwk = _pub_jwk(local)
     now = int(time.time())
     workload = {"software_id": PRINCIPAL_AGENT_ID, "agent_type": "orchestrator",
@@ -683,8 +684,16 @@ def _acquire_principal_pf() -> PrincipalCredential:
         ar.raise_for_status(); att = ar.json()
         dpop = jwt.encode({"htm": "POST", "htu": PF_TOKEN_URL, "jti": str(uuid.uuid4()), "iat": now},
                           local, algorithm="ES256", headers={"typ": "dpop+jwt", "jwk": local_jwk})
-        tr = c.post(PF_TOKEN_URL, data={"grant_type": "client_credentials",
-                    "client_id": PRINCIPAL_AGENT_ID, "client_secret": PF_CLIENT_SECRET},
+        if user_token:
+            grant = "urn:ietf:params:oauth:grant-type:token-exchange"
+            data = {"grant_type": grant, "subject_token": user_token,
+                    "subject_token_type": "urn:ietf:params:oauth:token-type:access_token",
+                    "client_id": PRINCIPAL_AGENT_ID, "client_secret": PF_CLIENT_SECRET}
+        else:
+            grant = "client_credentials"
+            data = {"grant_type": grant, "client_id": PRINCIPAL_AGENT_ID,
+                    "client_secret": PF_CLIENT_SECRET}
+        tr = c.post(PF_TOKEN_URL, data=data,
                     headers={"OAuth-Client-Attestation": att["attestation"], "DPoP": dpop})
         tr.raise_for_status(); token = tr.json()["access_token"]
     claims = jwt.decode(token, options={"verify_signature": False})
@@ -707,15 +716,26 @@ def _acquire_principal_pf() -> PrincipalCredential:
          "detail": f"{PRINCIPAL_AGENT_ID} authenticated to PingFederate as its own client via the "
                    f"attestation (attest_jwt_client_auth_dpop).",
          "client_id": PRINCIPAL_AGENT_ID, "agent": PRINCIPAL_AGENT_ID, "jkt": local_jkt,
-         "local_jkt": local_jkt, "grant": "client_credentials",
+         "local_jkt": local_jkt, "grant": grant,
          "auth_method": "attest_jwt_client_auth_dpop", "role": "principal", "mode": "pingfederate"},
-        {"type": "token_exchange", "title": "PingFederate issued the Principal Agent's token",
-         "detail": f"PingFederate issued a REAL delegated token: sub={claims.get('sub')}, "
-                   f"act = {' ◀ '.join(labels)}.",
+        {"type": "token_exchange",
+         "title": ("Token exchange (RFC 8693) @ PingFederate → Principal Agent token"
+                   if user_token else "PingFederate issued the Principal Agent's token"),
+         "detail": (f"REAL RFC 8693 exchange: the concierge presented Alice's login token as the "
+                    f"subject_token; PingFederate VALIDATED it and derived sub={claims.get('sub')} from "
+                    f"her authenticated identity, act = {' ◀ '.join(labels)}."
+                    if user_token else
+                    f"PingFederate issued a REAL delegated token: sub={claims.get('sub')}, "
+                    f"act = {' ◀ '.join(labels)}."),
          "sub": claims.get("sub"), "act": act, "act_sub": (act or {}).get("sub") if isinstance(act, dict) else act,
          "actor_chain": labels, "hop": 1, "hops": 1, "delegator": None,
          "scope": claims.get("scope"), "cnf_jkt": (claims.get("cnf") or {}).get("jkt"),
          "aud": claims.get("aud"), "client_id": claims.get("client_id"),
+         "grant": grant,
+         "subject_token_preview": (user_token[:20] + "…" + user_token[-12:]) if user_token else None,
+         "te_request": ({"grant_type": grant, "subject_token": "<Alice's PF login token>",
+                         "subject_token_type": "urn:ietf:params:oauth:token-type:access_token",
+                         "client_id": PRINCIPAL_AGENT_ID} if user_token else None),
          "token_preview": token[:20] + "…" + token[-12:], "claims": claims,
          "token_header": jwt.get_unverified_header(token), "te_endpoint": PF_TOKEN_URL,
          "role": "principal", "mode": "pingfederate"},
@@ -723,12 +743,12 @@ def _acquire_principal_pf() -> PrincipalCredential:
     return PrincipalCredential(token=token, steps=steps)
 
 
-def acquire_principal_credential() -> PrincipalCredential:
+def acquire_principal_credential(user_token: str | None = None) -> PrincipalCredential:
     """Establish ONLY the concierge's authority: attestation + the Alice →
     Principal Agent token exchange at the AS. The concierge presents this token to
     the task agents over A2A; each task agent then exchanges it for its own."""
     if TOKEN_MODE == "pingfederate" and PF_TOKEN_URL:
-        return _acquire_principal_pf()
+        return _acquire_principal_pf(user_token=user_token)
     now = int(time.time())
     signing_key = _new_key()
     header = {"alg": "ES256", "typ": "JWT"}
