@@ -40,6 +40,7 @@ RUN printf '\noidf.attestation.required.claims=workload\n' >> /opt/staging/insta
 # in-handshake hostname check; this JDK flag disables it. The image's entrypoint clears
 # a container-level JAVA_OPTS, so inject it directly into run.sh's arg list (right after
 # PF's own --add-opens line) instead of via ENV.
-RUN sed -i '/add-opens=java.base\/java.lang=ALL-UNNAMED/a JAVA_OPTS="$JAVA_OPTS -Djdk.internal.httpclient.disableHostnameVerification=true"' /opt/staging/instance/bin/run.sh
+RUN sed -i '/add-opens=java.base\/java.lang=ALL-UNNAMED/a JAVA_OPTS="$JAVA_OPTS -Djdk.internal.httpclient.disableHostnameVerification=true"' /opt/server/bin/run.sh \
+    && grep -c disableHostnameVerification /opt/server/bin/run.sh
 USER 9031:0
 # Stock entrypoint: the drop-in-deployer imports data.zip during boot.
