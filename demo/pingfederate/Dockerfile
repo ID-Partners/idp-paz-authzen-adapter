@@ -35,5 +35,10 @@ RUN printf '\noidf.mock.attesters=/opt/out/instance/server/default/conf/oidf-moc
 # Federation-gated disclosure (AS side): this AS declares it REQUIRES the workload attributes disclosed,
 # so a presentation that withholds them (external / unknown profile) is rejected (insufficient_disclosure).
 RUN printf '\noidf.attestation.required.claims=workload\n' >> /opt/staging/instance/bin/run.properties.subst.default
+# The RAR plugin calls PingAuthorize over its self-signed internal TLS (SAN doesn't
+# match *.railway.internal). A trust-all SSLContext doesn't stop the JDK HttpClient's
+# in-handshake hostname check; this JDK flag disables it. run.sh uses $JAVA_OPTS as the
+# base and still appends PF's --add-opens/--add-exports, so nothing is lost.
+ENV JAVA_OPTS="-Djdk.internal.httpclient.disableHostnameVerification=true"
 USER 9031:0
 # Stock entrypoint: the drop-in-deployer imports data.zip during boot.
