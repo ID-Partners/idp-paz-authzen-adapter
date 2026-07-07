@@ -26,6 +26,7 @@ import anthropic
 
 from a2a_client import a2a_send, fetch_agent_card
 from auth import TASK_AGENTS, acquire_principal_credential
+from token_verify import verify_bearer
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -175,6 +176,16 @@ async def agent_events(prompt: str, session_id: str = "demo",
                "final": "🔒 Before I can act on your behalf I have to exchange a token at the "
                         "authorization server, and policy requires you to be signed in first. "
                         "Taking you to the PingFederate login…"}
+        return
+
+    # 0) VERIFY Alice's forwarded PF token before acting on it — signature vs
+    #    PingFederate's JWKS, issuer, expiry — with token_validator. Don't trust; verify.
+    vstep = verify_bearer(user_token, kind="user", presenter="the app (BFF)")
+    yield vstep
+    if not vstep.get("verified"):
+        yield {"type": "final", "session_id": session_id,
+               "final": f"🛑 I couldn't verify your session token ({vstep.get('error')}), so I won't "
+                        f"act on it. Please sign in again."}
         return
 
     # 1) Establish the Principal Agent (concierge)'s own authority: attestation +

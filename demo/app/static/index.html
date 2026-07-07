@@ -609,6 +609,14 @@ function render(steps) {
       out.appendChild(el('step memory',
         `<div class="label">🧠 Memory</div>${esc(s.detail||'')}
          <div class="explain">The agent recalls this session's earlier turns, so it can follow up in context. Identity is still re-established (fresh token, re-authorized) every turn.</div>`));
+    } else if (s.type === 'token_verification') {
+      const badge = s.verified ? `<span class="decision allow">✔ verified</span>`
+                               : `<span class="decision deny">✘ ${esc(s.error||'rejected')}</span>`;
+      const checks = (s.checks||[]).map(c=>`<code>${esc(c)}</code>`).join(' · ');
+      out.appendChild(el('step tool_result',
+        `<div class="label">🔎 Token verification — ${esc(s.kind)} bearer</div>${badge}
+         <div class="reason">${esc(s.detail||'')}</div>
+         <div class="explain">The agent independently validated the ${esc(s.kind)} token presented by ${esc(s.presenter||'')} — ${checks} — with the <b>client-attestation-sdk</b> <code>token_validator</code>, rather than trusting it.${s.sub?` sub=<code>${esc(s.sub)}</code>.`:''}</div>`));
     } else if (s.type === 'agent_card') {
       { const n = agentNode(s.role); if (n) setNode(n,'done'); }
       const wire = wireDetails('A2A Agent Card', [

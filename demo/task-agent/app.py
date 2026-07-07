@@ -20,6 +20,7 @@ from fastapi.responses import JSONResponse
 
 from identity import establish_identity
 from mcp_exec import MCP_SERVER_URL, LoginRequired, call_tool
+from token_verify import verify_bearer
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -130,12 +131,21 @@ async def a2a(request: Request):
     logger.info("A2A message/send op=%s (delegation token %s, user token %s)",
                 operation, subj_note, "present" if user_token else "absent")
 
+    # 0) VERIFY the tokens presented to this agent before acting — the calling
+    #    agent's A2A bearer and Alice's forwarded PF token — with token_validator
+    #    (signature vs PingFederate JWKS, issuer, expiry). Don't trust; verify.
+    _bearer = subj.split(" ", 1)[1] if " " in subj else (subj or None)
+    verify_steps = [
+        verify_bearer(_bearer, kind="agent", presenter="the calling agent (A2A bearer)"),
+        verify_bearer(user_token, kind="user", presenter="the app (Alice's PF token)"),
+    ]
+
     # 1) This task agent establishes its own identity + delegated token — a real
     #    RFC 8693 exchange of Alice's login token when she's signed in.
     cred = establish_identity(agent_id=CFG["id"], agent_type=CFG["type"],
                               agent_label=CFG["label"], role=AGENT_ROLE, mcp_url=MCP_SERVER_URL,
                               user_token=user_token)
-    steps: list[dict[str, Any]] = list(cred.steps)
+    steps: list[dict[str, Any]] = verify_steps + list(cred.steps)
     steps.append({
         "type": "connect", "role": AGENT_ROLE, "agent": CFG["id"], "agent_label": CFG["label"],
         "detail": f"{CFG['label']} ({CFG['id']}) opened its own MCP session via Kong (PEP #1) "
