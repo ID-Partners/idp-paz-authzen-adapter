@@ -1,185 +1,115 @@
 <!DOCTYPE html>
-#*
-Tell the browser not to render this page if it's contained within a frame.
-This is to prevent Clickjacking attack.
-
-Velocity variables (identified by the $ character) are generated
-at runtime by the server.
-
-The following variables are available on this page, but not used by default:
-
-$utils                 - The utility method to display JSON String arrays
-$escape                - The utility class that can be used to escape String variables
-$HttpServletResponse   - The details of HTTP response
-$HttpServletRequest    - The details of HTTP request
-$TrackingId            - The user's session tracking ID
-$TransactionId         - The unique ID for the SSO or SLO transaction.
-$PingFedBaseURL        - The URL containing full hostname and port on which the PingFederate deployment runs on
-$CurrentPingFedBaseURL - The base URL used in the current request. This URL may differ from $PingFedBaseURL when using a virtual host name
-$locale                - The user's country and language
-$templateMessages      - The set of messages that is used to localize messages based on the user's locale
-
-$userKey               - The unique user key based on the persistent grant mapping.
-$userName              - The username based on the persistent grant mapping.
-$client_id             - The ID of the OAuth client used in this transaction
-$clientName            - The name of the OAuth client used in this transaction
-$clientDescription     - The description of the OAuth client used in this transaction
-$clientLogoUrl         - The logo URL of the OAuth client used in this transaction
-$extendedProperties    - The extended properties defined on the OAuth client
-$grantAttributes       - The attributes of the grant that will be created in this transaction
-
-Change text or formatting as needed. Modifying Velocity statements
-is not recommended as it may interfere with expected server behavior.
-
-It is recommended to sanitize the values that are displayed using $escape.escape(), for example $escape.escape($client_id).
-
-*#
-
-$HttpServletResponse.setHeader("X-Frame-Options", "DENY")
-
-<!-- template name: oauth.approval.page.template.html -->
-
-#set( $messageKeyPrefix = "oauth.approval.page.template." )
-
-<html lang="$locale.getLanguage()" dir="ltr">
+##
+## Northwind Bank — custom PingFederate OAuth approval/consent template.
+## Self-contained (inline CSS + native submit buttons) so it works WITHOUT
+## PingFederate's default main.css / pf-general.js — the demo's runtime baseUrl
+## is internal on Railway, so those external assets never load. Preserves the
+## Velocity refs PF fills in: $action (form target, an internal URL — rewritten
+## to the public origin by the inline script), $cSRFToken, $userName, $clientName,
+## $defaultScopeDescription, $scopeDescriptions, $authorizationDetailsDescriptions.
+## The Allow/Deny buttons submit pf.oauth.authz.consent=allow|deny natively.
+##
+<html lang="en">
 <head>
-    <title>$templateMessages.getMessage($messageKeyPrefix, "title")</title>
-    <base href="$CurrentPingFedBaseURL"/>
-    <meta http-equiv="Content-Type" content="text/html; charset=UTF-8" />
-    <meta name="viewport" content="initial-scale=1.0, minimum-scale=1.0, maximum-scale=1.0, user-scalable=no" />
-    <meta http-equiv="x-ua-compatible" content="IE=edge" />
-    <meta http-equiv="Content-Security-Policy" content="default-src 'self' 'nonce-$CSPNonce';" />
-    <link rel="stylesheet" media="all" type="text/css" href="assets/css/main.css" />
-    <script src='assets/scripts/pf-general.js'></script>
-
+    <meta http-equiv="Content-Type" content="text/html; charset=UTF-8"/>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+    <meta http-equiv="Content-Security-Policy"
+          content="default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; script-src 'self' 'nonce-$CSPNonce'"/>
+    <title>Northwind Bank — Approve Request</title>
+    <style>
+        :root {
+            --bg1: #12202e; --bg2: #070a0e; --panel: #0d1117; --border: #24303c;
+            --text: #e6edf3; --muted: #8b98a5; --accent: #3b82f6; --accent2: #2f6fe0;
+            --deny: #24303c; --amount: #7ee787;
+        }
+        * { box-sizing: border-box; }
+        html, body { height: 100%; margin: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            color: var(--text);
+            background: radial-gradient(1200px 600px at 50% -10%, var(--bg1), var(--bg2) 70%);
+            display: flex; align-items: center; justify-content: center; padding: 24px;
+        }
+        .wrap { width: 100%; max-width: 440px; }
+        .card {
+            background: var(--panel); border: 1px solid var(--border); border-radius: 14px;
+            padding: 28px 26px; box-shadow: 0 24px 60px rgba(0,0,0,.5);
+        }
+        .brand { font-size: 22px; font-weight: 700; letter-spacing: -.2px; }
+        .sub { color: var(--muted); font-size: 13px; margin: 5px 0 20px; }
+        .who { font-size: 13px; color: var(--muted); margin-bottom: 16px; }
+        .who b { color: var(--text); }
+        .asks { font-size: 13px; color: var(--muted); margin-bottom: 8px; }
+        .asks b { color: var(--text); }
+        ul.perms { list-style: none; padding: 0; margin: 0 0 6px; }
+        ul.perms li {
+            padding: 10px 12px; margin-bottom: 8px; font-size: 14px;
+            background: #06090d; border: 1px solid var(--border); border-radius: 8px;
+        }
+        ul.perms li.rar { border-color: #2c4a2f; }
+        ul.perms li .k { color: var(--muted); font-size: 11.5px; text-transform: uppercase; letter-spacing: .4px; }
+        ul.perms li .v { margin-top: 3px; }
+        ul.perms li .v .amt { color: var(--amount); font-weight: 700; }
+        .row { display: flex; gap: 10px; margin-top: 20px; }
+        .btn {
+            flex: 1; padding: 12px; font-size: 15px; font-weight: 600; border-radius: 8px;
+            border: 1px solid var(--border); cursor: pointer; transition: background .15s ease;
+        }
+        .allow { color: #fff; background: var(--accent); border-color: var(--accent); }
+        .allow:hover { background: var(--accent2); }
+        .deny { color: var(--text); background: var(--deny); }
+        .deny:hover { background: #2c3a48; }
+        .foot { text-align: center; color: var(--muted); font-size: 11.5px; margin-top: 16px; }
+        .foot b { color: var(--muted); }
+    </style>
 </head>
-
 <body>
+<div class="wrap">
+    <form class="card" method="post" action="$action" id="consentForm">
+        <input type="hidden" name="check-user-approved-scope" value="true"/>
+        <input type="hidden" name="cSRFToken" value="$cSRFToken"/>
 
-<div class="ping-container ping-large">
+        <div class="brand">🏦 Northwind Bank</div>
+        <div class="sub">Authorize this request</div>
 
-    <!--
-    if there is a logo present in the 'company-logo' container,
-    then 'has-logo' class should be added to 'ping-header' container.
-    -->
-    <div class="ping-header">
-        <span class="company-logo"><!-- client company logo here --></span>
-        $templateMessages.getMessage($messageKeyPrefix, "title")
-    </div><!-- .ping-header -->
+        <div class="who">Signed in as <b>$escape.escape($userName)</b></div>
+        <div class="asks"><b>$escape.escape($clientName)</b> is requesting permission to:</div>
 
-    <div class="ping-body-container">
-        <form method="post" action="$action">
-            <input type="hidden" name="check-user-approved-scope" value="true"/>
-            <div class="ping-body">
+        <ul class="perms">
+            <li>
+                <div class="k">Access</div>
+                <div class="v">$escape.escape($templateMessages.getMessage($defaultScopeDescription))</div>
+            </li>
+            #foreach( $scopeEntry in $scopeDescriptions.entrySet() )
+            <li>
+                <div class="k">Scope</div>
+                <div class="v">$escape.escape($scopeEntry.getValue())</div>
+            </li>
+            <input type="hidden" name="scope" value="$escape.escape($scopeEntry.getKey())"/>
+            #end
+            #foreach( $adEntry in $authorizationDetailsDescriptions.entrySet() )
+            <li class="rar">
+                <div class="k">Payment authorization (RFC 9396)</div>
+                <div class="v">$escape.escape($adEntry.getValue())</div>
+            </li>
+            <input type="hidden" name="authorization_details" value="$escape.escape($adEntry.getKey())"/>
+            #end
+        </ul>
 
-                <div class="user-name">
-                    $templateMessages.getMessage($messageKeyPrefix, "info.2") <strong>$escape.escape($userName)</strong>
-                </div>
-
-                <div class="ping-section ping-request">
-                    <div class="section-title">
-                        $templateMessages.getMessage($messageKeyPrefix, "info.1", $templateMessages.getMessage($escape.escape($clientName)))
-                    </div>
-                    <div class="ping-input-container ping-checkbox-container stacked">
-                        <ul class="no-bullets">
-                            <li><label class="disabled"><input type="checkbox" disabled="disabled" checked="checked"> $escape.escape($templateMessages.getMessage($defaultScopeDescription))
-                                <div class="icon"></div></label></li>
-                            #foreach( $scopeEntry in $scopeDescriptions.entrySet() )
-                            <li>
-                                <label>
-                                    <input type="checkbox" name="scope" value="$escape.escape($scopeEntry.getKey())" checked="true" />
-                                    $escape.escape($scopeEntry.getValue())
-                                    <div class="icon"></div></label>
-                            </li>
-                            #end
-                            #foreach( $authorizationDetailEntry in $authorizationDetailsDescriptions.entrySet() )
-                            <li>
-                                <label>
-                                    <input type="checkbox" name="authorization_details" value="$escape.escape($authorizationDetailEntry.getKey())" checked="true" />
-                                    $escape.escape($authorizationDetailEntry.getValue())
-                                    <div class="icon"></div></label>
-                            </li>
-                            #end
-                        </ul>
-                    </div>
-
-
-                </div><!-- .ping-section.ping-label -->
-
-                <div class="ping-section ping-client">
-                    <!-- Icons must be 100px by 100px minimum -->
-                    #if (( $clientLogoUrl ) && ( "$clientLogoUrl" != "" ))
-                    <img src="$escape.escape($clientLogoUrl)"/>
-                    #{else}
-                    <span class="icon-apps"></span>
-                    #end
-                    <dl>
-                        <dt>
-                            $templateMessages.getMessage($messageKeyPrefix, "client") :
-                        </dt>
-                        <dd>
-                            $templateMessages.getMessage($escape.escape($clientName))
-                        </dd>
-
-                        #if (( $clientDescription ) && ( "$clientDescription" != "" ))
-                        <dd>
-                            $templateMessages.getMessage($escape.escape($clientDescription))
-                        </dd>
-                        #end
-                    </dl>
-                </div><!-- .ping-section.ping-warning-icon -->
-                <div class = "input-row">
-                    <div class="ping-buttons">
-                        <input type="hidden" name="cSRFToken" value="$cSRFToken"/>
-                        <input type="hidden" name="pf.oauth.authz.consent"/>
-
-
-                        <a id="allowButton" class="ping-button normal allow" title="$templateMessages.getMessage($messageKeyPrefix, "allow")" >
-                        $templateMessages.getMessage($messageKeyPrefix, "allow")
-                        </a>
-                        <a id="denyButton" class="ping-button blue deny" title="$templateMessages.getMessage($messageKeyPrefix, "dontAllow")">
-                        $templateMessages.getMessage($messageKeyPrefix, "dontAllow")
-                        </a>
-                    </div><!-- .ping-buttons -->
-                </div>
-            </div><!-- .ping-body -->
-        </form>
-        <div class="ping-clr"></div>
-    </div><!-- .ping-body-container -->
-
-    <div class="ping-footer-container">
-        <div class="ping-footer">
-            <div class="ping-credits"></div>
-            <div class="ping-copyright">$templateMessages.getMessage("global.footerMessage")</div>
-        </div> <!-- .ping-footer -->
-    </div> <!-- .ping-footer-container -->
-
-</div><!-- .ping-container -->
-
-<script type="text/javascript" nonce="$CSPNonce">
-
-            registerEventHandler('allowButton', 'click', postAllow);
-            registerEventHandler('denyButton', 'click', postDeny);
-
-            function postAllow() {
-                postResponse('allow');
-            }
-
-            function postDeny() {
-                postResponse('deny');
-            }
-
-            function postResponse(approvalState)
-            {
-                var f = document.forms[0];
-                // PF's $action is built from the runtime baseUrl (internal on Railway),
-                // and a <base> tag resolves relative URLs back to it — so post to the
-                // ABSOLUTE public origin the browser is already on.
-                try { f.action = location.origin + new URL(f.action).pathname; } catch (e) {}
-                f['pf.oauth.authz.consent'].value=approvalState;
-                f.submit();
-            }
-        </script>
-
+        <div class="row">
+            <button type="submit" name="pf.oauth.authz.consent" value="deny" class="btn deny">Don't Allow</button>
+            <button type="submit" name="pf.oauth.authz.consent" value="allow" class="btn allow">Allow</button>
+        </div>
+    </form>
+    <div class="foot">Governed by <b>Ping Authorize</b> · secured by <b>PingFederate</b></div>
+</div>
+<script nonce="$CSPNonce">
+    // $action is built from PF's internal runtime baseUrl on Railway; post to the
+    // public origin the browser is actually on.
+    (function () {
+        var f = document.getElementById('consentForm');
+        try { f.action = location.origin + new URL(f.action).pathname; } catch (e) {}
+    })();
+</script>
 </body>
 </html>
