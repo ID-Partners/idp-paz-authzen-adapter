@@ -37,8 +37,9 @@ RUN printf '\noidf.mock.attesters=/opt/out/instance/server/default/conf/oidf-moc
 RUN printf '\noidf.attestation.required.claims=workload\n' >> /opt/staging/instance/bin/run.properties.subst.default
 # The RAR plugin calls PingAuthorize over its self-signed internal TLS (SAN doesn't
 # match *.railway.internal). A trust-all SSLContext doesn't stop the JDK HttpClient's
-# in-handshake hostname check; this JDK flag disables it. run.sh uses $JAVA_OPTS as the
-# base and still appends PF's --add-opens/--add-exports, so nothing is lost.
-ENV JAVA_OPTS="-Djdk.internal.httpclient.disableHostnameVerification=true"
+# in-handshake hostname check; this JDK flag disables it. The image's entrypoint clears
+# a container-level JAVA_OPTS, so inject it directly into run.sh's arg list (right after
+# PF's own --add-opens line) instead of via ENV.
+RUN sed -i '/add-opens=java.base\/java.lang=ALL-UNNAMED/a JAVA_OPTS="$JAVA_OPTS -Djdk.internal.httpclient.disableHostnameVerification=true"' /opt/staging/instance/bin/run.sh
 USER 9031:0
 # Stock entrypoint: the drop-in-deployer imports data.zip during boot.
