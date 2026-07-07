@@ -854,11 +854,21 @@ async function streamRun(prompt, spin){
       }
       if(ev.type === 'scope_challenge'){
         // A sensitive action needs a scope Alice hasn't approved — step her up at
-        // PingFederate for that scope, then resume the request.
+        // PingFederate for that scope, then resume the request. For a payment we
+        // also carry the specific operation so the app requests it as an RFC 9396
+        // authorization_details (RAR) that Alice consents to at PingFederate.
         sessionStorage.setItem('pending_prompt', prompt);
         setNode('pep2','deny','insufficient_scope');
-        out.appendChild(el('step tool_result convo', `<div class="label">🔐 Step-up required — scope <code>${esc(ev.scope||'')}</code></div><div>${esc(ev.detail||'')} You'll re-authenticate at PingFederate to approve this scope, then the payment continues.</div>`));
-        setTimeout(()=>{ location.href = '/login?stepup=' + encodeURIComponent(ev.scope||'banking:payments:transfer'); }, 2200);
+        out.appendChild(el('step tool_result convo', `<div class="label">🔐 Step-up required — scope <code>${esc(ev.scope||'')}</code></div><div>${esc(ev.detail||'')} You'll re-authenticate at PingFederate and approve this specific payment, then it continues.</div>`));
+        let url = '/login?stepup=' + encodeURIComponent(ev.scope||'banking:payments:transfer');
+        const p = ev.payment;
+        if(p){
+          url += '&amount=' + encodeURIComponent(p.amount)
+               + '&from=' + encodeURIComponent(p.from_account||'')
+               + '&to=' + encodeURIComponent(p.to_account||'')
+               + '&cur=' + encodeURIComponent(p.currency||'AUD');
+        }
+        setTimeout(()=>{ location.href = url; }, 2200);
         return;
       }
       if(ev.type === 'final'){ finalText = ev.final || ''; continue; }

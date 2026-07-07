@@ -301,8 +301,14 @@ async def agent_events(prompt: str, session_id: str = "demo",
             if md.get("scope_challenge"):
                 sc = md["scope_challenge"]
                 scope = sc.get("scope")
+                # Carry the specific operation (amount, accounts) so the app can
+                # turn it into an RFC 9396 authorization_details (RAR) entry Alice
+                # consents to at PingFederate — consent to THIS payment, governed
+                # by Ping Authorize at issuance, not just to a coarse scope.
+                pay = tu.input if tu.name == "make_payment" else None
                 yield {"type": "scope_challenge", "role": route["role"],
                        "agent_label": route["label"], "scope": scope, "pep": sc.get("pep"),
+                       "tool": tu.name, "payment": pay,
                        "detail": sc.get("detail", "A step-up scope is required.")}
                 yield {"type": "final", "session_id": session_id,
                        "final": f"🔒 That transfer needs your approval for the '{scope}' scope. "

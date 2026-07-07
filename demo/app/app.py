@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import os
 import secrets
 import time
@@ -91,13 +92,40 @@ def health():
     return {"status": "ok"}
 
 
+PF_PAR = os.environ.get("PF_PAR_URL", PF_BASE + "/as/par.oauth2")
+RAR_TYPE = os.environ.get("PAYMENT_RAR_TYPE", "payment_initiation")
+
+
+def _payment_rar(request: Request) -> list | None:
+    """Build an RFC 9396 authorization_details entry from the step-up payment
+    params, so Alice consents to THIS specific payment at PingFederate (governed
+    by Ping Authorize at issuance) rather than to a coarse scope."""
+    amount = (request.query_params.get("amount") or "").strip()
+    if not amount:
+        return None
+    try:
+        amt = float(amount)
+    except ValueError:
+        return None
+    return [{
+        "type": RAR_TYPE,
+        "purpose": RAR_TYPE,                       # dot-free marker the PAZ policy reads
+        "amount": amt,
+        "currency": (request.query_params.get("cur") or "AUD").strip(),
+        "debtorAccount": (request.query_params.get("from") or "").strip(),
+        "creditorAccount": (request.query_params.get("to") or "").strip(),
+    }]
+
+
 @app.get("/login")
-def login(request: Request):
+async def login(request: Request):
     """Kick off the OIDC authorization-code + PKCE flow at PingFederate.
 
     By default Alice consents to the everyday scopes. A `?stepup=<scope>` request
     is a step-up: it adds the elevated scope (e.g. banking:payments:transfer) and
     forces re-authentication (prompt=login) — RFC 9470 step-up for a risky action.
+    For a payment, the specific operation is attached as RFC 9396 authorization_details
+    and pushed via PAR (RFC 9126) so Alice consents to THIS payment at the AS.
     """
     verifier = _b64u(secrets.token_bytes(40))
     challenge = _b64u(hashlib.sha256(verifier.encode()).digest())
@@ -110,8 +138,27 @@ def login(request: Request):
               "code_challenge": challenge, "code_challenge_method": "S256",
               "state": state, "nonce": nonce}
     if stepup:
-        params["prompt"] = "login"   # force re-auth to approve the sensitive scope
-    authz = PF_AUTHORIZE + "?" + urllib.parse.urlencode(params)
+        params["prompt"] = "login consent"   # force re-auth AND the consent/approval page
+    rar = _payment_rar(request)
+    if rar:
+        params["authorization_details"] = json.dumps(rar)
+
+    authz = None
+    if rar:
+        # PAR: push the request (incl. authorization_details) to PF, reference it by
+        # request_uri — keeps the RAR payload off the browser URL.
+        try:
+            async with httpx.AsyncClient(timeout=15.0, verify=False) as c:
+                pr = await c.post(PF_PAR, data={**params, "client_secret": OIDC_CLIENT_SECRET})
+                pr.raise_for_status()
+                request_uri = pr.json()["request_uri"]
+            authz = (PF_AUTHORIZE + "?" +
+                     urllib.parse.urlencode({"client_id": OIDC_CLIENT_ID, "request_uri": request_uri}))
+        except Exception:  # noqa: BLE001 - fall back to a plain (non-PAR) request
+            authz = PF_AUTHORIZE + "?" + urllib.parse.urlencode(params)
+    else:
+        authz = PF_AUTHORIZE + "?" + urllib.parse.urlencode(params)
+
     resp = RedirectResponse(authz, status_code=302)
     # Stash the PKCE verifier + state in a short-lived signed cookie.
     resp.set_cookie(TX_COOKIE, _sign({"v": verifier, "state": state, "nonce": nonce}, 600),
