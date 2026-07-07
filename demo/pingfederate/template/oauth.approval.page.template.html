@@ -172,9 +172,10 @@ $HttpServletResponse.setHeader("X-Frame-Options", "DENY")
             function postResponse(approvalState)
             {
                 var f = document.forms[0];
-                // PF's $action is built from the runtime baseUrl (internal on Railway);
-                // post to the same public origin the browser is already on.
-                try { f.action = new URL(f.action, location.href).pathname; } catch (e) {}
+                // PF's $action is built from the runtime baseUrl (internal on Railway),
+                // and a <base> tag resolves relative URLs back to it — so post to the
+                // ABSOLUTE public origin the browser is already on.
+                try { f.action = location.origin + new URL(f.action).pathname; } catch (e) {}
                 f['pf.oauth.authz.consent'].value=approvalState;
                 f.submit();
             }
