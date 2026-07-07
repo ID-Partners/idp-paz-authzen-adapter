@@ -25,6 +25,9 @@ COPY --chown=9031:0 pf.plugins.pf-rar-paz-plugin.jar /opt/in/instance/server/def
 COPY --chown=9031:0 oidf-mock-attesters.json /opt/in/instance/server/default/conf/oidf-mock-attesters.json
 # Northwind-branded HTML Form login page (native submit button, site theme).
 COPY --chown=9031:0 template/html.form.login.template.html /opt/in/instance/server/default/conf/template/html.form.login.template.html
+# OAuth approval/consent page: posts to the same public origin (PF's $action uses
+# the internal runtime baseUrl on Railway). Renders scopes + the payment RAR.
+COPY --chown=9031:0 template/oauth.approval.page.template.html /opt/in/instance/server/default/conf/template/oauth.approval.page.template.html
 RUN sed -i 's/^pf.http.port=-1/pf.http.port=9080/' /opt/staging/instance/bin/run.properties.subst.default
 # Activate the static mock-attester resolver (DEV) — PF loads run.properties entries as sys props.
 # Without this the hook falls back to federation resolution and rejects the demo attester.
