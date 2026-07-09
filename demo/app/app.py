@@ -29,8 +29,8 @@ import urllib.parse
 import httpx
 import jwt  # PyJWT
 from fastapi import FastAPI, Request
-from fastapi.responses import (FileResponse, JSONResponse, RedirectResponse,
-                               StreamingResponse)
+from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,
+                               RedirectResponse, StreamingResponse)
 from fastapi.staticfiles import StaticFiles
 
 app = FastAPI(title="Northwind Web App (BFF)")
@@ -139,8 +139,23 @@ async def login(request: Request):
               "state": state, "nonce": nonce}
     if stepup:
         params["prompt"] = "login consent"   # force re-auth AND the consent/approval page
+    # Assert the authenticated principal so the RAR governance decision is attributed to Alice, not the
+    # OAuth client. PingFederate's AuthorizationDetailProcessor SDK exposes no resource-owner accessor, so
+    # the pf-rar-paz-plugin reads this login_hint as the decision's UserID (the agent stays the 'actor').
+    sess = _session(request)
+    principal_sub = sess.get("sub") if sess else None
+    if principal_sub:
+        params["login_hint"] = principal_sub   # carries on the non-PAR path
     rar = _payment_rar(request)
     if rar:
+        # Fold the authenticated principal into each authorization_details entry. PingFederate does not
+        # surface PAR-pushed request params (login_hint) to the AuthorizationDetailProcessor, but it DOES
+        # hand it the authorization_details — the reliable PAR-surviving channel for the pf-rar-paz-plugin
+        # to attribute the governance decision to Alice as UserID (agent recorded as 'actor'). The plugin
+        # reads '_principal_sub' then strips it, so it never reaches the consent page or the issued token.
+        if principal_sub:
+            for entry in rar:
+                entry["_principal_sub"] = principal_sub
         params["authorization_details"] = json.dumps(rar)
 
     authz = None
@@ -297,9 +312,118 @@ async def reset_bank(request: Request):
         return JSONResponse(status_code=r.status_code, content=r.json())
 
 
+# ── PingOne MFA device enrolment (autonomous demo: bootstrap Bob's approver app) ──
+P1_ENV = os.environ.get("PINGONE_ENV", "")
+P1_AUTH = os.environ.get("PINGONE_AUTH", "https://auth.pingone.asia").rstrip("/")
+P1_API = os.environ.get("PINGONE_API", "https://api.pingone.asia").rstrip("/")
+P1_CLIENT = os.environ.get("PINGONE_CLIENT_ID", "")
+P1_SECRET = os.environ.get("PINGONE_SECRET", "")
+P1_BOB = os.environ.get("PINGONE_BOB_ID", "")
+P1_APP = os.environ.get("PINGONE_NATIVE_APP_ID", "")
+
+
+async def _pingone_pairing_key() -> dict:
+    """Mint a one-time MFA pairing key for Bob via the PingOne Management API."""
+    async with httpx.AsyncClient(timeout=20.0) as c:
+        tr = await c.post(f"{P1_AUTH}/{P1_ENV}/as/token",
+                          data={"grant_type": "client_credentials"}, auth=(P1_CLIENT, P1_SECRET))
+        tok = tr.json().get("access_token")
+        r = await c.post(f"{P1_API}/v1/environments/{P1_ENV}/users/{P1_BOB}/pairingKeys",
+                         headers={"Authorization": f"Bearer {tok}"},
+                         json={"applications": [{"id": P1_APP}]})
+        return r.json()
+
+
+@app.get("/enroll")
+async def enroll():
+    """Branded page that mints + displays a pairing key for Bob's iOS approver app."""
+    if not (P1_ENV and P1_CLIENT and P1_BOB and P1_APP):
+        return HTMLResponse("Enrolment not configured — set PINGONE_ENV / PINGONE_CLIENT_ID / "
+                            "PINGONE_SECRET / PINGONE_BOB_ID / PINGONE_NATIVE_APP_ID.", status_code=503)
+    try:
+        pk = await _pingone_pairing_key()
+    except Exception as exc:  # noqa: BLE001
+        return HTMLResponse(f"Enrolment error: {exc}", status_code=502)
+    code = pk.get("code")
+    if not code:
+        return HTMLResponse(f"Could not mint pairing key: {json.dumps(pk)[:400]}", status_code=502)
+    return HTMLResponse(_ENROLL_HTML.replace("__CODE__", code).replace("__EXP__", pk.get("expiresAt", "")))
+
+
+_ENROLL_HTML = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ID Partners Bank — Enrol device</title><style>
+:root{--bg:#0d1117;--panel:#161b22;--border:#2d333b;--text:#e6edf3;--muted:#9198a1;--accent:#ff6600}
+*{box-sizing:border-box}body{margin:0;min-height:100vh;background:var(--bg);color:var(--text);
+ font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;display:flex;align-items:center;justify-content:center;padding:24px}
+.card{width:100%;max-width:440px;background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:30px 28px}
+.idp-mark{display:inline-flex;align-items:center;gap:.42em;font-weight:800;letter-spacing:.05em;font-size:20px}
+.idp-mark .sq{width:.66em;height:.66em;background:var(--accent);border-radius:2px}
+.idp-mark .pa{color:var(--accent)} .bank{color:var(--muted);font-weight:600;margin-left:4px}
+h1{font-size:19px;margin:22px 0 4px}.sub{color:var(--muted);font-size:13px;margin:0 0 22px}
+.code{font-family:ui-monospace,Menlo,monospace;font-size:30px;font-weight:700;letter-spacing:.12em;
+ text-align:center;background:#06090d;border:1px solid #2c4a2f;border-radius:10px;padding:20px;color:#fff;user-select:all}
+.exp{text-align:center;color:var(--muted);font-size:12.5px;margin:12px 0 0}
+ol{color:var(--muted);font-size:13.5px;line-height:1.6;padding-left:18px;margin:22px 0 4px}
+ol b{color:var(--text)}
+.btn{display:block;width:100%;margin-top:20px;padding:12px;text-align:center;text-decoration:none;
+ background:var(--accent);color:#fff;font-weight:600;border-radius:9px}
+.foot{text-align:center;color:var(--muted);font-size:11px;margin-top:16px}
+</style></head><body><div class="card">
+<div><span class="idp-mark"><span class="sq"></span>ID<span class="pa">PARTNERS</span></span><span class="bank">Bank</span></div>
+<h1>Enrol this device for approvals</h1>
+<p class="sub">Bob's phone pairs once, then approves payments with Face&nbsp;ID.</p>
+<div class="code" id="code">__CODE__</div>
+<p class="exp" id="exp">Pairing key · one-time · expires <span id="cd">soon</span></p>
+<ol>
+ <li>Open the <b>ID Partners Bank Approver</b> app on Bob's iPhone.</li>
+ <li>Tap <b>Pair this device</b> and enter the key above.</li>
+ <li>Approve the test push to confirm.</li>
+</ol>
+<a class="btn" href="/enroll">Generate a new key</a>
+<div class="foot">Secured by PingOne MFA</div>
+</div><script>
+(function(){var exp=new Date("__EXP__").getTime();function t(){var s=Math.max(0,Math.floor((exp-Date.now())/1000));
+document.getElementById('cd').textContent=s>0?('in '+Math.floor(s/60)+'m '+(s%60)+'s'):'— expired, generate a new one';}
+if(!isNaN(exp)){t();setInterval(t,1000);}})();
+</script></body></html>"""
+
+
+# The gateway/PEP product shown in the UI. Default Kong; the agentgateway (solo.io) staging
+# env sets GATEWAY_LABEL=agentgateway so the diagram + transcript name the real gateway.
+GATEWAY_LABEL = os.environ.get("GATEWAY_LABEL", "Kong")
+
+# The bank MCP server whose tools/list carries the COAZ declarations shown in
+# the UI's COAZ popup (fetched live so the popup always matches reality).
+MCP_TOOLS_URL = os.environ.get("MCP_TOOLS_URL",
+                               "http://bank-mcp.railway.internal:8090/mcp")
+
+
+@app.get("/coaz/tools")
+async def coaz_tools():
+    """Live tools/list from the bank MCP server, for the COAZ popup: which
+    tools declare coaz:true and what their x-coaz-mapping says."""
+    payload = {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}
+    headers = {"Content-Type": "application/json",
+               "Accept": "application/json, text/event-stream"}
+    try:
+        async with httpx.AsyncClient(timeout=8) as client:
+            r = await client.post(MCP_TOOLS_URL, json=payload, headers=headers)
+        if r.headers.get("content-type", "").startswith("text/event-stream"):
+            line = next(l for l in r.text.splitlines() if l.startswith("data:"))
+            data = json.loads(line[len("data:"):])
+        else:
+            data = r.json()
+        return JSONResponse({"tools": data.get("result", {}).get("tools", [])})
+    except Exception as exc:  # noqa: BLE001 - popup is informational
+        return JSONResponse({"error": str(exc), "tools": []}, status_code=502)
+
+
 @app.get("/")
 def index():
-    return FileResponse(os.path.join(STATIC_DIR, "index.html"))
+    with open(os.path.join(STATIC_DIR, "index.html"), encoding="utf-8") as fh:
+        html = fh.read()
+    return HTMLResponse(html.replace("__GATEWAY__", GATEWAY_LABEL))
 
 
 if os.path.isdir(STATIC_DIR):

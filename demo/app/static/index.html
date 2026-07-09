@@ -3,11 +3,11 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>Northwind Bank · Agentic identity + Ping Authorize (AuthZEN)</title>
+<title>ID Partners Bank · Agentic identity + Ping Authorize (AuthZEN)</title>
 <style>
   :root {
     --bg:#0d1117; --panel:#161b22; --panel2:#0b0f14; --border:#2d333b; --text:#e6edf3;
-    --muted:#9198a1; --accent:#4493f8; --ok:#3fb950; --deny:#f85149; --tool:#d29922;
+    --muted:#9198a1; --accent:#ff6600; --accent2:#e65c00; --ok:#3fb950; --deny:#f85149; --tool:#d29922;
     --id:#a371f7; --idp:#f778ba; --pep:#e3b341; --pdp:#39c5cf;
   }
   * { box-sizing:border-box; }
@@ -16,17 +16,26 @@
   header { padding:16px 24px; border-bottom:1px solid var(--border); }
   header h1 { font-size:16px; margin:0; font-weight:600; }
   header .tag { font-size:12px; color:var(--muted); }
-  .wrap { max-width:1920px; margin:0 auto; padding:24px; }
-  /* two-column: diagram pinned on the left (grows into spare width on wide
-     screens), chat + detail scroll on the right at a comfortable reading width */
-  .layout { display:flex; gap:32px; align-items:flex-start; }
-  .col-left { flex:1 1 auto; min-width:0; position:sticky; top:16px; align-self:flex-start; }
-  .col-right { flex:0 1 560px; min-width:360px; display:flex; flex-direction:column; }
+  .wrap { max-width:2560px; margin:0 auto; padding:20px 24px; }
+  /* two-column: the (now vertical) diagram sits in a fixed-width lane on the left;
+     the activity log grows to fill all remaining screen width. Drag the divider
+     between them to rebalance. */
+  .layout { display:flex; gap:0; align-items:stretch; }
+  .col-left { flex:0 0 auto; width:var(--diagram-w,500px); min-width:340px; max-width:60vw;
+              position:sticky; top:16px; align-self:flex-start; }
+  .col-divider { flex:0 0 16px; align-self:stretch; cursor:ew-resize; display:flex;
+                 align-items:center; justify-content:center; user-select:none; }
+  .col-divider::before { content:""; width:4px; height:56px; border-radius:3px; background:#3a424c;
+                         transition:background .12s, height .12s; }
+  .col-divider:hover::before, .col-divider.dragging::before { background:var(--accent); height:88px; }
+  .col-right { flex:1 1 auto; min-width:420px; display:flex; flex-direction:column; padding-left:12px; }
   .col-right form#chat { position:sticky; top:0; z-index:3; background:var(--bg);
                          padding:6px 0 10px; }
   @media (max-width:980px){
     .layout { flex-direction:column; gap:12px; }
-    .col-left { position:static; width:100%; }
+    .col-left { position:static; width:100%; max-width:none; }
+    .col-divider { display:none; }
+    .col-right { padding-left:0; }
     .col-right form#chat { position:static; }
   }
   h2.section { font-size:12px; text-transform:uppercase; letter-spacing:.6px; color:var(--muted);
@@ -34,6 +43,34 @@
 
   /* interaction graph */
   .graphwrap { width:100%; overflow-x:auto; margin-bottom:4px; }
+  #gwtoggle { display:inline-flex; margin-left:12px; vertical-align:middle; border:1px solid var(--border);
+              border-radius:7px; overflow:hidden; text-transform:none; letter-spacing:0; }
+  #gwtoggle button { background:var(--panel); color:var(--muted); border:none; padding:3px 11px;
+                     font-size:11px; cursor:pointer; font-family:inherit; }
+  #gwtoggle button + button { border-left:1px solid var(--border); }
+  #gwtoggle button.on { background:var(--accent); color:#1a0f00; font-weight:700; }
+  /* COAZ popup chip + modal internals */
+  #coazbtn { display:inline-flex; align-items:center; gap:5px; margin-left:8px; vertical-align:middle;
+    background:var(--panel); color:var(--muted); border:1px solid var(--border); border-radius:999px;
+    padding:3px 11px; font-size:11.5px; cursor:pointer; }
+  #coazbtn:hover { color:var(--accent); border-color:var(--accent); }
+  .coaz-flow { display:flex; flex-wrap:wrap; gap:6px; align-items:center; margin:10px 0 14px;
+    font-size:12px; color:var(--muted); }
+  .coaz-flow .step { background:rgba(255,255,255,.04); border:1px solid var(--border);
+    border-radius:8px; padding:5px 9px; }
+  .coaz-flow .arr { opacity:.6; }
+  .coaz-tool { border:1px solid var(--border); border-radius:10px; margin:8px 0; overflow:hidden; }
+  .coaz-tool summary { cursor:pointer; padding:8px 12px; display:flex; align-items:center; gap:8px;
+    font-size:13px; list-style:none; }
+  .coaz-tool summary::-webkit-details-marker { display:none; }
+  .coaz-tool .badge { font-size:10px; border-radius:999px; padding:1px 8px; border:1px solid; }
+  .coaz-tool .badge.on { color:#7ce38b; border-color:#2ea04366; background:#2ea04314; }
+  .coaz-tool .badge.off { color:var(--muted); border-color:var(--border); }
+  .coaz-tool pre { margin:0; padding:10px 12px; border-top:1px solid var(--border);
+    background:rgba(0,0,0,.25); font-size:11px; line-height:1.5; overflow:auto; max-height:260px; }
+  .coaz-codes { width:100%; border-collapse:collapse; font-size:12px; margin-top:6px; }
+  .coaz-codes td { border-top:1px solid var(--border); padding:6px 8px; vertical-align:top; }
+  .coaz-codes td.code { font-family:ui-monospace,monospace; color:var(--accent); white-space:nowrap; }
   #graph { width:100%; height:auto; min-width:480px; display:block; }
   .gnode rect { fill:var(--panel); stroke:var(--border); stroke-width:1.5;
                 transition:stroke .35s, filter .35s; }
@@ -41,7 +78,10 @@
   .gnode .gs { fill:var(--muted); font-family:system-ui,sans-serif; font-size:9.5px; }
   .gnode .gic { font-size:15px; }
   .gnode .gflag { font-family:system-ui,sans-serif; font-size:8.5px; font-weight:700; fill:var(--muted); }
-  .gnode.done rect { stroke:var(--accent); filter:drop-shadow(0 0 3px rgba(88,166,255,.45)); }
+  .gnode.done rect { stroke:var(--accent); filter:drop-shadow(0 0 3px rgba(255,102,0,.5)); }
+  .idp-mark { display:inline-flex; align-items:center; gap:.42em; font-weight:800; letter-spacing:.05em; }
+  .idp-mark .idp-sq { width:.66em; height:.66em; background:var(--accent); border-radius:2px; display:inline-block; }
+  .idp-mark .idp-id { color:var(--text); } .idp-mark .idp-pa { color:var(--accent); }
   .gnode.permit rect { stroke:var(--ok); filter:drop-shadow(0 0 3px rgba(63,185,80,.5)); }
   .gnode.deny rect { stroke:var(--deny); filter:drop-shadow(0 0 4px rgba(248,81,73,.5)); }
   .gnode.done .gflag { fill:var(--accent); }
@@ -76,7 +116,22 @@
   .turn-sep { text-align:center; color:var(--muted); font-size:11px; margin:14px 0 4px;
               border-top:1px dashed var(--border); padding-top:8px; }
 
-  .transcript { display:flex; flex-direction:column; gap:10px; }
+  .transcript { display:flex; flex-direction:column; gap:10px; flex:none;
+    height:58vh; min-height:160px; max-height:90vh; overflow-y:auto; overflow-x:hidden;
+    border:1px solid var(--border); border-radius:10px 10px 0 0; border-bottom:none; padding:12px;
+    scroll-behavior:smooth; overscroll-behavior:contain; }
+  .transcript:empty { display:none; }
+  .transcript::-webkit-scrollbar { width:10px; }
+  .transcript::-webkit-scrollbar-thumb { background:#2d333b; border-radius:6px; border:2px solid var(--panel); }
+  .transcript::-webkit-scrollbar-thumb:hover { background:#3a424c; }
+  /* Visible drag handle to resize the activity log. */
+  .resize-handle { height:16px; cursor:ns-resize; display:flex; align-items:center; justify-content:center;
+    border:1px solid var(--border); border-top:none; border-radius:0 0 10px 10px; background:var(--panel);
+    margin-bottom:10px; user-select:none; }
+  .resize-handle::before { content:""; width:46px; height:4px; border-radius:3px; background:#3a424c; transition:background .12s,width .12s; }
+  .resize-handle:hover::before { background:var(--accent); width:60px; }
+  .resize-handle.dragging::before { background:var(--accent); }
+  .transcript:empty + .resize-handle { display:none; }
   .step { border:1px solid var(--border); border-radius:10px; padding:12px 14px; background:var(--panel); }
   .step .label { font-size:11px; text-transform:uppercase; letter-spacing:.5px; color:var(--muted);
                  margin-bottom:6px; display:flex; align-items:center; gap:6px; }
@@ -113,7 +168,7 @@
   .claims .cv.act { color:var(--id); font-weight:600; }
   .claims .cv.jkt { color:var(--pdp); }
   .chips { display:flex; gap:6px; flex-wrap:wrap; }
-  .chip { background:rgba(68,147,248,.14); color:#79c0ff; border-radius:12px; padding:1px 8px; font-size:11px;
+  .chip { background:rgba(255,102,0,.15); color:#ffa366; border-radius:12px; padding:1px 8px; font-size:11px;
           font-family:ui-monospace,Menlo,monospace; }
   .rar { margin:8px 10px 10px; }
   .rar pre { background:var(--panel2); border-radius:6px; padding:8px; font-size:11.5px; margin:4px 0 0; }
@@ -216,7 +271,7 @@
 
 <div id="login" class="login-overlay">
   <div class="login-card">
-    <div class="login-brand">🏦 Northwind Bank</div>
+    <div class="login-brand"><span class="idp-mark"><i class="idp-sq"></i><span class="idp-id">ID</span><span class="idp-pa">PARTNERS</span></span> Bank</div>
     <div class="login-sub">Sign in to your AI account assistant</div>
     <button id="loginbtn" class="login-btn" type="button" onclick="location.href='/login'">
       🎫 Sign in with PingFederate
@@ -228,8 +283,8 @@
 
 <header>
   <div>
-    <h1>🏦 Northwind Bank — AI Account Assistant</h1>
-    <span class="tag">Agent identity · RFC 8693 token exchange · DPoP · Kong PDP enforcement (MCP + API)</span>
+    <h1><span class="idp-mark"><i class="idp-sq"></i><span class="idp-id">ID</span><span class="idp-pa">PARTNERS</span></span> Bank — AI Account Assistant</h1>
+    <span class="tag">Agent identity · RFC 8693 token exchange · DPoP · <span class="gw-name">__GATEWAY__</span> PDP enforcement (MCP + API)</span>
   </div>
   <span id="whoami" class="whoami" hidden>
     <span class="avatar" id="waAvatar">A</span>
@@ -255,13 +310,25 @@
     </div>
   </div>
 </div>
+<div id="coazModal" class="modal-backdrop">
+  <div class="modal" style="width:640px">
+    <div class="modal-head">
+      <h3>🧩 COAZ — MCP tool authorization (OpenID AuthZEN MCP profile)</h3>
+      <button type="button" class="x" id="coazClose">✕ Close</button>
+    </div>
+    <div class="modal-body" id="coazBody">
+      <p class="tok-sub">Loading…</p>
+    </div>
+  </div>
+</div>
 <div class="wrap">
  <div class="layout">
   <div class="col-left">
-  <h2 class="section">How the agents &amp; services interact</h2>
+  <h2 class="section">How the agents &amp; services interact
+    <span id="gwtoggle" title="Swap the gateway — same architecture (AuthZEN adapter + Ping Authorize), either PEP"><button data-gw="Kong">Kong</button><button data-gw="agentgateway">agentgateway</button></span><button id="coazbtn" title="How MCP tool calls are authorized per the OpenID AuthZEN MCP profile">🧩 MCP·COAZ</button></h2>
   <div class="graphwrap">
-    <svg id="graph" viewBox="0 0 960 360" preserveAspectRatio="xMinYMin meet" role="img"
-         aria-label="Interaction graph: Alice delegates to a principal agent, which delegates to a task agent; agents are attested and exchange tokens at the AS, then call the bank through two Kong policy enforcement points backed by Ping Authorize."></svg>
+    <svg id="graph" viewBox="0 0 520 624" preserveAspectRatio="xMinYMin meet" role="img"
+         aria-label="Interaction graph: Alice delegates to a principal agent, which delegates to a task agent; agents are attested and exchange tokens at the AS, then call the bank through two __GATEWAY__ policy enforcement points backed by Ping Authorize."></svg>
   </div>
   <p class="pdp-note">Alice authorises a <b class="c-a">principal agent</b>, which <b class="c-a">delegates</b> to a task agent.
     At <b>every resource boundary</b> the caller does a <b style="color:#e0b25c">token exchange</b> at PingFederate for a
@@ -271,6 +338,8 @@
     <span style="color:#c79a52">The dashed gold leg (MCP&nbsp;→&nbsp;AS) is the intended step — today the MCP forwards the agent's token; a true
     nested exchange there needs RFC&nbsp;8693 token exchange.</span> Nodes light up as a run progresses.</p>
   </div>
+
+  <div class="col-divider" id="cd" title="Drag to resize"></div>
 
   <div class="col-right">
   <div class="examples">
@@ -288,6 +357,7 @@
   </form>
 
   <div id="transcript" class="transcript"></div>
+  <div id="rh" class="resize-handle" title="Drag to resize the activity log"></div>
 
   <details class="legend">
     <summary>Components &amp; standards — what's talking to what</summary>
@@ -299,7 +369,7 @@
               <td>OAuth 2.0 client · <a href="https://www.rfc-editor.org/rfc/rfc8693" target="_blank">RFC 8693</a> · <a href="https://www.rfc-editor.org/rfc/rfc9449" target="_blank">RFC 9449 DPoP</a> · MCP client</td></tr>
           <tr><td class="c1">🎫 PingFederate</td><td class="role">Authorization Server / IdP. Runs the token exchange, issues the delegated DPoP-bound token.</td>
               <td>OAuth 2.0 · <a href="https://www.rfc-editor.org/rfc/rfc8693" target="_blank">Token Exchange</a> · <a href="https://www.rfc-editor.org/rfc/rfc9126" target="_blank">PAR</a> · <a href="https://www.rfc-editor.org/rfc/rfc9068" target="_blank">JWT AT</a></td></tr>
-          <tr><td class="c1">🛡️ Kong (PEP #1/#2)</td><td class="role">API gateway = Policy Enforcement Point. Validates the token/DPoP, calls the PDP, allows or blocks.</td>
+          <tr><td class="c1">🛡️ <span class="gw-name">__GATEWAY__</span> (PEP #1/#2)</td><td class="role">API gateway = Policy Enforcement Point. Validates the token/DPoP, calls the PDP, allows or blocks.</td>
               <td>HTTP · JWT/DPoP validation · <a href="https://openid.github.io/authzen/" target="_blank">AuthZEN</a> eval to the PDP</td></tr>
           <tr><td class="c1">🧰 Bank MCP</td><td class="role">Model Context Protocol server exposing banking tools to the agent; forwards the delegated identity onward.</td>
               <td><a href="https://modelcontextprotocol.io" target="_blank">MCP</a> (JSON-RPC over streamable HTTP)</td></tr>
@@ -331,6 +401,52 @@
 const form = document.getElementById('chat');
 const input = document.getElementById('prompt');
 const out = document.getElementById('transcript');
+// Scroll within the transcript panel (not the page). Only auto-follow when the user is
+// already near the bottom, so scrolling up to read isn't yanked back down.
+let stickBottom = true;
+out.addEventListener('scroll', () => {
+  stickBottom = out.scrollHeight - out.scrollTop - out.clientHeight < 90;
+});
+function autoScroll(){ if (stickBottom) out.scrollTop = out.scrollHeight; }
+// Drag the handle below the transcript to resize the activity-log panel.
+(function(){
+  const h = document.getElementById('rh');
+  if(!h) return;
+  let sy=0, sh=0;
+  h.addEventListener('pointerdown', e => {
+    sy = e.clientY; sh = out.getBoundingClientRect().height;
+    h.classList.add('dragging'); h.setPointerCapture(e.pointerId);
+    document.body.style.userSelect = 'none'; e.preventDefault();
+  });
+  h.addEventListener('pointermove', e => {
+    if(!h.hasPointerCapture(e.pointerId)) return;
+    out.style.height = Math.max(160, Math.min(window.innerHeight*0.9, sh + (e.clientY - sy))) + 'px';
+    autoScroll();
+  });
+  const end = e => { h.classList.remove('dragging'); document.body.style.userSelect='';
+    try { h.releasePointerCapture(e.pointerId); } catch(_){} };
+  h.addEventListener('pointerup', end);
+  h.addEventListener('pointercancel', end);
+})();
+// Drag the vertical divider to resize the diagram lane; the activity log fills the rest.
+(function(){
+  const cd = document.getElementById('cd'), left = document.querySelector('.col-left');
+  if(!cd || !left) return;
+  let sx=0, sw=0;
+  cd.addEventListener('pointerdown', e => {
+    sx = e.clientX; sw = left.getBoundingClientRect().width;
+    cd.classList.add('dragging'); cd.setPointerCapture(e.pointerId);
+    document.body.style.userSelect = 'none'; e.preventDefault();
+  });
+  cd.addEventListener('pointermove', e => {
+    if(!cd.hasPointerCapture(e.pointerId)) return;
+    left.style.width = Math.max(340, Math.min(window.innerWidth*0.6, sw + (e.clientX - sx))) + 'px';
+  });
+  const end = e => { cd.classList.remove('dragging'); document.body.style.userSelect='';
+    try { cd.releasePointerCapture(e.pointerId); } catch(_){} };
+  cd.addEventListener('pointerup', end);
+  cd.addEventListener('pointercancel', end);
+})();
 const sendBtn = form.querySelector('button.send');
 const newConvBtn = document.getElementById('newconv');
 function newSid(){ return 'web-' + Math.random().toString(36).slice(2,10) + Date.now().toString(36); }
@@ -342,7 +458,7 @@ localStorage.setItem('bankagent_sid', SID);
 // automatically (same origin), so app calls need no bearer header. Sign-in is a
 // redirect to PingFederate (button → /login → PF → /callback → back here).
 // The app is NOT gated: Alice can browse and even ask the agent while signed
-// out — the gateway (Kong PEP #1) is what requires a logged-in user and pushes
+// out — the gateway (__GATEWAY__ PEP #1) is what requires a logged-in user and pushes
 // back a login challenge, which redirects her to PingFederate. The header shows
 // either her identity or a "Sign in" button.
 const loginOverlay = document.getElementById('login');
@@ -372,11 +488,28 @@ async function ensureAuth(){
 }
 // After Alice signs in and PingFederate redirects her back, pick up the request
 // that triggered the login challenge and run it — so the agent activity resumes.
+// Surface the RFC 9396 authorization_details Alice consented to. It lives on her session
+// token (the auth-code token from the PingFederate consent), not on the agent's exchanged
+// token — so this is where the RAR becomes visible in the activity log.
+async function showActiveRar(){
+  try {
+    const t = await fetch('/session/token', {credentials:'include'}).then(r => r.ok ? r.json() : null);
+    const rar = t && t.claims && t.claims.authorization_details;
+    if (rar && rar.length){
+      out.appendChild(el('step tool_result convo',
+        `<div class="label">📝 Payment authorization — RFC 9396 (governed by Ping Authorize)</div>
+         <div class="ck" style="font-size:11px;margin:4px 0 6px">Alice approved THIS specific payment at PingFederate; the issued token carries the governed <code>authorization_details</code>.</div>
+         <div class="rar"><pre>${pretty(rar)}</pre></div>`));
+      autoScroll();
+    }
+  } catch(e){}
+}
 function resumePending(){
   const p = sessionStorage.getItem('pending_prompt');
   if(!p) return;
   sessionStorage.removeItem('pending_prompt');
   out.appendChild(el('step agent convo', `<div class="label">✅ Signed in with PingFederate</div>Resuming your request…`));
+  showActiveRar();
   setTimeout(()=>runPrompt(p), 400);
 }
 document.getElementById('logout').addEventListener('click', async ()=>{
@@ -419,6 +552,65 @@ document.getElementById('viewtoken').addEventListener('click', openToken);
 document.getElementById('tokClose').addEventListener('click', closeToken);
 tokenModal.addEventListener('click', (e)=>{ if(e.target===tokenModal) closeToken(); });
 document.addEventListener('keydown', (e)=>{ if(e.key==='Escape') closeToken(); });
+
+// --- COAZ (OpenID AuthZEN MCP profile) popup --------------------------------
+const coazModal = document.getElementById('coazModal');
+const coazBody = document.getElementById('coazBody');
+async function openCoaz(){
+  coazModal.classList.add('open');
+  const gwHow = (gateway === 'Kong')
+    ? 'the Kong <b>authzen-pdp</b> plugin delegates each <code>tools/call</code> to the shared <b>coaz-pep</b> engine over HTTP'
+    : 'agentgateway attaches the <b>coaz-pep</b> engine via its Envoy-compatible <b>extAuthz</b> policy (gRPC)';
+  coazBody.innerHTML = `
+    <p class="tok-sub">The bank's MCP tools are <b>COAZ-compatible</b>: each one declares
+      <code>coaz: true</code> plus an <code>x-coaz-mapping</code> in its <code>tools/list</code>
+      entry, telling the gateway how the tool's <i>arguments</i> and the caller's <i>token claims</i>
+      map to an <a href="https://github.com/openid/authzen/blob/main/profiles/authzen-mcp-profile-1_0.md"
+      target="_blank" rel="noopener">OpenID AuthZEN</a> request. The <span class="gw-name">${esc(gateway)}</span>
+      PEP evaluates <b>every tool call</b> against Ping Authorize — ${gwHow}.</p>
+    <div class="coaz-flow">
+      <span class="step">🛠️ tools/list declares <code>x-coaz-mapping</code></span><span class="arr">→</span>
+      <span class="step">🛡️ PEP #1 intercepts <code>tools/call</code></span><span class="arr">→</span>
+      <span class="step">⚙️ CEL over <code>params</code> + <code>token</code></span><span class="arr">→</span>
+      <span class="step">⚖️ AuthZEN → Ping Authorize</span><span class="arr">→</span>
+      <span class="step">✅ permit / ❌ JSON-RPC error</span>
+    </div>
+    <div class="tok-section">Live declarations (from the bank MCP server's tools/list)</div>
+    <div id="coazTools"><p class="tok-sub">Loading tool declarations…</p></div>
+    <div class="tok-section">Profile error semantics (relayed to the MCP client)</div>
+    <table class="coaz-codes">
+      <tr><td class="code">-32401</td><td>PDP <b>deny</b> — message carries Ping Authorize's
+        <code>context.reason</code> (e.g. the payment limit).</td></tr>
+      <tr><td class="code">-32602</td><td><b>Mapping error</b> — a CEL expression failed
+        (e.g. a required tool argument is missing).</td></tr>
+      <tr><td class="code">-32603</td><td><b>PDP unreachable</b> — the gateway fails closed.</td></tr>
+    </table>
+    <p class="tok-sub" style="margin-top:10px">The mappings emit the <i>same</i> AuthZEN shapes as the
+      API edge (subject = the <b class="c-a">agent</b>, acting <code>on_behalf_of</code> the user), so the
+      same Ping Authorize policies govern both the MCP edge and the Bank API edge.</p>`;
+  try {
+    const r = await fetch('/coaz/tools');
+    const d = await r.json();
+    const tools = d.tools || [];
+    if(!tools.length){ document.getElementById('coazTools').innerHTML =
+      '<p class="tok-sub">Could not load tools/list' + (d.error ? ' — ' + esc(d.error) : '') + '.</p>'; return; }
+    document.getElementById('coazTools').innerHTML = tools.map(t => {
+      const mapping = (t.inputSchema || {})['x-coaz-mapping'];
+      const badge = t.coaz ? '<span class="badge on">coaz: true</span>'
+                           : '<span class="badge off">not declared</span>';
+      const body = mapping ? `<pre>${esc(JSON.stringify(mapping, null, 2))}</pre>` : '';
+      return `<details class="coaz-tool"><summary>🛠️ <b>${esc(t.name)}</b> ${badge}
+        <span style="color:var(--muted);font-size:11px;margin-left:auto">x-coaz-mapping ▾</span></summary>${body}</details>`;
+    }).join('');
+  } catch(e){
+    document.getElementById('coazTools').innerHTML = '<p class="tok-sub">Could not load tools/list.</p>';
+  }
+}
+function closeCoaz(){ coazModal.classList.remove('open'); }
+document.getElementById('coazbtn').addEventListener('click', openCoaz);
+document.getElementById('coazClose').addEventListener('click', closeCoaz);
+coazModal.addEventListener('click', (e)=>{ if(e.target===coazModal) closeCoaz(); });
+document.addEventListener('keydown', (e)=>{ if(e.key==='Escape') closeCoaz(); });
 ensureAuth();
 
 document.querySelectorAll('.examples button').forEach(b => {
@@ -431,7 +623,7 @@ function pretty(o){ return esc(typeof o === 'string' ? o : JSON.stringify(o, nul
 function short(s, n=22){ s=String(s||''); return s.length>n ? s.slice(0,n)+'…' : s; }
 
 // running identity context, captured at token exchange, used to reconstruct
-// the AuthZEN evaluation requests that the Kong PEPs send to the PDP.
+// the AuthZEN evaluation requests that the __GATEWAY__ PEPs send to the PDP.
 const CTX = { sub:null, act:null, scope:null, client_id:null };
 
 function wireDetails(title, blocks){
@@ -465,17 +657,18 @@ function toolToAuthzen(name, input){
 // ---- interaction graph -------------------------------------------------------
 const GW=140, GH=46;
 const GN = {
-  alice:     {x:6,   y:70,  ic:'🧑', t:'Alice',           s:'principal · human'},
-  principal: {x:210, y:70,  ic:'🤖', t:'Principal Agent', s:'concierge'},
-  account:   {x:410, y:8,   ic:'🤖', t:'Account Agent',   s:'open · list · balance'},
-  payments:  {x:410, y:130, ic:'🤖', t:'Payments Agent',  s:'make_payment'},
-  attester:  {x:300, y:250, ic:'📜', t:'Attester',        s:'signs each agent\'s attestation'},
-  as:        {x:598, y:150, ic:'🎫', t:'PingFederate AS', s:'issues audience-scoped tokens'},
-  pep1:      {x:810, y:18,  ic:'🛡️', t:'PEP #1',          s:'Kong · MCP edge'},
-  mcp:       {x:810, y:110, ic:'🧰', t:'MCP',             s:'bank tools · API client'},
-  pep2:      {x:810, y:202, ic:'🛡️', t:'PEP #2',          s:'Kong · API edge'},
-  bankapi:   {x:810, y:294, ic:'🏦', t:'Bank API',        s:'resource server'},
-  pdp:       {x:598, y:294, ic:'⚖️', t:'Ping Authorize',  s:'policy decision point'},
+  alice:     {x:30,  y:12,  ic:'🧑', t:'Alice',           s:'principal · human'},
+  principal: {x:30,  y:112, ic:'🤖', t:'Principal Agent', s:'concierge'},
+  account:   {x:12,  y:214, ic:'🤖', t:'Account Agent',   s:'open · list · balance'},
+  payments:  {x:186, y:214, ic:'🤖', t:'Payments Agent',  s:'make_payment'},
+  attester:  {x:99,  y:320, ic:'📜', t:'Attester',        s:'signs each agent\'s attestation'},
+  as:        {x:30,  y:432, ic:'🎫', t:'PingFederate AS', s:'issues audience-scoped tokens'},
+  pep1:      {x:360, y:214, ic:'🛡️', t:'PEP #1',          s:'__GATEWAY__ · MCP edge'},
+  mcp:       {x:360, y:330, ic:'🧰', t:'MCP',             s:'bank tools · API client'},
+  pep2:      {x:360, y:446, ic:'🛡️', t:'PEP #2',          s:'__GATEWAY__ · API edge'},
+  adapter:   {x:188, y:486, ic:'🔌', t:'AuthZEN adapter',  s:'ext_authz → AuthZEN'},
+  bankapi:   {x:360, y:562, ic:'🏦', t:'Bank API',        s:'resource server'},
+  pdp:       {x:30,  y:562, ic:'⚖️', t:'Ping Authorize',  s:'policy decision point'},
 };
 const GE = [
   ['alice','principal','acts for'],
@@ -493,8 +686,9 @@ const GE = [
   ['mcp','as','exchange · aud API','plan'],
   ['mcp','pep2','present token'],
   ['pep2','bankapi','bank call'],
-  ['pep1','pdp','decision','dash'],
-  ['pep2','pdp','decision','dash'],
+  ['pep1','adapter','AuthZEN','dash'],
+  ['pep2','adapter','AuthZEN','dash'],
+  ['adapter','pdp','evaluate','dash'],
   ['as','pdp','governs issuance','dash'],
 ];
 function gcenter(n){ return [n.x+GW/2, n.y+GH/2]; }
@@ -541,10 +735,25 @@ function setNode(node, state, flag){
   if(state) n.classList.add(state);
   if(flag!==undefined){ const f=n.querySelector('.flag, .gflag'); if(f) f.textContent = flag; }
 }
-function resetPipeline(){ ['alice','principal','account','payments','attester','as','pep1','mcp','pep2','bankapi','pdp'].forEach(n=>setNode(n,'','')); }
+function resetPipeline(){ ['alice','principal','account','payments','attester','as','pep1','mcp','pep2','adapter','bankapi','pdp'].forEach(n=>setNode(n,'','')); }
 // A transcript step's `role` maps directly to a graph node id (principal/account/payments).
 function agentNode(role){ return (role==='principal'||role==='account'||role==='payments') ? role : null; }
-buildGraph();
+
+// ---- gateway toggle (Kong ⇄ agentgateway; same architecture, either PEP) ----
+// The deployed default is injected server-side; the toggle is a presentation aid showing the
+// architecture is gateway-agnostic — the AuthZEN adapter + Ping Authorize are identical either way.
+let gateway = "__GATEWAY__";
+function applyGateway(g){
+  gateway = g;
+  GN.pep1.s = g + ' · MCP edge';
+  GN.pep2.s = g + ' · API edge';
+  GN.adapter.s = (g === 'Kong') ? 'Lua plugin → AuthZEN' : 'ext_authz → AuthZEN';
+  document.querySelectorAll('.gw-name').forEach(e => e.textContent = g);
+  document.querySelectorAll('#gwtoggle button').forEach(b => b.classList.toggle('on', b.dataset.gw === g));
+  buildGraph();
+}
+document.querySelectorAll('#gwtoggle button').forEach(b => b.addEventListener('click', () => applyGateway(b.dataset.gw)));
+applyGateway(gateway);
 
 function scopeChips(scope){
   if(!scope) return '';
@@ -568,8 +777,12 @@ function tokenPanel(s){
   row('scope', scopeChips(c.scope || s.scope));
   if(c.cnf || s.cnf_jkt) row('cnf.jkt', esc((c.cnf && c.cnf.jkt) || s.cnf_jkt) + ' <span style="color:var(--muted)">(DPoP key binding)</span>', 'jkt');
   const rar = s.authorization_details || c.authorization_details;
+  const rarSrc = s.authorization_details_source || c.authorization_details_source;
   let rarHtml = '';
-  if(rar) rarHtml = `<div class="rar"><div class="ck" style="font-size:11px">authorization_details (RAR)</div><pre>${pretty(rar)}</pre></div>`;
+  if(rar && (Array.isArray(rar) ? rar.length : true)){
+    const srcNote = rarSrc ? ` <span style="color:var(--muted)">· ${esc(rarSrc)}</span>` : '';
+    rarHtml = `<div class="rar"><div class="ck" style="font-size:11px">authorization_details (RAR) <span class="std">RFC 9396</span>${srcNote}</div><pre>${pretty(rar)}</pre></div>`;
+  }
   return `<div class="token">
     <div class="thead"><span>DELEGATED ACCESS TOKEN · mode=${esc(s.mode||'')}</span>
       <span class="tprev">${esc(s.token_preview||'')}</span></div>
@@ -721,7 +934,7 @@ function render(steps) {
           json:{ headers:{ Authorization: p.authorization || 'DPoP <token>', DPoP: p.dpop_proof || '<proof>' },
                  body:{ jsonrpc:'2.0', id:0, method:'initialize',
                         params:{ protocolVersion:'2025-11-25', capabilities:{}, clientInfo:{ name:'bank-agent', version:'1' } } } } },
-        { label:'2 · AuthZEN evaluation @ PEP #1', desc:'Kong asks Ping Authorize: may this agent open an MCP session?',
+        { label:'2 · AuthZEN evaluation @ PEP #1', desc:gateway+' → AuthZEN adapter asks Ping Authorize: may this agent open an MCP session?',
           http:'POST /access/v1/evaluation', json: authzenRequest('access_mcp','mcp-service','northwind-bank') },
         { label:'3 · PDP decision', desc:'the session opened, so Ping Authorize returned PERMIT for access_mcp',
           json:{ decision:true } },
@@ -729,7 +942,7 @@ function render(steps) {
       out.appendChild(el('step connect',
         `<div class="label">③ Gateway connect · PEP #1 (MCP edge)${s.agent_label ? ' · ' + esc(s.agent_label) : ''}</div>${esc(s.detail)}
          ${presentedChip(p)}
-         <div class="explain">Kong authenticated the real DPoP-bound token and asked the PDP to permit MCP access before the session opened.</div>${wire}`));
+         <div class="explain">${gateway} authenticated the real DPoP-bound token and (via the AuthZEN adapter) asked the PDP to permit MCP access before the session opened.</div>${wire}`));
     } else if (s.type === 'connect_error') {
       setNode('pep1','deny','deny'); setNode('pdp','deny','DENY');
       out.appendChild(el('step tool_result',
@@ -744,17 +957,25 @@ function render(steps) {
       { const n = agentNode(s.role); if (n) setNode(n,'done'); }
       const byAgent = s.agent_label ? ` <span style="color:var(--muted);font-weight:400">· via ${esc(s.agent_label)}</span>` : '';
       const wire = wireDetails('wire detail — real MCP call + PEP #2 decision', [
-        { label:'1 · Request the agent actually sends', desc:'tools/call over MCP to Kong, carrying the real DPoP-bound token',
+        { label:'1 · Request the agent actually sends', desc:'tools/call over MCP to '+gateway+', carrying the real DPoP-bound token',
           http:`POST ${url}`,
           json:{ headers:{ Authorization: p.authorization || 'DPoP <token>', DPoP: p.dpop_proof || '<proof>' },
                  body:{ jsonrpc:'2.0', id:1, method:'tools/call', params:{ name:s.name, arguments:s.input } } } },
-        { label:'2 · AuthZEN evaluation @ PEP #2', desc:'Kong maps the Bank API call to an AuthZEN request for the PDP',
+        { label:'2 · AuthZEN evaluation @ PEP #2', desc:gateway+' maps the Bank API call to an AuthZEN request (via the adapter) for the PDP',
           http:'POST /access/v1/evaluation', json: toolToAuthzen(s.name, s.input) },
       ]);
       out.appendChild(el('step tool_call',
         `<div class="label">🧰 Tool call → ${esc(s.name)}${byAgent}</div><pre>${pretty(s.input)}</pre>
          ${presentedChip(p)}
          <div class="hops"><span class="hop">${esc(s.agent_label||'Agent')}</span><span class="hop">PEP #1</span><span class="hop">MCP</span><span class="hop">PEP #2</span><span class="hop">Bank API</span></div>${wire}`));
+    } else if (s.type === 'scope_stepup') {
+      // Display-only: the task agent reporting PEP #2's insufficient_scope. The
+      // redirect itself is driven by the concierge's 'scope_challenge' event.
+      setNode('pep2','deny','insufficient_scope');
+      out.appendChild(el('step tool_result',
+        `<div class="label">🔒 Scope step-up ← ${esc(s.agent_label||'agent')}</div>
+         <span class="decision deny">✘ insufficient_scope</span>${s.pep?`<span class="pep">at ${esc(s.pep)}</span>`:''}
+         <div class="reason">${esc(s.detail||('Needs scope '+(s.scope||'')))}</div>`));
     } else if (s.type === 'tool_result') {
       const allowed = s.authorized;
       const pep = s.pep ? `<span class="pep">at ${esc(s.pep)}${s.pep_action ? ' · action=' + esc(s.pep_action) : ''}</span>` : '';
@@ -763,20 +984,32 @@ function render(steps) {
       else if (allowed === false) { badge = `<span class="decision deny">✘ DENY</span>${pep}`; setNode('pep2','deny','deny'); setNode('pdp','deny','DENY'); }
       const reason = s.policy_reason ? `<div class="reason">Policy reason: ${esc(s.policy_reason)}</div>` : '';
       const wire = (allowed === true || allowed === false) ? wireDetails('wire detail — PDP decision', [
-        { label:'AuthZEN decision response', desc:'from Ping Authorize via the AuthZEN adapter; Kong enforces it',
+        { label:'AuthZEN decision response', desc:'from Ping Authorize via the AuthZEN adapter; '+gateway+' enforces it',
           json:{ decision: allowed, context:{ reason: s.policy_reason || (allowed ? 'Permitted by policy.' : 'Denied by policy.') } } },
-        { label:'Gateway headers', desc:'surfaced by Kong on the proxied response',
+        { label:'Gateway headers', desc:'surfaced by '+gateway+' on the proxied response',
           json:{ 'X-PDP-PEP': s.pep || '', 'X-PDP-Decision': allowed ? 'PERMIT' : 'DENY', 'X-PDP-Action': s.pep_action || '' } },
       ]) : '';
       const respLabel = (allowed === false)
         ? 'Gateway response (real) — PEP #2 blocked the call'
-        : 'Bank API response (real) — returned through Kong';
+        : 'Bank API response (real) — returned through '+gateway;
       out.appendChild(el('step tool_result',
         `<div class="label">🛡️ Decision ← ${esc(s.name)}</div>${badge}${reason}
          <div class="ck" style="font-size:11px;margin:6px 0 2px">${respLabel}</div>
          <pre>${pretty(s.result)}</pre>${wire}`));
+    } else if (s.type === 'token_exchange_failed') {
+      setNode('as','deny','✘');
+      const wire = wireDetails('wire detail — decoded subject token + PingFederate response', [
+        { label:'subject token (decoded, unverified)', desc:s.subject_token_note||'', json:s.subject_token_decoded },
+        { label:`PingFederate response (HTTP ${s.pf_status})`, json:s.pf_response },
+      ]);
+      out.appendChild(el('step tool_result',
+        `<div class="label">🎫 ${esc(s.title||'Token exchange failed')}${s.agent?' ← '+esc(s.agent):''}</div>
+         <span class="decision deny">✘ ${esc(s.summary||'failed')}</span>
+         <div class="reason">${esc(s.detail||'')}</div>
+         <div class="ck" style="font-size:11px;margin:8px 0 2px">curl — the exact RFC 8693 request (tokens/secrets elided)</div>
+         <pre>${esc(s.curl||'')}</pre>${wire}`));
     }
-    out.scrollIntoView({behavior:'smooth', block:'end'});
+    autoScroll();
   }
 }
 
@@ -789,7 +1022,7 @@ async function runPrompt(prompt){
   resetPipeline();
   out.appendChild(el('step agent convo', `<div class="label">🧑 You</div>${esc(prompt)}`));
   sendBtn.disabled = true;
-  const spin = el('step spinner mech', 'Agent is working (recalling context, authenticating, exchanging tokens, calling tools through the Kong policy gateways)…');
+  const spin = el('step spinner mech', 'Agent is working (recalling context, authenticating, exchanging tokens, calling tools through the '+gateway+' policy gateways)…');
   out.appendChild(spin);
   try {
     await streamRun(prompt, spin);
@@ -798,7 +1031,7 @@ async function runPrompt(prompt){
     out.appendChild(el('step tool_result convo', `<div class="label">⚠ Error</div><pre>${esc(err)}</pre>`));
   } finally {
     sendBtn.disabled = false;
-    out.lastChild && out.lastChild.scrollIntoView({behavior:'smooth', block:'end'});
+    stickBottom = true; autoScroll();
   }
 }
 form.addEventListener('submit', (e) => {
