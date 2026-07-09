@@ -15,10 +15,11 @@ import logging
 import os
 from typing import Any
 
+import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from identity import establish_identity
+from identity import EVENT_SINK_URL, PFExchangeError, establish_identity, exchange_for_events
 from mcp_exec import MCP_SERVER_URL, LoginRequired, call_tool
 from token_verify import verify_bearer
 
@@ -142,9 +143,20 @@ async def a2a(request: Request):
 
     # 1) This task agent establishes its own identity + delegated token — a real
     #    RFC 8693 exchange of Alice's login token when she's signed in.
-    cred = establish_identity(agent_id=CFG["id"], agent_type=CFG["type"],
-                              agent_label=CFG["label"], role=AGENT_ROLE, mcp_url=MCP_SERVER_URL,
-                              user_token=user_token)
+    try:
+        cred = establish_identity(agent_id=CFG["id"], agent_type=CFG["type"],
+                                  agent_label=CFG["label"], role=AGENT_ROLE, mcp_url=MCP_SERVER_URL,
+                                  user_token=user_token, delegator_token=_bearer)
+    except PFExchangeError as exc:
+        # Surface the failure in the transcript (curl + decoded subject token + PF error) instead
+        # of a bare 500, so the identity failure is visible + debuggable in the activity log.
+        steps = verify_steps + [exc.diagnostic]
+        return JSONResponse(status_code=200, content={
+            "jsonrpc": "2.0", "id": rpc_id, "result": {
+                "message": {"role": "agent", "parts": [{"kind": "data",
+                    "data": {"error": "token_exchange_failed", "detail": exc.diagnostic["summary"]}}]},
+                "metadata": {"agent": CFG["id"], "agent_label": CFG["label"], "role": AGENT_ROLE,
+                             "steps": steps}}})
     steps: list[dict[str, Any]] = verify_steps + list(cred.steps)
     steps.append({
         "type": "connect", "role": AGENT_ROLE, "agent": CFG["id"], "agent_label": CFG["label"],
@@ -185,8 +197,12 @@ async def a2a(request: Request):
     # Alice back to PingFederate to approve it, then retry.
     if outcome.get("insufficient_scope"):
         scope = outcome.get("scope_required")
+        # This is a DISPLAY step only (type != 'scope_challenge') so it renders in
+        # the transcript without tripping the app's scope_challenge redirect handler.
+        # The concierge emits the single, authoritative 'scope_challenge' event
+        # (carrying the payment authorization_details) that drives the RAR step-up.
         steps.append({
-            "type": "scope_challenge", "role": AGENT_ROLE, "agent_label": CFG["label"],
+            "type": "scope_stepup", "role": AGENT_ROLE, "agent_label": CFG["label"],
             "scope": scope, "pep": outcome.get("pep"),
             "detail": f"PEP #2 rejected {operation} with 401 insufficient_scope: it needs the "
                       f"'{scope}' scope, which the signed-in user hasn't approved. Step-up required."})
@@ -204,6 +220,30 @@ async def a2a(request: Request):
         "authorized": outcome.get("authorized"), "policy_reason": outcome.get("policy_reason"),
         "pep": outcome.get("pep"), "pep_action": outcome.get("pep_action"),
         "bank_response": outcome.get("result"), "result": outcome.get("result")})
+
+    # After a successful payment, publish an event using a FLATTENED token (sub=root actor, no
+    # act) obtained via a 2nd audience-scoped exchange. Guarded: a no-op unless EVENT_SINK_URL is
+    # set AND the events ATM/mapping has been applied in PF (Terraform flatten.tf).
+    if EVENT_SINK_URL and outcome.get("authorized") and "payment" in operation.lower():
+        try:
+            etok, eclaims, estep = exchange_for_events(agent_id=CFG["id"], subject_token=cred.access_token)
+            steps.append(estep)
+            er = httpx.post(EVENT_SINK_URL.rstrip("/") + "/events",
+                            headers={"Authorization": f"Bearer {etok}"},
+                            json={"paymentId": arguments.get("paymentId"), **arguments},
+                            timeout=15.0, verify=False)
+            ebody = er.json() if er.headers.get("content-type", "").startswith("application/json") else er.text[:300]
+            steps.append({
+                "type": "event_published", "role": AGENT_ROLE, "agent_label": CFG["label"],
+                "accepted": er.status_code < 400, "status": er.status_code,
+                "producer": eclaims.get("sub"), "audience": eclaims.get("aud"),
+                "detail": (f"Event-sink {'accepted' if er.status_code < 400 else 'rejected'} the flattened "
+                           f"token (HTTP {er.status_code}) — producer={eclaims.get('sub')}, no act chain."),
+                "response": ebody})
+        except Exception as exc:  # noqa: BLE001
+            steps.append({
+                "type": "event_publish_skipped", "role": AGENT_ROLE, "agent_label": CFG["label"],
+                "detail": f"Event publish skipped ({exc}) — the events ATM/mapping may not be applied yet."})
 
     return JSONResponse(status_code=200, content={
         "jsonrpc": "2.0", "id": rpc_id, "result": {

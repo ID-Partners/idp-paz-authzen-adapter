@@ -20,6 +20,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import logging
 import os
 import time
 import uuid
@@ -31,6 +32,8 @@ import jwt  # PyJWT
 from cryptography.hazmat.primitives.asymmetric import ec
 
 from attestation import mint_agent_attestation
+
+log = logging.getLogger("task-agent-identity")
 
 PRINCIPAL_SUB = os.environ.get("PRINCIPAL_SUB", "alice")   # the human (== OIDC sub)
 PRINCIPAL_AGENT_ID = os.environ.get("PRINCIPAL_AGENT_ID", "urn:agent:northwind-concierge:v1")
@@ -51,6 +54,10 @@ DEFAULT_SCOPE = os.environ.get(
 RAR_TYPE = os.environ.get(
     "RAR_TYPE", "https://schemas.idpartners.com.au/agentic/payment_initiation/v1")
 TOKEN_TTL = int(os.environ.get("TOKEN_TTL", "900"))
+# Audience-scoped FLATTEN exchange (event endpoint). The payments agent does a 2nd exchange for
+# this audience → a token whose sub is the ROOT actor and which has NO act (agent acts as itself).
+EVENTS_AUDIENCE = os.environ.get("EVENTS_AUDIENCE", "https://events.northwind.example")
+EVENT_SINK_URL = os.environ.get("EVENT_SINK_URL", "")  # unset → event publishing is skipped
 
 
 def _b64url(data: bytes) -> str:
@@ -100,6 +107,34 @@ def _authorization_details() -> list[dict[str, Any]]:
              "locations": [RS_AUDIENCE], "instructedAmount": {"currency": "AUD"}}]
 
 
+def _normalize_ad(ad: Any) -> list[dict[str, Any]]:
+    """Coerce an authorization_details value (list, JSON string, or single object)
+    into a list of RAR entries; [] if absent/unparseable."""
+    if not ad:
+        return []
+    if isinstance(ad, str):
+        try:
+            ad = json.loads(ad)
+        except Exception:  # noqa: BLE001
+            return []
+    if isinstance(ad, dict):
+        return [ad]
+    return ad if isinstance(ad, list) else []
+
+
+def _subject_authorization_details(user_token: str | None) -> list[dict[str, Any]]:
+    """The RFC 9396 authorization_details Alice consented to, read from her subject
+    token. RFC 8693 bounds the exchanged token's authority by the subject's grant, so
+    this governed payment is exactly what the delegated hop is entitled to carry."""
+    if not user_token:
+        return []
+    try:
+        return _normalize_ad(jwt.decode(user_token, options={"verify_signature": False})
+                             .get("authorization_details"))
+    except Exception:  # noqa: BLE001
+        return []
+
+
 @dataclass
 class Credential:
     access_token: str
@@ -139,16 +174,82 @@ class DPoPAuth(httpx.Auth):
         yield request
 
 
+class PFExchangeError(Exception):
+    """Token exchange at PingFederate failed; carries a transcript-ready diagnostic."""
+    def __init__(self, diagnostic: dict[str, Any]) -> None:
+        self.diagnostic = diagnostic
+        super().__init__(diagnostic.get("summary", "token exchange failed"))
+
+
+def _decode_jwt(token: str | None) -> dict[str, Any]:
+    """Decode a JWT WITHOUT verifying (for display/diagnosis) → header + key claims."""
+    if not token:
+        return {"error": "no token"}
+    try:
+        h = jwt.get_unverified_header(token)
+        c = jwt.decode(token, options={"verify_signature": False})
+        return {"header": {k: h.get(k) for k in ("alg", "kid", "typ") if k in h},
+                "claims": {k: c.get(k) for k in
+                           ("iss", "sub", "aud", "exp", "iat", "scope", "act", "client_id", "jti", "cnf")
+                           if k in c},
+                "preview": token[:16] + "…" + token[-10:]}
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"undecodable: {exc}", "preview": token[:16] + "…"}
+
+
+def _curl_for(url: str, data: dict[str, str], attest: bool, dpop: bool) -> str:
+    """A copy-pasteable curl for the token-exchange request (secrets/tokens elided)."""
+    lines = [f"curl -sk -X POST '{url}'"]
+    if attest:
+        lines.append("-H 'OAuth-Client-Attestation: <attestation JWT>'")
+    if dpop:
+        lines.append("-H 'DPoP: <proof signed by cnf.jwk>'")
+    for k, v in data.items():
+        vv = "<…>" if k in ("subject_token", "actor_token", "client_secret") else str(v)
+        lines.append(f"--data-urlencode '{k}={vv}'")
+    return " \\\n  ".join(lines)
+
+
+def _exchange_diagnostic(agent_id: str, data: dict[str, str], subject_token: str | None,
+                         tr: "httpx.Response") -> dict[str, Any]:
+    try:
+        body = tr.json()
+    except Exception:  # noqa: BLE001
+        body = tr.text[:400]
+    subj = _decode_jwt(subject_token)
+    exp = subj.get("claims", {}).get("exp")
+    now = int(time.time())
+    if isinstance(exp, int):
+        note = (f"subject token EXPIRED {now - exp}s ago" if exp < now
+                else f"subject token still valid for {exp - now}s")
+    else:
+        note = "no exp claim on subject token"
+    err = body.get("error") if isinstance(body, dict) else body
+    return {
+        "type": "token_exchange_failed", "role": "task_agent", "agent": agent_id,
+        "title": f"Token exchange FAILED at PingFederate ({tr.status_code})",
+        "summary": f"PF {tr.status_code}: {err}",
+        "detail": (f"PingFederate rejected the RFC 8693 exchange: {err}. "
+                   f"Subject = the presented bearer (Alice's login token). {note}."),
+        "te_endpoint": PF_TOKEN_URL, "pf_status": tr.status_code, "pf_response": body,
+        "curl": _curl_for(PF_TOKEN_URL, data, attest=True, dpop=True),
+        "subject_token_decoded": subj, "subject_token_note": note,
+    }
+
+
 def _establish_pf(*, agent_id: str, agent_type: str, agent_label: str, role: str,
-                  user_token: str | None = None) -> Credential:
+                  user_token: str | None = None, delegator_token: str | None = None) -> Credential:
     """Get a REAL delegated token from PingFederate: the attester service signs an
     attestation binding this agent's DPoP key, then PF (as this agent's own OAuth
     client) validates it and issues the token.
 
-    With `user_token` (Alice's PF login token), this is a real RFC 8693 TOKEN
-    EXCHANGE: her token is the subject_token, PF validates it and derives the
-    issued token's sub from HER authenticated identity. Without it, fall back to
-    client_credentials (static sub)."""
+    RFC 8693 token exchange, chained for a GROWING actor chain: the subject_token is
+    the DELEGATOR's delegated token (the concierge's token, which already carries
+    act={concierge}) when present, else Alice's login token. PingFederate reads the
+    incoming token's `act` and WRAPS it — {this-agent, act={…incoming…}} — so the
+    chain is derived from the token, not baked per agent. `sub` (Alice) rides through
+    unchanged. The RAR is still read from Alice's `user_token` (her consent).
+    Without any subject token, fall back to client_credentials (static sub)."""
     now = int(time.time())
     local = _new_key(); local_jkt = _jkt(local); local_jwk = _pub_jwk(local)
     workload = {"software_id": agent_id, "agent_type": agent_type,
@@ -168,19 +269,38 @@ def _establish_pf(*, agent_id: str, agent_type: str, agent_label: str, role: str
                            "jti": str(uuid.uuid4()), "iat": now},
                           local, algorithm="ES256",
                           headers={"typ": "dpop+jwt", "jwk": local_jwk})
-        if user_token:
+        # Exchange ALICE's login token as the subject. (Chaining on the concierge's delegated
+        # token — to derive a growing act — is deferred: PF's subjectJwtProc requires
+        # iss=<PF-URL>, but the attestJwt ATMs issue agent tokens with an EMPTY issuer, so the
+        # concierge token is rejected as a subject. That needs the agent ATMs to stamp iss first;
+        # until then the nested act comes from the per-agent ATM mapping, not from re-exchange.)
+        subject_token = user_token or delegator_token
+        # Carry Alice's consented payment (RFC 9396 RAR) from her subject token onto
+        # this exchange, so PingFederate can bind the delegated token to the SAME
+        # governed authority (RFC 8693: issued authority ⊆ the subject's grant).
+        subject_ad = _subject_authorization_details(user_token)
+        if subject_token:
             grant = "urn:ietf:params:oauth:grant-type:token-exchange"
             data = {"grant_type": grant,
-                    "subject_token": user_token,
+                    "subject_token": subject_token,
                     "subject_token_type": "urn:ietf:params:oauth:token-type:access_token",
                     "client_id": agent_id, "client_secret": PF_CLIENT_SECRET}
+            if subject_ad:
+                data["authorization_details"] = json.dumps(subject_ad)
         else:
             grant = "client_credentials"
             data = {"grant_type": grant, "client_id": agent_id,
                     "client_secret": PF_CLIENT_SECRET}
         tr = c.post(PF_TOKEN_URL, data=data,
                     headers={"OAuth-Client-Attestation": attestation, "DPoP": dpop})
-        tr.raise_for_status()
+        if tr.status_code != 200:
+            diag = _exchange_diagnostic(agent_id, data, subject_token, tr)
+            # Server-side: log the decoded subject token so the reason is visible in the logs.
+            _sd = diag["subject_token_decoded"]
+            log.warning("token exchange FAILED (%s) for %s | %s | subject hdr=%s claims=%s",
+                        tr.status_code, agent_id, diag["subject_token_note"],
+                        _sd.get("header"), _sd.get("claims"))
+            raise PFExchangeError(diag)
         token = tr.json()["access_token"]
 
     claims = jwt.decode(token, options={"verify_signature": False})
@@ -192,6 +312,13 @@ def _establish_pf(*, agent_id: str, agent_type: str, agent_label: str, role: str
             act = {"sub": act}
     chain_labels = _actor_chain_labels(act) if isinstance(act, dict) else [agent_id]
     tp = token[:20] + "…" + token[-12:]
+    # Prefer the RAR PingFederate stamped into the issued token; otherwise show the
+    # governed payment carried from Alice's subject token (what this hop is entitled
+    # to exercise). ad_source lets the UI label which it is, truthfully.
+    issued_ad = _normalize_ad(claims.get("authorization_details"))
+    effective_ad = issued_ad or subject_ad
+    ad_source = ("issued token" if issued_ad
+                 else "carried from Alice's consent (subject token)" if subject_ad else None)
     steps = [
         {"type": "attestation", "title": "Client attestation (signed by the attester service)",
          "detail": f"Attester '{att.get('attester_issuer')}' signed an attestation JWT for "
@@ -222,13 +349,14 @@ def _establish_pf(*, agent_id: str, agent_type: str, agent_label: str, role: str
          "actor_chain": chain_labels, "hop": 2, "hops": 2, "delegator": PRINCIPAL_AGENT_ID,
          "scope": claims.get("scope"), "cnf_jkt": (claims.get("cnf") or {}).get("jkt"),
          "aud": claims.get("aud"), "client_id": claims.get("client_id"),
-         "authorization_details": claims.get("authorization_details"),
+         "authorization_details": effective_ad,
+         "authorization_details_source": ad_source,
          "grant": grant,
-         "subject_token_preview": (user_token[:20] + "…" + user_token[-12:]) if user_token else None,
+         "subject_token_preview": (subject_token[:20] + "…" + subject_token[-12:]) if subject_token else None,
          "te_request": ({"grant_type": grant,
                          "subject_token": "<Alice's PF login token>",
                          "subject_token_type": "urn:ietf:params:oauth:token-type:access_token",
-                         "client_id": agent_id} if user_token else None),
+                         "client_id": agent_id} if subject_token else None),
          "token_preview": tp, "claims": claims, "token_header": jwt.get_unverified_header(token),
          "te_endpoint": PF_TOKEN_URL, "role": role, "agent_label": agent_label, "mode": "pingfederate"},
     ]
@@ -237,8 +365,50 @@ def _establish_pf(*, agent_id: str, agent_type: str, agent_label: str, role: str
                       actor_chain=chain_labels)
 
 
+def exchange_for_events(*, agent_id: str, subject_token: str) -> tuple[str, dict[str, Any], dict[str, Any]]:
+    """2nd RFC 8693 exchange scoped to the events audience → a FLATTENED token: PingFederate
+    promotes the ROOT actor (innermost act.sub) into `sub` and drops `act`. The agent asserts
+    its OWN identity for event publishing — deliberately NOT delegation, scoped to this audience.
+
+    Requires the events ATM + audience-scoped mapping applied in PF (Terraform `flatten.tf`).
+    Returns (flattened_token, claims, transcript_step)."""
+    now = int(time.time())
+    local = _new_key()
+    local_jwk = _pub_jwk(local)
+    with httpx.Client(timeout=20.0, verify=False) as c:
+        ar = c.post(ATTESTER_URL.rstrip("/") + "/attest",
+                    json={"client_id": agent_id, "cnf": local_jwk,
+                          "workload": {"software_id": agent_id, "on_behalf_of": PRINCIPAL_SUB},
+                          "authorization_details": []})
+        ar.raise_for_status()
+        attestation = ar.json()["attestation"]
+        dpop = jwt.encode({"htm": "POST", "htu": PF_TOKEN_URL, "jti": str(uuid.uuid4()), "iat": now},
+                          local, algorithm="ES256", headers={"typ": "dpop+jwt", "jwk": local_jwk})
+        tr = c.post(PF_TOKEN_URL, data={
+            "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+            "subject_token": subject_token,
+            "subject_token_type": "urn:ietf:params:oauth:token-type:access_token",
+            "resource": EVENTS_AUDIENCE,  # ← selects the events ATM → flatten mapping
+            "client_id": agent_id, "client_secret": PF_CLIENT_SECRET},
+            headers={"OAuth-Client-Attestation": attestation, "DPoP": dpop})
+        tr.raise_for_status()
+        token = tr.json()["access_token"]
+    claims = jwt.decode(token, options={"verify_signature": False})
+    step = {
+        "type": "token_exchange_flatten",
+        "title": "Audience-scoped exchange (RFC 8693) → FLATTENED event token",
+        "detail": (f"Exchanged for aud={EVENTS_AUDIENCE}: PingFederate promoted the ROOT actor into "
+                   f"sub={claims.get('sub')} and dropped the act chain — the agent acts as ITSELF to "
+                   f"publish the event (deliberately NOT delegation, scoped to this one audience)."),
+        "sub": claims.get("sub"), "aud": claims.get("aud"), "has_act": "act" in claims,
+        "resource": EVENTS_AUDIENCE, "client_id": claims.get("client_id"),
+        "token_preview": token[:20] + "…" + token[-12:], "claims": claims, "mode": "pingfederate"}
+    return token, claims, step
+
+
 def establish_identity(*, agent_id: str, agent_type: str, agent_label: str,
-                       role: str, mcp_url: str, user_token: str | None = None) -> Credential:
+                       role: str, mcp_url: str, user_token: str | None = None,
+                       delegator_token: str | None = None) -> Credential:
     """Mint this task agent's identity + its delegated, DPoP-bound token.
 
     In pingfederate mode, get a REAL token from PF via the attester — an RFC 8693
@@ -247,7 +417,8 @@ def establish_identity(*, agent_id: str, agent_type: str, agent_label: str,
     """
     if TOKEN_MODE == "pingfederate" and PF_TOKEN_URL:
         return _establish_pf(agent_id=agent_id, agent_type=agent_type,
-                             agent_label=agent_label, role=role, user_token=user_token)
+                             agent_label=agent_label, role=role, user_token=user_token,
+                             delegator_token=delegator_token)
     now = int(time.time())
     entity = _new_key(); entity_jkt = _jkt(entity)
     local = _new_key(); local_jkt = _jkt(local); local_jwk = _pub_jwk(local)
