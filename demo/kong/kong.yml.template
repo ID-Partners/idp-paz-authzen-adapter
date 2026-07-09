@@ -37,6 +37,11 @@ services:
           # Step-up: require a logged-in end user (X-User-Token). If absent, the
           # gateway challenges (401 login_required) so the app forces a PF login.
           require_user_login: true
+          # COAZ (OpenID AuthZEN MCP profile): tools/call on COAZ-declared
+          # tools is authorized per the tool's x-coaz-mapping by the shared
+          # coaz-pep engine (discovery from the MCP server's tools/list).
+          coaz_url: "__COAZ_URL__"
+          mcp_upstream_url: "__BANK_MCP_URL__/mcp"
 
   - name: bank-api-svc
     url: __BANK_API_URL__

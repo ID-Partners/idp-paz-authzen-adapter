@@ -26,7 +26,7 @@ local resty_sha256 = require "resty.sha256"
 
 local AuthzenPDP = {
   PRIORITY = 1000,  -- run before upstream proxying; after auth plugins if present
-  VERSION = "0.1.0",
+  VERSION = "0.2.0", -- 0.2.0: COAZ (OpenID AuthZEN MCP profile) via coaz-pep
 }
 
 -- ---------- helpers ----------
@@ -244,6 +244,61 @@ function AuthzenPDP:access(conf)
     -- so a mismatch is logged rather than fatal for the demo.
     if pclaims.htu and not tostring(pclaims.htu):find(kong.request.get_path(), 1, true) then
       kong.log.warn("DPoP htu path mismatch: ", tostring(pclaims.htu))
+    end
+  end
+
+  -- 2b) COAZ (OpenID AuthZEN MCP profile): tools/call on an MCP route is
+  --     delegated to the coaz-pep engine, which discovers the tool's
+  --     x-coaz-mapping from the MCP server's tools/list, evaluates the CEL
+  --     mapping against the call arguments + token claims, asks the AuthZEN
+  --     PDP, and returns either a permit (with identity/audit headers) or the
+  --     profile's JSON-RPC error response to relay verbatim.
+  if conf.style == "mcp" and conf.coaz_url and conf.coaz_url ~= "" then
+    local ok_body, raw_body = pcall(function() return kong.request.get_raw_body() end)
+    local rpc = ok_body and raw_body and cjson.decode(raw_body) or nil
+    if type(rpc) == "table" and rpc.method == "tools/call" then
+      local coaz_httpc = http.new()
+      coaz_httpc:set_timeout(15000)
+      local cres, cerr = coaz_httpc:request_uri(conf.coaz_url .. "/v1/mcp/check", {
+        method = "POST",
+        body = cjson.encode({
+          config = {
+            pep_label = pep,
+            style = "mcp",
+            mcp_upstream_url = conf.mcp_upstream_url,
+          },
+          method = kong.request.get_method(),
+          path = kong.request.get_path(),
+          headers = {
+            authorization = kong.request.get_header("authorization"),
+            ["x-user-token"] = kong.request.get_header("x-user-token"),
+          },
+          body = raw_body,
+        }),
+        headers = { ["Content-Type"] = "application/json" },
+      })
+      if not cres or cres.status ~= 200 then
+        kong.log.err("coaz-pep engine call failed: ", cerr or (cres and cres.status))
+        return deny(pep, 503, "COAZ authorization engine unreachable; denying (fail-closed).")
+      end
+      local verdict = cjson.decode(cres.body) or {}
+      local c = kong.ctx.plugin
+      if verdict.decision and verdict.decision == true then
+        for k, v in pairs(verdict.upstream_headers or {}) do
+          kong.service.request.set_header(k, v)
+        end
+        local rh = verdict.response_headers or {}
+        c.pep, c.decision = pep, "PERMIT"
+        c.action = rh["X-PDP-Action"] or ("tools/call:" .. tostring(rpc.params and rpc.params.name or "?"))
+        c.reason = rh["X-PDP-Reason"]
+        return
+      end
+      local resp = verdict.response or {}
+      local rh = resp.headers or {}
+      c.pep, c.decision = pep, "DENY"
+      c.action = rh["X-PDP-Action"] or ("tools/call:" .. tostring(rpc.params and rpc.params.name or "?"))
+      c.reason = rh["X-PDP-Reason"]
+      return kong.response.exit(resp.status or 200, resp.body or "", rh)
     end
   end
 

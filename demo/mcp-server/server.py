@@ -141,6 +141,102 @@ async def make_payment(customer_id: str, from_account: str, to_account: str,
     return rs_client.summarize(resp)
 
 
+# ---------------------------------------------------------------------------
+# COAZ (OpenID AuthZEN MCP profile) declarations.
+#
+# Each tool advertises `coaz: true` plus an `x-coaz-mapping` in its
+# inputSchema, telling the gateway PEP (coaz-pep) how the tool's arguments and
+# the caller's token claims map to an AuthZEN evaluation request. String
+# values are CEL expressions over `params` (the tools/call params) and `token`
+# (decoded access-token claims); static values are CEL string literals.
+#
+# The mappings deliberately produce the SAME AuthZEN request shapes as the
+# gateway's REST-edge PEP (subject.type=agent + on_behalf_of, actions like
+# make_payment), so the existing Ping Authorize policies govern MCP tool calls
+# unchanged.
+# ---------------------------------------------------------------------------
+from mcp import types as mcp_types  # noqa: E402
+
+_AGENT_EXPR = ("has(token.act) ? token.act.sub : "
+               "(has(token.client_id) ? token.client_id : 'unknown-agent')")
+_COAZ_SUBJECT = [{
+    "type": "'agent'",
+    "identity": _AGENT_EXPR,
+    "properties": {
+        "on_behalf_of": "has(token.sub) ? token.sub : ''",
+        "agent_type": "'ai_assistant'",
+        "scope": "has(token.scope) ? token.scope : ''",
+        "client_id": "has(token.client_id) ? token.client_id : ''",
+    },
+}]
+_COAZ_CONTEXT_BASE = {"channel": "'ai-agent'", "agent": _AGENT_EXPR}
+
+COAZ_MAPPINGS: dict[str, dict] = {
+    "list_accounts": {
+        "subject": _COAZ_SUBJECT,
+        "action": [{"name": "'list_accounts'"}],
+        "resource": [{"type": "'customer'", "id": "params.arguments.customer_id"}],
+        "context": [dict(_COAZ_CONTEXT_BASE)],
+    },
+    "get_balance": {
+        "subject": _COAZ_SUBJECT,
+        "action": [{"name": "'get_balance'"}],
+        "resource": [{"type": "'account'", "id": "params.arguments.account_id"}],
+        "context": [dict(_COAZ_CONTEXT_BASE)],
+    },
+    "open_account": {
+        "subject": _COAZ_SUBJECT,
+        "action": [{"name": "'open_account'"}],
+        "resource": [{
+            "type": "'account'",
+            "id": ("'new:' + (has(params.arguments.account_type) ? "
+                   "params.arguments.account_type : 'savings')"),
+            "properties": {
+                "account_type": ("has(params.arguments.account_type) ? "
+                                 "params.arguments.account_type : 'savings'"),
+            },
+        }],
+        "context": [dict(_COAZ_CONTEXT_BASE)],
+    },
+    "make_payment": {
+        "subject": _COAZ_SUBJECT,
+        "action": [{"name": "'make_payment'"}],
+        "resource": [{
+            "type": "'account'",
+            "id": "params.arguments.from_account",
+            "properties": {
+                "from_account": "params.arguments.from_account",
+                "to_account": "params.arguments.to_account",
+            },
+        }],
+        "context": [{
+            **_COAZ_CONTEXT_BASE,
+            "amount": "params.arguments.amount",
+            "currency": ("has(params.arguments.currency) ? "
+                         "params.arguments.currency : 'AUD'"),
+            "description": ("has(params.arguments.description) ? "
+                            "params.arguments.description : ''"),
+        }],
+    },
+}
+
+
+@mcp._mcp_server.list_tools()
+async def _coaz_list_tools() -> list[mcp_types.Tool]:
+    """tools/list with COAZ declarations attached (replaces the stock handler)."""
+    tools = []
+    for info in mcp._tool_manager.list_tools():
+        schema = dict(info.parameters)
+        extra: dict = {}
+        if info.name in COAZ_MAPPINGS:
+            schema = {**schema, "x-coaz-mapping": COAZ_MAPPINGS[info.name]}
+            extra["coaz"] = True
+        tools.append(mcp_types.Tool(
+            name=info.name, description=info.description,
+            inputSchema=schema, **extra))
+    return tools
+
+
 if __name__ == "__main__":
     logger.info("Starting Bank MCP server on %s:%s (Bank API via %s)",
                 HOST, PORT, rs_client.BANK_API_BASE_URL)

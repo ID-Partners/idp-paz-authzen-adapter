@@ -29,6 +29,15 @@ return {
           -- must carry this scope; if not, return 401 insufficient_scope.
           { stepup_scope = { type = "string" } },
           { stepup_action = { type = "string", default = "make_payment" } },
+          -- COAZ (OpenID AuthZEN MCP profile): base URL of the coaz-pep
+          -- engine's HTTP check API. When set on an "mcp"-style route,
+          -- tools/call requests are authorized per the tool's x-coaz-mapping
+          -- (discovery from tools/list, CEL evaluation, JSON-RPC errors) by
+          -- the shared engine — one spec implementation for every gateway.
+          { coaz_url = { type = "string" } },
+          -- The MCP server whose tools/list declares the x-coaz-mapping
+          -- objects (reached directly by the engine for discovery).
+          { mcp_upstream_url = { type = "string" } },
         },
       },
     },

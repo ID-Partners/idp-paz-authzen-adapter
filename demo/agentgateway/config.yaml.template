@@ -8,13 +8,13 @@
 # in docker-compose (hostnames like bank-mcp) and on Railway (*.railway.internal):
 #   __BANK_MCP_HOST__   e.g. bank-mcp:8090          or bank-mcp.railway.internal:8090
 #   __BANK_API_HOST__   e.g. bank-api:8070          or bank-api.railway.internal:8070
-#   __EXTAUTHZ_HOST__   e.g. authzen-extauthz:9191  or authzen-extauthz.railway.internal:9191
+#   __EXTAUTHZ_HOST__   e.g. coaz-pep:9191  or authzen-extauthz.railway.internal:9191
 #
 # One gateway fronts BOTH governed surfaces, each with its own PEP:
 #   PEP #1  agent -> agentgateway/mcp       -> bank-mcp/mcp   (MCP edge, coarse)
 #   PEP #2  mcp   -> agentgateway/bank/...  -> bank-api/...   (Resource Server, fine)
 #
-# The PEP itself is the authzen-extauthz extension (demo/agentgateway/authzen-ext),
+# The PEP itself is the authzen-extauthz extension (demo/coaz-pep),
 # attached via agentgateway's Envoy-compatible extAuthz policy. The per-route
 # `context` map below is delivered to the extension as ext_authz
 # context_extensions — the same knobs as the Kong plugin's per-route config.
@@ -50,6 +50,10 @@ binds:
                 # the gateway challenges (401 login_required) so the app forces a
                 # PF login.
                 require_user_login: "true"
+                # COAZ (OpenID AuthZEN MCP profile): tools/call on COAZ-declared
+                # tools is authorized per the tool's x-coaz-mapping, discovered
+                # from this MCP server's tools/list.
+                mcp_upstream_url: "http://__BANK_MCP_HOST__/mcp"
       backends:
       - host: __BANK_MCP_HOST__
 

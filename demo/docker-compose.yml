@@ -37,17 +37,35 @@ services:
     expose:
       - "8070"
 
+  # coaz-pep: the AuthZEN MCP-profile (COAZ) engine + gateway PEP, vendored
+  # from the authzen-coaz-pep package. Kong delegates tools/call authorization
+  # to it over HTTP (:9192); the agentgateway override attaches it as the
+  # Envoy ext_authz service (:9191). One spec implementation, both gateways.
+  coaz-pep:
+    build: ./coaz-pep
+    environment:
+      AUTHZEN_URL: "http://authzen-adapter:8080"
+      AUTHZEN_API_KEY: "${AUTHZEN_API_KEY:-Password1}"
+    expose:
+      - "9191"
+      - "9192"
+    depends_on:
+      - authzen-adapter
+
   kong:
     build: ./kong
     environment:
       # consumed by the authzen-pdp plugin via Kong's env vault
       AUTHZEN_URL: "http://authzen-adapter:8080"
       AUTHZEN_API_KEY: "${AUTHZEN_API_KEY:-Password1}"
+      # COAZ engine for MCP tools/call authorization (AuthZEN MCP profile)
+      COAZ_URL: "http://coaz-pep:9192"
     ports:
       - "8002:8000"   # proxy on host:8002 (agent/mcp reach it internally as kong:8000)
       - "8001:8001"   # admin (debug only)
     depends_on:
       - authzen-adapter
+      - coaz-pep
       - bank-api
       - bank-mcp
 

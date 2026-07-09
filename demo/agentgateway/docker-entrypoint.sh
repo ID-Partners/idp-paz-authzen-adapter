@@ -6,7 +6,7 @@ set -e
 
 : "${BANK_MCP_HOST:=bank-mcp:8090}"
 : "${BANK_API_HOST:=bank-api:8070}"
-: "${EXTAUTHZ_HOST:=authzen-extauthz:9191}"
+: "${EXTAUTHZ_HOST:=coaz-pep:9191}"
 
 sed -e "s|__BANK_MCP_HOST__|${BANK_MCP_HOST}|g" \
     -e "s|__BANK_API_HOST__|${BANK_API_HOST}|g" \

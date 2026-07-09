@@ -95,6 +95,28 @@ func scopeString(claims map[string]any) string {
 	return ""
 }
 
+// claimsForCEL returns the decoded claims normalised for COAZ CEL evaluation:
+// object-valued claims that arrive as JSON strings (PingFederate's JWT ATM
+// emits `act` that way) are decoded so expressions like `token.act.sub` work
+// regardless of issuer encoding.
+func claimsForCEL(claims map[string]any) map[string]any {
+	if claims == nil {
+		return map[string]any{}
+	}
+	out := make(map[string]any, len(claims))
+	for k, v := range claims {
+		if s, ok := v.(string); ok && len(s) > 1 && s[0] == '{' {
+			var decoded map[string]any
+			if json.Unmarshal([]byte(s), &decoded) == nil {
+				out[k] = decoded
+				continue
+			}
+		}
+		out[k] = v
+	}
+	return out
+}
+
 // actorSub extracts act.sub (RFC 8693). `act` may be a nested object
 // (self-issued tokens) OR a JSON string (PingFederate's JWT ATM emits
 // object-valued claims as strings) — handle both, as the Kong plugin does.

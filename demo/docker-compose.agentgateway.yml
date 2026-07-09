@@ -2,32 +2,20 @@
 #
 #   docker compose -f docker-compose.yml -f docker-compose.agentgateway.yml up --build
 #
-# Same topology, same PDP — only the gateway (and its PEP implementation) changes:
+# Same topology, same PDP — only the gateway changes:
 #   bank-agent ──DPoP──▶ agentgateway:/mcp  (PEP #1) ──▶ bank-mcp
 #   bank-mcp   ──token─▶ agentgateway:/bank (PEP #2) ──▶ bank-api
-#   both PEPs ──ext_authz(gRPC)──▶ authzen-extauthz ──AuthZEN──▶ authzen-adapter ──▶ Ping Authorize
+#   both PEPs ──ext_authz(gRPC)──▶ coaz-pep ──AuthZEN──▶ authzen-adapter ──▶ Ping Authorize
 #
-# Where Kong runs the authzen-pdp Lua plugin in-process, agentgateway attaches
-# its Envoy-compatible extAuthz policy to each route, calling the
-# authzen-extauthz extension (demo/agentgateway/authzen-ext) — a gRPC bridge
-# that ports the same PEP logic and consumes the same AuthZEN PDP.
+# The PEP is the coaz-pep service from the base compose (vendored from the
+# authzen-coaz-pep package): agentgateway attaches it via the Envoy-compatible
+# extAuthz policy (gRPC :9191), while Kong uses its HTTP check API (:9192).
+# Both include COAZ (OpenID AuthZEN MCP profile) support for tools/call.
 
 services:
   # Park Kong: only started if you explicitly ask for --profile kong.
   kong:
     profiles: ["kong"]
-
-  # The AuthZEN PEP extension (Envoy ext_authz gRPC -> AuthZEN PDP).
-  authzen-extauthz:
-    build: ./agentgateway/authzen-ext
-    environment:
-      PORT: "9191"
-      AUTHZEN_URL: "http://authzen-adapter:8080"
-      AUTHZEN_API_KEY: "${AUTHZEN_API_KEY:-Password1}"
-    expose:
-      - "9191"
-    depends_on:
-      - authzen-adapter
 
   # The gateway itself, on the same host port Kong used (8002).
   agentgateway:
@@ -35,11 +23,11 @@ services:
     environment:
       BANK_MCP_HOST: "bank-mcp:8090"
       BANK_API_HOST: "bank-api:8070"
-      EXTAUTHZ_HOST: "authzen-extauthz:9191"
+      EXTAUTHZ_HOST: "coaz-pep:9191"
     ports:
       - "8002:8000"
     depends_on:
-      - authzen-extauthz
+      - coaz-pep
       - bank-api
       - bank-mcp
 
