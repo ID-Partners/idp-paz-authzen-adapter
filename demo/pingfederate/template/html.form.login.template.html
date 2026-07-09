@@ -13,11 +13,11 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
     <meta http-equiv="Content-Security-Policy"
           content="default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; script-src 'self' 'nonce-$CSPNonce'"/>
-    <title>Northwind Bank — Sign In</title>
+    <title>ID Partners Bank — Sign In</title>
     <style>
         :root {
             --bg1: #12202e; --bg2: #070a0e; --panel: #0d1117; --border: #24303c;
-            --text: #e6edf3; --muted: #8b98a5; --accent: #3b82f6; --accent2: #2f6fe0;
+            --text: #e6edf3; --muted: #8b98a5; --accent: #ff6600; --accent2: #e65c00;
             --error: #ff7b72;
         }
         * { box-sizing: border-box; }
@@ -34,6 +34,9 @@
             padding: 30px 28px; box-shadow: 0 24px 60px rgba(0,0,0,.5);
         }
         .brand { font-size: 23px; font-weight: 700; letter-spacing: -.2px; }
+        .idp-mark { display: inline-flex; align-items: center; gap: .42em; font-weight: 800; letter-spacing: .05em; }
+        .idp-mark .idp-sq { width: .62em; height: .62em; background: var(--accent); border-radius: 2px; display: inline-block; }
+        .idp-mark .idp-id { color: var(--text); } .idp-mark .idp-pa { color: var(--accent); }
         .sub { color: var(--muted); font-size: 13px; margin: 5px 0 22px; }
         label { display: block; font-size: 12px; color: var(--muted); margin: 14px 0 5px; }
         input[type=text], input[type=password] {
@@ -60,7 +63,7 @@
 <body>
 <div class="wrap">
     <form class="card" method="POST" action="$url" autocomplete="off">
-        <div class="brand">🏦 Northwind Bank</div>
+        <div class="brand"><span class="idp-mark"><i class="idp-sq"></i><span class="idp-id">ID</span><span class="idp-pa">PARTNERS</span></span> Bank</div>
         <div class="sub">Sign in to your AI account assistant</div>
 
         #if($authnMessageKey)

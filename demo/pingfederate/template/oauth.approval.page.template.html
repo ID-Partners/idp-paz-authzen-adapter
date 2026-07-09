@@ -15,11 +15,11 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
     <meta http-equiv="Content-Security-Policy"
           content="default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; script-src 'self' 'nonce-$CSPNonce'"/>
-    <title>Northwind Bank — Approve Request</title>
+    <title>ID Partners Bank — Approve Request</title>
     <style>
         :root {
             --bg1: #12202e; --bg2: #070a0e; --panel: #0d1117; --border: #24303c;
-            --text: #e6edf3; --muted: #8b98a5; --accent: #3b82f6; --accent2: #2f6fe0;
+            --text: #e6edf3; --muted: #8b98a5; --accent: #ff6600; --accent2: #e65c00;
             --deny: #24303c; --amount: #7ee787;
         }
         * { box-sizing: border-box; }
@@ -36,6 +36,9 @@
             padding: 28px 26px; box-shadow: 0 24px 60px rgba(0,0,0,.5);
         }
         .brand { font-size: 22px; font-weight: 700; letter-spacing: -.2px; }
+        .idp-mark { display: inline-flex; align-items: center; gap: .42em; font-weight: 800; letter-spacing: .05em; }
+        .idp-mark .idp-sq { width: .62em; height: .62em; background: var(--accent); border-radius: 2px; display: inline-block; }
+        .idp-mark .idp-id { color: var(--text); } .idp-mark .idp-pa { color: var(--accent); }
         .sub { color: var(--muted); font-size: 13px; margin: 5px 0 20px; }
         .who { font-size: 13px; color: var(--muted); margin-bottom: 16px; }
         .who b { color: var(--text); }
@@ -50,6 +53,18 @@
         ul.perms li .k { color: var(--muted); font-size: 11.5px; text-transform: uppercase; letter-spacing: .4px; }
         ul.perms li .v { margin-top: 3px; }
         ul.perms li .v .amt { color: var(--amount); font-weight: 700; }
+        /* Attribute-focused payment card — the authorization_details ARE the request. */
+        .payment { background: #06120a; border: 1px solid #2c4a2f; border-radius: 10px; padding: 16px; margin: 4px 0 14px; }
+        .payment .plabel { font-size: 11.5px; text-transform: uppercase; letter-spacing: .4px; color: var(--amount); font-weight: 700; margin-bottom: 10px; }
+        .payment .attrs { font-size: 15px; line-height: 1.75; white-space: pre-line; }
+        .rfc { color: var(--muted); font-size: 11px; margin-top: 10px; }
+        details.scopes { margin-top: 4px; }
+        details.scopes summary { cursor: pointer; color: var(--muted); font-size: 12px; list-style: none; padding: 4px 0; }
+        details.scopes summary::-webkit-details-marker { display: none; }
+        details.scopes summary:before { content: "▸ "; }
+        details.scopes[open] summary:before { content: "▾ "; }
+        ul.perms.mini { margin-top: 8px; }
+        ul.perms.mini li { padding: 7px 10px; font-size: 12.5px; color: var(--muted); background: #06090d; }
         .row { display: flex; gap: 10px; margin-top: 20px; }
         .btn {
             flex: 1; padding: 12px; font-size: 15px; font-weight: 600; border-radius: 8px;
@@ -69,12 +84,36 @@
         <input type="hidden" name="check-user-approved-scope" value="true"/>
         <input type="hidden" name="cSRFToken" value="$cSRFToken"/>
 
-        <div class="brand">🏦 Northwind Bank</div>
+        <div class="brand"><span class="idp-mark"><i class="idp-sq"></i><span class="idp-id">ID</span><span class="idp-pa">PARTNERS</span></span> Bank</div>
         <div class="sub">Authorize this request</div>
 
         <div class="who">Signed in as <b>$escape.escape($userName)</b></div>
-        <div class="asks"><b>$escape.escape($clientName)</b> is requesting permission to:</div>
 
+#if( $authorizationDetailsDescriptions && !$authorizationDetailsDescriptions.isEmpty() )
+        ## Attribute-focused consent: the authorization_details ARE what Alice approves. Lead with them;
+        ## the coarse OAuth scopes are secondary context tucked away below.
+        <div class="asks">Approve this <b>payment</b>:</div>
+        #foreach( $adEntry in $authorizationDetailsDescriptions.entrySet() )
+        <div class="payment">
+            <div class="plabel">Payment details</div>
+            <div class="attrs">$escape.escape($adEntry.getValue())</div>
+            <div class="rfc">Rich Authorization Request · RFC 9396 · governed by Ping Authorize</div>
+        </div>
+        <input type="hidden" name="authorization_details" value="$escape.escape($adEntry.getKey())"/>
+        #end
+        <details class="scopes">
+            <summary>This session also grants</summary>
+            <ul class="perms mini">
+                <li>$escape.escape($templateMessages.getMessage($defaultScopeDescription))</li>
+                #foreach( $scopeEntry in $scopeDescriptions.entrySet() )
+                <li>$escape.escape($scopeEntry.getValue())</li>
+                <input type="hidden" name="scope" value="$escape.escape($scopeEntry.getKey())"/>
+                #end
+            </ul>
+        </details>
+#else
+        ## No authorization_details (everyday login): plain scope consent.
+        <div class="asks"><b>$escape.escape($clientName)</b> is requesting permission to:</div>
         <ul class="perms">
             <li>
                 <div class="k">Access</div>
@@ -87,14 +126,8 @@
             </li>
             <input type="hidden" name="scope" value="$escape.escape($scopeEntry.getKey())"/>
             #end
-            #foreach( $adEntry in $authorizationDetailsDescriptions.entrySet() )
-            <li class="rar">
-                <div class="k">Payment authorization (RFC 9396)</div>
-                <div class="v">$escape.escape($adEntry.getValue())</div>
-            </li>
-            <input type="hidden" name="authorization_details" value="$escape.escape($adEntry.getKey())"/>
-            #end
         </ul>
+#end
 
         <div class="row">
             <button type="submit" name="pf.oauth.authz.consent" value="deny" class="btn deny">Don't Allow</button>
