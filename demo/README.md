@@ -12,7 +12,8 @@ authorization mechanics of AI agents** visible:
    impersonation**. The agent never presents the customer's identity as its own.
 3. **DPoP (RFC 9449).** Tokens are sender-constrained: bound to the agent's key,
    so a stolen token is useless without the key.
-4. **Policy enforced at the gateway (PEP), not in app code.** A **Kong** gateway
+4. **Policy enforced at the gateway (PEP), not in app code.** A gateway —
+   **Kong** by default, or **agentgateway (solo.io)** as a swap-in option —
    sits in front of **both** the MCP surface *and* a classic REST **Bank API**,
    and calls **Ping Authorize** (via the AuthZEN adapter) for a decision on every
    request. You watch each action get PERMIT/DENY from policy in real time.
@@ -40,7 +41,8 @@ authorization mechanics of AI agents** visible:
 | Component | Path | What it is |
 |-----------|------|------------|
 | **Bank Agent** | `agent/` | The AI agent (Claude via the Anthropic API), AgentCore-shaped (`POST /invocations`, `GET /ping`). `auth.py` obtains a **delegated, DPoP-bound token** (real PingFederate token exchange, or a local-mint mode). It connects to the MCP service **through Kong**, presenting the token on every call, and serves the web UI. |
-| **Kong gateway** | `kong/` | Kong OSS (DB-less) running the custom **`authzen-pdp`** Lua plugin as **two PEPs**: PEP #1 at the MCP edge, PEP #2 at the Bank API edge. Each reads the token claims (`sub`, `act.sub`, `scope`, `cnf.jkt`), checks the DPoP binding, and calls the AuthZEN PDP before forwarding. |
+| **Kong gateway** (default) | `kong/` | Kong OSS (DB-less) running the custom **`authzen-pdp`** Lua plugin as **two PEPs**: PEP #1 at the MCP edge, PEP #2 at the Bank API edge. Each reads the token claims (`sub`, `act.sub`, `scope`, `cnf.jkt`), checks the DPoP binding, and calls the AuthZEN PDP before forwarding. |
+| **agentgateway** (option) | `agentgateway/` | [agentgateway](https://github.com/agentgateway/agentgateway) (solo.io) as a drop-in gateway swap: the same two PEPs, implemented as an **AuthZEN ext-authz extension** (`agentgateway/authzen-ext/`, Envoy `ext_authz` gRPC → AuthZEN) attached per-route via agentgateway's `extAuthz` policy. Same challenges, same PDP, identical evaluation requests. See `agentgateway/README.md`. |
 | **Bank MCP service** | `mcp-server/` | A **Model Context Protocol** server exposing banking tools (`list_accounts`, `open_account`, `get_balance`, `make_payment`). It holds **no policy** — each tool calls the Bank API **through Kong (PEP #2)**, forwarding the delegated identity. |
 | **Bank API** | `bank-api/` | The **Resource Server**: a plain REST banking API (accounts, balance, open, payments). No policy of its own; it trusts the gateway and records the `sub`/`act` delegation chain for its audit log. |
 | **AuthZEN PDP adapter** | `../authzen-adapter/` | The existing Go service. Implements the [AuthZEN](https://authzen-interop.net) Authorization API and proxies decisions to **Ping Authorize**. Unchanged. |
@@ -131,6 +133,18 @@ cd demo
 docker compose up --build
 # open http://localhost:8000   (Kong is on host :8002, admin :8001)
 ```
+
+### Gateway choice
+
+Kong is the default. To run the **same demo on agentgateway (solo.io)** —
+swapping only the gateway and its PEP implementation, nothing else:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.agentgateway.yml up --build
+# agentgateway proxy lands on the same host port :8002
+```
+
+Details of the AuthZEN extension are in [`agentgateway/README.md`](agentgateway/README.md).
 
 Runs in `TOKEN_MODE=local` by default. Set `TOKEN_MODE=pingfederate` (plus
 `AGENT_CLIENT_ID`/`AGENT_CLIENT_SECRET`) once PF is configured.

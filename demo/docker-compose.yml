@@ -9,6 +9,9 @@
 #   bank-agent ──DPoP──▶ kong:/mcp  (PEP #1) ──▶ bank-mcp
 #   bank-mcp   ──token─▶ kong:/bank (PEP #2) ──▶ bank-api
 #   both PEPs ──AuthZEN──▶ authzen-adapter ──▶ Ping Authorize
+#
+# Gateway swap: add -f docker-compose.agentgateway.yml to run the same demo on
+# agentgateway (solo.io) instead of Kong — see demo/agentgateway/README.md.
 
 services:
   authzen-adapter:
