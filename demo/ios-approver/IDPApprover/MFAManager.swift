@@ -26,11 +26,29 @@ final class MFAManager: ObservableObject {
     /// The push payload for the pending authentication, needed to send the action back.
     private var pendingUserInfo: [AnyHashable: Any]?
 
+    /// The APNs device token, cached so it can be (re-)applied AFTER pairing. The token
+    /// arrives at app launch (didRegisterForRemoteNotifications) but pairing happens later
+    /// when the user enters the key — if setDeviceToken runs before pair(), the token never
+    /// attaches to the created device (PingOne shows the device with no push registration →
+    /// no notification is ever delivered). So we stash it and apply it post-pair too.
+    private var deviceToken: Data?
+
     init() {
         // AP tenant (console.pingone.asia) → Singapore data center.
         // CONFIRM: .Singapore vs .Australia for this tenant's home region.
         PingOne.configure(geo: .Singapore) { error in
             if let error { print("PingOne.configure error:", error) }
+        }
+        // If this device already paired on a previous launch, DON'T show the pairing screen
+        // again (re-pairing mints a brand-new PingOne device every time — that's why Bob
+        // accumulated several). Reflect the persisted pairing so we reuse the same device.
+        PingOne.getInfo { [weak self] info, error in
+            Task { @MainActor in
+                if info != nil, error == nil {
+                    self?.state = .paired
+                    self?.applyDeviceToken()   // re-assert the push token on the existing device
+                }
+            }
         }
     }
 
@@ -38,14 +56,28 @@ final class MFAManager: ObservableObject {
     func pair(pairingKey: String) {
         PingOne.pair(pairingKey) { [weak self] _, error in
             Task { @MainActor in
-                if let error { self?.lastError = error.localizedDescription }
-                else { self?.state = .paired }
+                if let error { self?.lastError = error.localizedDescription; return }
+                self?.state = .paired
+                // CRITICAL: apply the cached APNs token now that the device exists, so
+                // PingOne registers a push target for it. Without this the device pairs
+                // but can never receive a notification.
+                self?.applyDeviceToken()
             }
         }
     }
 
-    /// Give the APNs device token to the SDK so PingOne can target this device.
+    /// Give the APNs device token to the SDK so PingOne can target this device. Called both
+    /// when the token arrives AND after pairing (whichever is later wins), so a token that
+    /// arrives before pairing isn't dropped.
     func registerPushToken(_ token: Data) {
+        deviceToken = token
+        applyDeviceToken()
+    }
+
+    private func applyDeviceToken() {
+        guard let token = deviceToken else { return }
+        // The entitlement is aps-environment: development, so a dev/sandbox build gets a
+        // SANDBOX APNs token → must register it as .sandbox or APNs silently drops delivery.
         #if DEBUG
         let type: PingOne.APNSDeviceTokenType = .sandbox
         #else
