@@ -123,8 +123,12 @@ def _rar(p: dict) -> list[dict]:
 
 
 def _binding(p: dict) -> str:
-    return (f"Approve payment {float(p.get('amount', 0) or 0):.2f} {p.get('currency','AUD')} "
-            f"from {p.get('from','')} to {p.get('to','')}")[:100]
+    # FAPI-CIBA constrains binding_message to <=20 chars, charset ^[a-zA-Z0-9-._+/!?#]{1,20}$
+    # (NO spaces) — verified against PF (a long/spaced value → 400 invalid_binding_message). It's
+    # a short confirmation CODE Bob sees; the full payment detail rides in the push body via the
+    # authenticator template. e.g. "Pay-600.00-AUD".
+    amt = float(p.get("amount", 0) or 0)
+    return f"Pay-{amt:.2f}-{p.get('currency', 'AUD')}"[:20]
 
 
 def _decode(token: str) -> dict:
@@ -187,10 +191,14 @@ async def _ciba_real(pid: str, payment: dict) -> str | None:
     pem = key.private_bytes(serialization.Encoding.PEM,
                             serialization.PrivateFormat.PKCS8, serialization.NoEncryption())
     now = int(time.time())
+    # NOTE: authorization_details (RAR) is deliberately NOT sent on the CIBA backchannel request —
+    # PF rejects it there (400 invalid_authorization_details, verified). The payment is conveyed to
+    # Bob via binding_message + the push template; RAR governance stays at the token-exchange/PDP
+    # plane (the staff-approval acr channel), same as the sim bridge.
     req_claims = {"iss": CIBA_CLIENT_ID, "aud": issuer, "jti": uuid.uuid4().hex,
                   "iat": now, "exp": now + 300, "nbf": now,
                   "scope": f"openid {ELEVATED_SCOPE}", "login_hint": BOB_USERNAME,
-                  "binding_message": binding, "authorization_details": _rar(payment)}
+                  "binding_message": binding}
     form = {"request": jwt.encode(req_claims, pem, algorithm="ES256",
                                   headers={"kid": "d4c67a35a199"}),
             "client_assertion_type": "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
