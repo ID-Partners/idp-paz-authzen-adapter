@@ -11,3 +11,6 @@
 overlay/pf.jwk
 overlay/pingfederate-system-keys.xml
 pingfederate.lic
+
+# PingOne MFA Integration Kit (licensed, gated download; supplied to the build out-of-band)
+pf-pingone-mfa-integration-kit-*.zip

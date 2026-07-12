@@ -23,6 +23,19 @@ COPY --chown=9031:0 jose4j-0.9.6.jar /opt/in/instance/server/default/deploy/jose
 # isolation (separate jackson jars in deploy/ did not link).
 COPY --chown=9031:0 pf.plugins.pf-rar-paz-plugin.jar /opt/in/instance/server/default/deploy/pf.plugins.pf-rar-paz-plugin.jar
 COPY --chown=9031:0 oidf-mock-attesters.json /opt/in/instance/server/default/conf/oidf-mock-attesters.json
+# PingOne MFA Integration Kit v4.0 (Ping Marketplace, gated download — kept out of git,
+# uploaded to the build via `railway up --no-gitignore`). Provides the PingOne MFA CIBA
+# Authenticator (PF-INF/oob-auth-plugins → com.pingidentity.oobauth.pingone.mfa.
+# PingOneMfaCibaAuthenticator): turns a FAPI-CIBA backchannel request into a PingOne MFA
+# push to Bob's phone. Merge its dist tree into the instance exactly as Ping documents.
+COPY --chown=9031:0 pf-pingone-mfa-integration-kit-4.0.zip /tmp/mfa-ik.zip
+RUN apk add --no-cache unzip \
+    && unzip -q /tmp/mfa-ik.zip -d /tmp/mfa-ik \
+    && cp -a /tmp/mfa-ik/pf-pingone-mfa-integration-kit/dist/pingfederate/server/default/. \
+             /opt/in/instance/server/default/ \
+    && chown -R 9031:0 /opt/in/instance/server/default/deploy /opt/in/instance/server/default/conf \
+    && rm -rf /tmp/mfa-ik /tmp/mfa-ik.zip \
+    && ls /opt/in/instance/server/default/deploy/pf-pingone-mfa-adapter-4.0.jar
 # Northwind-branded HTML Form login page (native submit button, site theme).
 COPY --chown=9031:0 template/html.form.login.template.html /opt/in/instance/server/default/conf/template/html.form.login.template.html
 # OAuth approval/consent page: posts to the same public origin (PF's $action uses
