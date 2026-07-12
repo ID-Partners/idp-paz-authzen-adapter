@@ -367,7 +367,7 @@ $('inject').onclick = async ()=>{
 $('injectOpen').onclick = async ()=>{
   $('injectOpen').disabled=true; setTimeout(()=>$('injectOpen').disabled=false, 1200);
   await fetch('/inject',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({eventType:'account_opening', customerId:'cust-alice', accountType:'savings'})});
+    body:JSON.stringify({eventType:'account_opening', customerId:'alice', accountType:'savings'})});
 };
 document.querySelectorAll('.presets button').forEach(b=>b.onclick=()=>{ $('amount').value=b.dataset.amt; });
 </script>

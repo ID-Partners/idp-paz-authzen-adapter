@@ -59,8 +59,12 @@ async def invocations(request: Request):
     if not prompt:
         return JSONResponse(status_code=400, content={"error": "missing 'prompt'"})
     user_token = request.headers.get("x-user-token") or None
+    # Optional STAFF-context target: the account owner the operation is for. Only
+    # honoured by agent_core when the authenticated principal is bank staff.
+    customer_id = payload.get("customer_id") or None
     try:
-        result = await run_agent(prompt, session_id, user_token=user_token)
+        result = await run_agent(prompt, session_id, user_token=user_token,
+                                 customer_id=customer_id)
     except Exception as exc:  # noqa: BLE001 - surface errors to the demo UI
         return JSONResponse(status_code=500, content={"error": str(exc)})
     return result
@@ -77,10 +81,13 @@ async def stream(request: Request):
     if not prompt:
         return JSONResponse(status_code=400, content={"error": "missing 'prompt'"})
     user_token = request.headers.get("x-user-token") or None
+    # Optional STAFF-context target (see /invocations) — staff principals only.
+    customer_id = payload.get("customer_id") or None
 
     async def gen():
         try:
-            async for ev in agent_events(prompt, session_id, user_token=user_token):
+            async for ev in agent_events(prompt, session_id, user_token=user_token,
+                                         customer_id=customer_id):
                 yield f"data: {_json.dumps(ev)}\n\n"
         except Exception as exc:  # noqa: BLE001
             yield "data: " + _json.dumps({

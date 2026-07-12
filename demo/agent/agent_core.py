@@ -150,7 +150,8 @@ def _extract_text(content_block) -> str:
 
 
 async def agent_events(prompt: str, session_id: str = "demo",
-                       user_token: str | None = None) -> AsyncIterator[dict[str, Any]]:
+                       user_token: str | None = None,
+                       customer_id: str | None = None) -> AsyncIterator[dict[str, Any]]:
     """Run one agent turn, yielding each transcript step AS IT HAPPENS.
 
     Emits identity steps, the gateway connect, the agent's reasoning, each tool
@@ -196,11 +197,28 @@ async def agent_events(prompt: str, session_id: str = "demo",
         yield step
 
     # The customer the concierge acts for IS the authenticated principal — the
-    # `sub` of the delegated token (derived from Alice's login via RFC 8693), not
+    # `sub` of the delegated token (derived from the login token via RFC 8693), not
     # a hardcoded id. This is the customer_id passed to every bank tool; the Bank
     # API enforces it equals the authenticated principal (X-Auth-Principal).
-    customer_id = _token_sub(principal.token) or _token_sub(user_token) or "alice"
-    system_prompt = SYSTEM_PROMPT_TEMPLATE.format(customer_id=customer_id)
+    #
+    # STAFF CONTEXT (the autonomous demo): when the authenticated principal is a
+    # bank STAFF member (e.g. bob, the agent owner), the operation targets a NAMED
+    # customer's accounts — the account owner from the triggering event — not the
+    # staff member's own (staff have no bank accounts). The caller supplies that
+    # target as `customer_id`, honoured ONLY for staff principals; a customer
+    # principal can never act on anyone but themselves. The Bank API applies the
+    # same rule server-side (staff principals may act on a customer, audited).
+    sub = _token_sub(principal.token) or _token_sub(user_token) or "alice"
+    staff_subs = set((os.environ.get("STAFF_SUBS", "bob")).split(","))
+    staff_note = ""
+    if customer_id and sub in staff_subs:
+        staff_note = (
+            f"\n- STAFF CONTEXT: you are operating under the authority of bank staff "
+            f"member \"{sub}\" (the agent owner), ON BEHALF OF account owner "
+            f"\"{customer_id}\". The accounts belong to {customer_id}, not {sub}.")
+    else:
+        customer_id = sub
+    system_prompt = SYSTEM_PROMPT_TEMPLATE.format(customer_id=customer_id) + staff_note
 
     # 2) Discover the task agents over A2A (their Agent Cards). Build a
     #    skill → task-agent routing table from what each agent advertises.
@@ -347,12 +365,14 @@ async def agent_events(prompt: str, session_id: str = "demo",
 
 
 async def run_agent(prompt: str, session_id: str = "demo",
-                    user_token: str | None = None) -> dict[str, Any]:
+                    user_token: str | None = None,
+                    customer_id: str | None = None) -> dict[str, Any]:
     """Non-streaming wrapper (AgentCore /invocations contract): collect the
     streamed events into a full transcript + final answer."""
     transcript: list[dict[str, Any]] = []
     final = "Done."
-    async for ev in agent_events(prompt, session_id, user_token=user_token):
+    async for ev in agent_events(prompt, session_id, user_token=user_token,
+                                 customer_id=customer_id):
         if ev.get("type") == "final":
             final = ev.get("final", final)
         else:

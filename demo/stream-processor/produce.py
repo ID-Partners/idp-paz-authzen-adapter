@@ -3,7 +3,7 @@
 Payments (default):
   KAFKA_BOOTSTRAP=localhost:9092 AMOUNT=150 FROM=CHK-1001 TO=SAV-1002 python produce.py
 Account opening:
-  TYPE=opening CUSTOMER=cust-alice ACCOUNT_TYPE=savings python produce.py
+  TYPE=opening CUSTOMER=alice ACCOUNT_TYPE=savings python produce.py
 """
 import json
 import os
@@ -18,7 +18,7 @@ if KIND in ("opening", "account_opening", "open"):
     topic = os.environ.get("KAFKA_TOPIC", "account.opening.requested")
     event = {
         "requestId": uuid.uuid4().hex[:12],
-        "customerId": os.environ.get("CUSTOMER", "cust-alice"),
+        "customerId": os.environ.get("CUSTOMER", "alice"),  # the ACCOUNT OWNER (bank customer id)
         "accountType": os.environ.get("ACCOUNT_TYPE", "savings"),
         "initiatedBy": os.environ.get("BY", "bob"),
     }

@@ -45,16 +45,29 @@ def _audit(action: str, principal: str | None, agent: str | None, detail: str) -
                 action, principal or "?", agent or "?", detail)
 
 
+# Bank STAFF principals: may act on a NAMED customer's data (the autonomous demo —
+# Bob, the agent owner, operating on Alice's accounts under an authorized, policy-
+# governed flow). Every such access is audited as staff access. Customers can only
+# ever act on themselves.
+STAFF_PRINCIPALS = set((os.environ.get("STAFF_PRINCIPALS", "bob")).split(","))
+
+
 def _forbid_foreign_customer(customer_id: str, principal: str | None) -> JSONResponse | None:
     """Enforce that the action targets the AUTHENTICATED principal's own data.
 
     The customer_id an agent supplies must equal the delegated token's `sub`
     (forwarded by the gateway as X-Auth-Principal). Otherwise an agent acting for
     one customer could reach another customer's accounts — the token, not the
-    request parameter, decides whose data is in scope. When no principal header is
-    present (e.g. a direct dev call that didn't pass through the gateway) we don't
-    block, so local testing without Kong still works."""
+    request parameter, decides whose data is in scope. Exception: a bank STAFF
+    principal (STAFF_PRINCIPALS) may act on a named customer — the gateway/PDP
+    already authorized the call and the access is audited. When no principal
+    header is present (e.g. a direct dev call that didn't pass through the
+    gateway) we don't block, so local testing without Kong still works."""
     if principal and customer_id != principal:
+        if principal in STAFF_PRINCIPALS:
+            logger.info("AUDIT staff-access: staff principal=%s acting on customer=%s",
+                        principal, customer_id)
+            return None
         logger.warning("DENY foreign customer: principal=%s attempted customer=%s",
                        principal, customer_id)
         return JSONResponse(status_code=403, content={

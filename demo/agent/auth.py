@@ -721,9 +721,10 @@ def _acquire_principal_pf(user_token: str | None = None) -> PrincipalCredential:
         {"type": "token_exchange",
          "title": ("Token exchange (RFC 8693) @ PingFederate → Principal Agent token"
                    if user_token else "PingFederate issued the Principal Agent's token"),
-         "detail": (f"REAL RFC 8693 exchange: the concierge presented Alice's login token as the "
-                    f"subject_token; PingFederate VALIDATED it and derived sub={claims.get('sub')} from "
-                    f"her authenticated identity, act = {' ◀ '.join(labels)}."
+         "detail": (f"REAL RFC 8693 exchange: the concierge presented the authenticated user's "
+                    f"login token as the subject_token; PingFederate VALIDATED it and derived "
+                    f"sub={claims.get('sub')} from that authenticated identity, "
+                    f"act = {' ◀ '.join(labels)}."
                     if user_token else
                     f"PingFederate issued a REAL delegated token: sub={claims.get('sub')}, "
                     f"act = {' ◀ '.join(labels)}."),

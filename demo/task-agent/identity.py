@@ -351,9 +351,10 @@ def _establish_pf(*, agent_id: str, agent_type: str, agent_label: str, role: str
         {"type": "token_exchange",
          "title": (f"Token exchange (RFC 8693) @ PingFederate → {agent_label} token"
                    if user_token else f"PingFederate issued {agent_label}'s delegated token"),
-         "detail": (f"REAL RFC 8693 exchange: {agent_id} presented Alice's login token as the "
-                    f"subject_token; PingFederate VALIDATED it and derived sub={claims.get('sub')} from her "
-                    f"authenticated identity, act = {' ◀ '.join(chain_labels)} — delegation, not impersonation."
+         "detail": (f"REAL RFC 8693 exchange: {agent_id} presented the authenticated user's login "
+                    f"token as the subject_token; PingFederate VALIDATED it and derived "
+                    f"sub={claims.get('sub')} from that authenticated identity, "
+                    f"act = {' ◀ '.join(chain_labels)} — delegation, not impersonation."
                     if user_token else
                     f"PingFederate validated the attestation and issued a REAL delegated token: "
                     f"sub={claims.get('sub')}, act = {' ◀ '.join(chain_labels)} — delegation, not impersonation."),

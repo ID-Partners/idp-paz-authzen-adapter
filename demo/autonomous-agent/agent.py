@@ -97,20 +97,23 @@ def _op_of(event: dict) -> dict:
     """Normalise a stream event into {id, kind, prompt, payment?}."""
     kind = (event.get("eventType") or ("account_opening" if event.get("accountType")
                                        else "payment")).lower()
+    # The ACCOUNT OWNER whose accounts the operation targets (Alice). The concierge
+    # honours this only because the authenticated principal (Bob) is bank staff.
+    owner = event.get("customerId") or event.get("accountOwner") or "alice"
     if kind == "account_opening":
         oid = event.get("requestId") or "open-" + uuid.uuid4().hex[:8]
         acct = event.get("accountType", "savings")
-        cust = event.get("customerId", "cust-alice")
-        return {"id": oid, "kind": kind, "event": event,
-                "prompt": f"Open a new {acct} account for customer {cust}."}
+        return {"id": oid, "kind": kind, "event": event, "owner": owner,
+                "prompt": f"Open a new {acct} account for customer {owner}."}
     oid = event.get("paymentId") or "pay-" + uuid.uuid4().hex[:8]
     amt = float(event.get("amount", 0) or 0)
     cur = event.get("currency", "AUD")
     frm = event.get("debtorAccount", "CHK-1001")
     to = event.get("creditorAccount", "SAV-1002")
-    return {"id": oid, "kind": "payment", "event": event,
+    return {"id": oid, "kind": "payment", "event": event, "owner": owner,
             "payment": {"amount": amt, "currency": cur, "from": frm, "to": to},
-            "prompt": f"Move ${amt:g} from my {frm} account to {to}."}
+            "prompt": (f"Move ${amt:g} from account {frm} to {to} "
+                       f"(accounts of customer {owner}).")}
 
 
 def _rar(p: dict) -> list[dict]:
@@ -273,15 +276,19 @@ async def _staff_approval(pid: str, payment: dict) -> str | None:
 
 
 # ── drive the concierge chain (the SAME pipeline as the interactive demo) ───────────
-async def _drive_chain(pid: str, prompt: str, token: str, session_id: str) -> dict:
-    """POST the concierge /stream with Bob's token as the user context; relay every
-    transcript step to the dashboard. Returns {outcome: final|scope_challenge|error, ...}."""
+async def _drive_chain(pid: str, prompt: str, token: str, session_id: str,
+                       owner: str) -> dict:
+    """POST the concierge /stream with Bob's token as the user context (and the
+    account owner as the staff-context target); relay every transcript step to
+    the dashboard. Returns {outcome: final|scope_challenge|error, ...}."""
     url = f"{CONCIERGE_URL}/stream"
     out: dict = {"outcome": "error", "detail": "no events received"}
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=15.0)) as c:
             async with c.stream("POST", url,
-                                json={"prompt": prompt, "session_id": session_id},
+                                json={"prompt": prompt, "session_id": session_id,
+                                      # the ACCOUNT OWNER (honoured because sub=bob is staff)
+                                      "customer_id": owner},
                                 headers={"x-user-token": token}) as r:
                 if r.status_code != 200:
                     body = (await r.aread()).decode()[:200]
@@ -345,7 +352,7 @@ async def orchestrate(event: dict) -> None:
 
         # 2) Drive the concierge chain; resolve at most one step-up via Bob's approval.
         for attempt in (1, 2):
-            res = await _drive_chain(pid, op["prompt"], token, session_id)
+            res = await _drive_chain(pid, op["prompt"], token, session_id, op["owner"])
             if res["outcome"] == "final":
                 await emit(pid, "executed", "ok",
                            "Operation completed by the agent chain.", {"final": res["final"]})
@@ -442,7 +449,7 @@ async def inject(request: Request) -> JSONResponse:
     if (body.get("eventType") or "").lower() == "account_opening":
         event = {"eventType": "account_opening",
                  "requestId": "open-" + uuid.uuid4().hex[:8],
-                 "customerId": body.get("customerId", "cust-alice"),
+                 "customerId": body.get("customerId", "alice"),
                  "accountType": body.get("accountType", "savings"),
                  "initiatedBy": body.get("initiatedBy", "batch:onboarding")}
     else:

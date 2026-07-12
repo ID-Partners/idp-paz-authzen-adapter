@@ -138,7 +138,7 @@ async def a2a(request: Request):
     _bearer = subj.split(" ", 1)[1] if " " in subj else (subj or None)
     verify_steps = [
         verify_bearer(_bearer, kind="agent", presenter="the calling agent (A2A bearer)"),
-        verify_bearer(user_token, kind="user", presenter="the app (Alice's PF token)"),
+        verify_bearer(user_token, kind="user", presenter="the caller (the user's PF token)"),
     ]
 
     # 1) This task agent establishes its own identity + delegated token — a real
