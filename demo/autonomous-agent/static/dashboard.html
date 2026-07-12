@@ -111,8 +111,8 @@
 </head>
 <body>
 <header>
-  <h1><span class="brand-sq"></span>ID <span class="brand-o">PARTNERS</span> Bank — Autonomous Payments</h1>
-  <span class="tag">Kafka → autonomous agent (principal&nbsp;·&nbsp;Bob) → FAPI-CIBA → PingOne MFA · RFC&nbsp;9396 RAR</span>
+  <h1><span class="brand-sq"></span>ID <span class="brand-o">PARTNERS</span> Bank — Autonomous Operations</h1>
+  <span class="tag">Kafka → the SAME agent chain as the interactive demo · staff authority&nbsp;=&nbsp;Bob · step-up via FAPI-CIBA · Alice&nbsp;=&nbsp;account owner</span>
   <span id="mode" class="mode sim">simulation</span>
 </header>
 
@@ -120,18 +120,30 @@
   <!-- LEFT: the pipeline + token -->
   <div>
     <div class="card">
-      <h2 class="sec">Autonomous payment pipeline <span id="pid" class="chip" style="display:none"></span></h2>
+      <h2 class="sec">Autonomous operation pipeline <span id="pid" class="chip" style="display:none"></span></h2>
       <div class="pipe" id="pipe"></div>
+      <div style="font-size:11px;color:var(--muted);margin-top:10px;line-height:1.5;border-top:1px solid #21262d;padding-top:8px">
+        👤 <b>Alice</b> is the <b>account owner</b> — her accounts are the resource being operated on.
+        🧑‍💼 <b>Bob</b> is the <b>internal authority</b>: the staff member who owns this agent and approves
+        its sensitive operations out-of-band. The token subject is Bob (staff context); the agents grow
+        the same nested <code>act</code> delegation chain over it as in the interactive demo.
+      </div>
     </div>
     <div class="card" id="tokCard" style="display:none">
-      <h2 class="sec">Delegated access token — <span style="color:var(--text)">sub=bob</span>, act={agent} <span class="chip">delegation, not impersonation</span></h2>
+      <h2 class="sec" id="tokTitle">Access token</h2>
       <div class="tok" id="tok"></div>
       <div style="font-size:11.5px;color:var(--muted);margin-top:10px;line-height:1.5">
-        The agent held <b>no authority</b> until Bob approved <b>this</b> payment. The token names Bob as
-        <code>sub</code> (principal) and the agent as <code>act.sub</code> (delegate), and carries the payment
-        as governed <code>authorization_details</code> (RFC&nbsp;9396). Every downstream action is attributable
-        to the human who approved it.
+        The agents held <b>no elevated authority</b> until Bob approved <b>this</b> operation. Tokens name
+        Bob as <code>sub</code> (the staff authority), each agent in the nested <code>act</code> chain
+        (delegation, not impersonation — RFC&nbsp;8693), and the staff approval as
+        <code>acr&nbsp;=&nbsp;urn:northwind:loa:staff-approval</code>. Ping Authorize enforces the SAME
+        step-up policy as the interactive demo; only the challenge resolution differs (CIBA push to Bob
+        instead of Alice's browser redirect).
       </div>
+    </div>
+    <div class="card" id="chainCard" style="display:none">
+      <h2 class="sec">Agent chain transcript <span class="chip">relayed live from the concierge</span></h2>
+      <div class="log" id="chainlog" style="max-height:340px"></div>
     </div>
   </div>
 
@@ -155,14 +167,16 @@
         <div><label>Currency</label><input id="ccy" value="AUD"></div>
       </div>
       <div class="presets">
-        <button data-amt="500">Payroll · $500</button>
-        <button data-amt="4200">Vendor · $4,200</button>
-        <button data-amt="25000">Large · $25,000</button>
+        <button data-amt="100">Small · $100 (no step-up)</button>
+        <button data-amt="600">Payroll · $600 (step-up → Bob)</button>
+        <button data-amt="2500">Large · $2,500 (hard deny)</button>
       </div>
-      <button class="primary" id="inject">▶ Publish to Kafka topic</button>
+      <button class="primary" id="inject">▶ Publish payment.requested</button>
+      <button class="primary" id="injectOpen" style="margin-top:6px;background:#243044">▶ Publish account.opening.requested</button>
       <div style="font-size:10.5px;color:#4b535d;margin-top:8px;line-height:1.5">
-        Simulates <code>payment.requested</code> landing on the stream — no keyboard, no session.
-        The agent must get Bob's out-of-band approval before it can move money.
+        Simulates an event landing on the stream — no keyboard, no session. The SAME agent chain as the
+        interactive demo runs under Bob's staff authority; payments above AUD&nbsp;500 need Bob's
+        out-of-band approval (the same Ping Authorize step-up Alice gets in her browser).
       </div>
     </div>
 
@@ -175,18 +189,19 @@
 
 <script>
 const STAGES = [
-  {key:'received',    node:'stream',  t:'Payment event on the stream',        s:'Kafka payment.requested → stream-processor → autonomous agent',        ic:'📩'},
-  {key:'ciba_request',node:'ciba',    t:'CIBA backchannel request',           s:'agent → PingFederate · private_key_jwt · FAPI signed request · RAR',    ic:'📡'},
-  {key:'push_sent',   node:'push',    t:'PingOne MFA push',                    s:'PingFederate → PingOne → Bob’s device',                                 ic:'📲'},
-  {key:'awaiting_approval',node:'wait',t:'Awaiting Bob’s approval',            s:'out-of-band · Face ID · the one human touchpoint',                      ic:'⏳'},
-  {key:'token_issued',node:'token',   t:'Delegated token issued',             s:'sub=bob · act={agent} · authorization_details = the payment',           ic:'🎫'},
-  {key:'executing',   node:'pep',     t:'Execute via Kong PEP',               s:'Ping Authorize governs the call · bank-api',                            ic:'🛡️'},
-  {key:'executed',    node:'done',    t:'Payment settled',                     s:'bank-api resource server',                                              ic:'🏦'},
+  {key:'received',     node:'stream', t:'Operation event on the stream',   s:'Kafka payment.requested / account.opening.requested → stream-processor → orchestrator', ic:'📩'},
+  {key:'staff_context',node:'staff',  t:'Bob’s staff context established', s:'PingFederate · sub=bob — the agent chain acts under the staff authority',               ic:'🧑‍💼'},
+  {key:'chain',        node:'chain',  t:'Agent chain runs',                s:'concierge → task agents (A2A) · self-attestation · RFC 8693 exchanges · gateways → Ping Authorize', ic:'🤖'},
+  {key:'stepup_challenge',node:'stepup',t:'Ping Authorize step-up',        s:'the SAME policy as the interactive demo (payment > AUD 500) — resolved by Bob, not Alice', ic:'🛡️'},
+  {key:'push_sent',    node:'push',   t:'Approval push to Bob',            s:'CIBA backchannel · binding_message + RFC 9396 RAR · PingOne MFA',                        ic:'📲'},
+  {key:'awaiting_approval',node:'wait',t:'Awaiting Bob’s approval',        s:'out-of-band · Face ID · the one human touchpoint',                                       ic:'⏳'},
+  {key:'executed',     node:'done',   t:'Operation completed',             s:'retried with the elevated staff token · bank-api · flatten → event-sink',                ic:'🏦'},
 ];
-// stage → pipeline node + whether it's terminal
-const NODE_OF = {received:'stream', ciba_request:'ciba', push_sent:'push',
-  awaiting_approval:'wait', approved:'wait', denied:'wait', token_issued:'token',
-  executing:'pep', executed:'done', halted:'done', error:'done'};
+// stage → pipeline node
+const NODE_OF = {received:'stream', staff_context:'staff', chain:'chain',
+  stepup_challenge:'stepup', ciba_request:'push', push_sent:'push',
+  awaiting_approval:'wait', approved:'wait', denied:'wait',
+  executed:'done', halted:'done', error:'done'};
 
 const pipe = document.getElementById('pipe');
 STAGES.forEach(st => {
@@ -249,18 +264,30 @@ async function decide(decision){
     body:JSON.stringify({paymentId:curPid, decision})});
 }
 
-function renderToken(claims){
+function actChain(act){
+  // Flatten the nested RFC 8693 act chain: {sub:A, act:{sub:B}} → "A ◀ B"
+  const parts=[]; let a=act;
+  while(a && typeof a==='object'){ if(a.sub) parts.push(a.sub); a=a.act; }
+  return parts;
+}
+function renderToken(claims, title){
   $('tokCard').style.display='';
+  $('tokTitle').innerHTML = title || 'Access token';
   const rows = [];
   const push = (k,v)=>rows.push(`<span class="k">${k}</span> = ${v}`);
-  if(claims.sub) push('sub', `<span class="p">${esc(claims.sub)}</span>  <span style="color:var(--muted)">(principal)</span>`);
-  if(claims.act) push('act', `<span class="p">${esc(claims.act.sub||'')}</span>  <span style="color:var(--muted)">(delegate — the agent)</span>`);
-  if(claims.client_id) push('client_id', esc(claims.client_id)+`  <span style="color:var(--muted)">(agent operator)</span>`);
+  if(claims.sub) push('sub', `<span class="p">${esc(claims.sub)}</span>  <span style="color:var(--muted)">(the staff authority — Bob)</span>`);
+  const chain = actChain(claims.act);
+  if(chain.length) push('act', `<span class="p">${esc(chain.join(' ◀ '))}</span>  <span style="color:var(--muted)">(nested delegation chain)</span>`);
+  if(claims.acr) push('acr', esc(claims.acr)+(String(claims.acr).includes('staff-approval')
+      ? `  <span style="color:var(--ok)">(staff approval — Bob authorized out-of-band)</span>` : ''));
+  if(claims.client_id) push('client_id', esc(claims.client_id)+`  <span style="color:var(--muted)">(OAuth client)</span>`);
   if(claims.scope) push('scope', esc(claims.scope));
+  if(claims.aud) push('aud', esc(Array.isArray(claims.aud)?claims.aud.join(','):claims.aud)+`  <span style="color:var(--muted)">(RFC 8707 audience restriction)</span>`);
   if(claims.cnf) push('cnf.jkt', esc(claims.cnf.jkt||'')+`  <span style="color:var(--muted)">(DPoP binding)</span>`);
   let rar='';
-  if(claims.authorization_details) rar = `<div style="margin-top:8px"><span class="k">authorization_details</span> <span style="color:var(--muted)">(RFC 9396 RAR — the governed payment)</span>
-    <pre style="margin-top:4px">${esc(JSON.stringify(claims.authorization_details,null,2))}</pre></div>`;
+  if(claims.authorization_details && claims.authorization_details.length)
+    rar = `<div style="margin-top:8px"><span class="k">authorization_details</span> <span style="color:var(--muted)">(RFC 9396 RAR)</span>
+      <pre style="margin-top:4px">${esc(JSON.stringify(claims.authorization_details,null,2))}</pre></div>`;
   $('tok').innerHTML = `<pre>${rows.join('\n')}</pre>${rar}`;
 }
 
@@ -271,23 +298,55 @@ function logEvent(e){
   log.insertBefore(div, log.firstChild);
 }
 
+let chainSteps = 0;
+function logChainStep(step, detail){
+  $('chainCard').style.display='';
+  const log=$('chainlog');
+  const div=document.createElement('div'); div.className='ev ok';
+  const t = step.title || step.type || 'step';
+  const who = step.agent_label || step.agent || step.role || '';
+  const txt = step.detail || step.text || step.final || detail || '';
+  div.innerHTML=`<div class="badge"></div><div><span class="stg">${esc(t)}</span>${who?` <span style="color:#4b535d;font-size:10px">· ${esc(who)}</span>`:''}<div class="dt">${esc(String(txt).slice(0,300))}</div></div>`;
+  log.appendChild(div); log.scrollTop = log.scrollHeight;
+}
+
 function handle(e){
-  // new payment run → reset the board
+  // new operation run → reset the board
   if(e.stage==='received'){
-    if(e.paymentId!==curPid){ curPid=e.paymentId; resetPipeline(); phoneIdle();
+    if(e.paymentId!==curPid){ curPid=e.paymentId; resetPipeline(); phoneIdle(); chainSteps=0;
+      $('chainlog').innerHTML=''; $('chainCard').style.display='none';
       $('pid').style.display=''; $('pid').textContent=e.paymentId; }
-    if(e.data && e.data.mode) setMode(e.data.mode);
+    if(e.data && e.data.mode) setMode(e.data.mode==='real-push'?'real':'sim');
   }
   if(e.paymentId && e.paymentId!==curPid && e.stage!=='received') return; // ignore stale
-  logEvent(e);
+  if(e.stage!=='chain') logEvent(e);
   const node = NODE_OF[e.stage];
   const cls = e.status==='deny' ? 'deny' : (e.stage==='executed'||e.stage==='approved') ? 'done' : 'active';
 
+  if(e.stage==='staff_context' && e.data && e.data.claims)
+    renderToken(e.data.claims, 'Bob’s STAFF context token <span class="chip">basic scopes</span>');
+  if(e.stage==='chain'){
+    chainSteps++;
+    const step=(e.data&&e.data.step)||{};
+    logChainStep(step, e.detail);
+    // a delegated-token exchange inside the chain → show the nested act chain live.
+    // The concierge's token_exchange steps carry the decoded claims as TOP-LEVEL fields
+    // (sub/act/scope/aud/cnf_jkt), with the full decode under issued_token_decoded.payload.
+    if(step.type==='token_exchange'){
+      const dec = step.issued_token_decoded && (step.issued_token_decoded.payload||step.issued_token_decoded);
+      const claims = (dec && dec.sub) ? dec : {sub: step.sub, act: step.act, scope: step.scope,
+        aud: step.aud, cnf: step.cnf_jkt ? {jkt: step.cnf_jkt} : undefined,
+        acr: step.acr, authorization_details: step.authorization_details};
+      if(claims.sub) renderToken(claims, 'Delegated agent token <span class="chip">RFC 8693 · nested act over Bob</span>');
+    }
+    markNode('chain','active', chainSteps+' steps relayed from the concierge chain');
+    return;
+  }
   if(e.stage==='push_sent') phonePush(e.data||{});
   if(e.stage==='awaiting_approval' && e.data && e.data.interactive) phonePush(e.data||{});
-  if(e.stage==='approved') phoneResolved(true);
+  if(e.stage==='approved'){ phoneResolved(true);
+    if(e.data && e.data.claims) renderToken(e.data.claims, 'Bob’s ELEVATED staff token <span class="chip">acr = staff-approval</span>'); }
   if(e.stage==='denied') phoneResolved(false);
-  if(e.stage==='token_issued' && e.data && e.data.claims) renderToken(e.data.claims);
 
   if(node) markNode(node, cls, e.detail);
   if(e.stage==='executed') markNode('done','done',e.detail);
@@ -304,6 +363,11 @@ $('inject').onclick = async ()=>{
   await fetch('/inject',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({debtorAccount:$('from').value, creditorAccount:$('to').value,
       amount:parseFloat($('amount').value)||0, currency:$('ccy').value})});
+};
+$('injectOpen').onclick = async ()=>{
+  $('injectOpen').disabled=true; setTimeout(()=>$('injectOpen').disabled=false, 1200);
+  await fetch('/inject',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({eventType:'account_opening', customerId:'cust-alice', accountType:'savings'})});
 };
 document.querySelectorAll('.presets button').forEach(b=>b.onclick=()=>{ $('amount').value=b.dataset.amt; });
 </script>

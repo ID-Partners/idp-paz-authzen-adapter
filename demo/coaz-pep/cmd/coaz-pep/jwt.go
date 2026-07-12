@@ -117,6 +117,17 @@ func audString(claims map[string]any) string {
 	return ""
 }
 
+// strClaim returns a top-level string claim ("" when absent or non-string).
+func strClaim(claims map[string]any, name string) string {
+	if claims == nil {
+		return ""
+	}
+	if s, ok := claims[name].(string); ok {
+		return s
+	}
+	return ""
+}
+
 // claimsForCEL returns the decoded claims normalised for COAZ CEL evaluation:
 // object-valued claims that arrive as JSON strings (PingFederate's JWT ATM
 // emits `act` that way) are decoded so expressions like `token.act.sub` work

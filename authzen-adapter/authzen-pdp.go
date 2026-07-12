@@ -496,6 +496,13 @@ func buildPdpDecisionPayload(evalRequest EvaluationRequest) (*PdpPayload, error)
 		if v, ok := ctx["token_aud"]; ok {
 			pdpPayload.Attributes["token_aud"] = fmt.Sprintf("%v", v)
 		}
+		// How the user token was authenticated (acr). The step-up rule admits the autonomous
+		// demo's staff-approval channel (Bob, the agent owner, authorizing out-of-band; acr
+		// urn:northwind:loa:staff-approval) as an alternative to the in-token RAR match,
+		// which an ROPC/CIBA-minted token cannot carry.
+		if v, ok := ctx["user_acr"]; ok {
+			pdpPayload.Attributes["user_acr"] = fmt.Sprintf("%v", v)
+		}
 	}
 
 	// Fine-grained RFC 9396 RAR coverage, pre-computed as booleans. The embedded PDP

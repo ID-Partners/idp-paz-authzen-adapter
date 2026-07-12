@@ -1,24 +1,25 @@
 """Autonomous orchestration agent — headless, stream-triggered, with a live dashboard.
 
-Principal = Bob (a bank employee). For each payment handed in by the stream processor:
-  received → CIBA backchannel (PingFederate → PingOne MFA push to Bob) → Bob approves
-  (Face ID) → delegated token (sub=bob, act={agent}, RAR = the governed payment) →
-  execute the payment through the existing Kong PEP + bank-api.
-
-No human is at a keyboard driving the agent — the trigger is a Kafka payment event. The one
-human touchpoint is Bob's *out-of-band* approval on his phone, which is the whole point:
-an autonomous agent still can't move money until its principal approves THIS payment.
+STAFF-AUTHORIZED MODE: a banking operation lands on Kafka (payment / account opening) and the
+SAME agent chain as the interactive demo executes it — concierge → task agents → gateways →
+Ping Authorize → bank-api. The difference is who authorizes: there is no Alice at a browser.
+BOB — the bank staff member who owns/operates the agent — is the internal authority. His
+identity IS the user context (sub=bob; the delegated tokens grow the same nested act chain
+over it), and when the PDP raises the SAME step-up it raises for Alice (payment > AUD 500),
+the challenge is resolved out-of-band: a CIBA push to Bob's phone instead of a browser
+redirect. Alice remains the ACCOUNT OWNER — her accounts are the resource being operated on.
 
 Every stage is published on an in-memory event bus; `/events` (SSE) streams them to the
-dashboard at `/`, so you can watch a payment flow through the identity plane in real time.
+dashboard at `/`, including the full relayed transcript of the concierge chain.
 
-Two modes:
-  • REAL      — PF_BASE + CIBA_CLIENT_ID set AND SIMULATE=0: performs the actual FAPI-CIBA
-                flow (mirrors demo/ciba-cli/ciba.py) against the live PingFederate/PingOne.
-  • SIMULATE  — the default until the CIBA identity plane is wired (PingOne MFA Integration
-                Kit in PF + Bob's device paired). Scripts the stages and lets you approve/deny
-                as "Bob" from the dashboard's phone mock, minting a real ES256 delegated token
-                so the token panel shows a genuine sub=bob / act={agent} / RAR chain.
+Two approval modes — this switch covers ONLY Bob's phone tap; every token is a real
+PingFederate token and the whole chain/PDP plane is always real:
+  • SIMULATE (default) — the dashboard's phone mock stands in for the push: you approve/deny
+    as Bob, and the approval is swapped for a real PF password-grant token (the staff-approval
+    bridge; acr=urn:northwind:loa:staff-approval).
+  • REAL (SIMULATE=0) — the actual FAPI-CIBA flow (signed request object, login_hint=bob,
+    binding_message + RAR) → PingOne MFA push → Bob approves with Face ID → poll → token.
+    Needs the PingOne MFA Integration Kit configured in PF (Phase F).
 """
 from __future__ import annotations
 
@@ -34,40 +35,46 @@ from pathlib import Path
 import httpx
 import jwt
 from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import ec
 from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("autonomous-agent")
 
+# ── config ────────────────────────────────────────────────────────────────────────
+PF_TOKEN_URL = os.environ.get(
+    "PF_TOKEN_URL", "https://pingfederate.railway.internal:9031/as/token.oauth2")
 PF_BASE = os.environ.get("PF_BASE", "").rstrip("/")
 CIBA_CLIENT_ID = os.environ.get("CIBA_CLIENT_ID", "") or "urn:agent:northwind-autonomous:v1"
-CIBA_KEY_PATH = os.environ.get("CIBA_KEY", "ciba-key.pem")
-BOB_LOGIN_HINT = os.environ.get("BOB_LOGIN_HINT", "bob")
-KONG_BASE = os.environ.get("KONG_BASE", "").rstrip("/")   # payment execution goes through the PEP
+BOB_USERNAME = os.environ.get("BOB_USERNAME", os.environ.get("BOB_LOGIN_HINT", "bob"))
+BOB_PASSWORD = os.environ.get("BOB_PASSWORD", "2Federate")
+CONCIERGE_URL = os.environ.get(
+    "CONCIERGE_URL", "http://bank-agent.railway.internal:8000").rstrip("/")
 RAR_TYPE = os.environ.get("RAR_TYPE", "payment_initiation")
-AGENT_SUB = os.environ.get("AGENT_SUB", "urn:agent:northwind-autonomous:v1")
+BASIC_SCOPE = os.environ.get(
+    "BASIC_SCOPE", "openid banking:accounts:list banking:accounts:originate")
+ELEVATED_SCOPE = os.environ.get("ELEVATED_SCOPE", "banking:payments:transfer")
 
-# Real CIBA only when explicitly enabled AND configured; otherwise simulate so the pipeline
-# and dashboard are demoable before the identity plane is up.
+# SIMULATE covers ONLY Bob's phone tap (mock vs real PingOne MFA push).
 SIMULATE = os.environ.get("SIMULATE", "1").lower() not in ("0", "false", "no")
-REAL_CIBA = (not SIMULATE) and bool(PF_BASE and os.environ.get("CIBA_CLIENT_ID"))
 
 STATIC = Path(__file__).parent / "static"
 app = FastAPI(title="autonomous-agent")
 
-# A throwaway signing key so the SIMULATE mode still mints a genuine ES256 token (the dashboard
-# can decode a real JWT rather than a hand-waved blob). Not a security boundary — sim only.
-_SIM_KEY = ec.generate_private_key(ec.SECP256R1())
-_SIM_PEM = _SIM_KEY.private_bytes(serialization.Encoding.PEM,
-                                  serialization.PrivateFormat.PKCS8,
-                                  serialization.NoEncryption())
+
+def _client_key():
+    """The autonomous client's private_key_jwt signing key: env PEM (Railway) or file (local)."""
+    pem = os.environ.get("CIBA_CLIENT_KEY_PEM")
+    if pem:
+        return serialization.load_pem_private_key(pem.encode(), password=None)
+    with open(os.environ.get("CIBA_KEY", "ciba-key.pem"), "rb") as fh:
+        return serialization.load_pem_private_key(fh.read(), password=None)
+
 
 # ── event bus ─────────────────────────────────────────────────────────────────────
 _subscribers: set[asyncio.Queue] = set()
 _history: list[dict] = []          # recent events, replayed to a freshly-connected dashboard
-_PENDING: dict[str, asyncio.Future] = {}   # paymentId → future resolved by Bob's decision (sim)
+_PENDING: dict[str, asyncio.Future] = {}   # opId → future resolved by Bob's decision (sim)
 
 
 async def emit(pid: str, stage: str, status: str, detail: str, data: dict | None = None) -> None:
@@ -75,7 +82,7 @@ async def emit(pid: str, stage: str, status: str, detail: str, data: dict | None
     evt = {"id": uuid.uuid4().hex[:8], "ts": time.time(), "paymentId": pid,
            "stage": stage, "status": status, "detail": detail, "data": data or {}}
     _history.append(evt)
-    del _history[:-300]
+    del _history[:-400]
     for q in list(_subscribers):
         q.put_nowait(evt)
     log.info("[%s] %s/%s — %s", pid, stage, status, detail)
@@ -85,69 +92,164 @@ def _sse(evt: dict) -> str:
     return f"event: stage\ndata: {json.dumps(evt)}\n\n"
 
 
-# ── RAR + token helpers ─────────────────────────────────────────────────────────────
-def _rar(payment: dict) -> list[dict]:
-    return [{
-        "type": RAR_TYPE,
-        "purpose": RAR_TYPE,
-        "amount": float(payment.get("amount", 0) or 0),
-        "currency": payment.get("currency", "AUD"),
-        "debtorAccount": payment.get("debtorAccount", ""),
-        "creditorAccount": payment.get("creditorAccount", ""),
-    }]
+# ── event → operation ────────────────────────────────────────────────────────────
+def _op_of(event: dict) -> dict:
+    """Normalise a stream event into {id, kind, prompt, payment?}."""
+    kind = (event.get("eventType") or ("account_opening" if event.get("accountType")
+                                       else "payment")).lower()
+    if kind == "account_opening":
+        oid = event.get("requestId") or "open-" + uuid.uuid4().hex[:8]
+        acct = event.get("accountType", "savings")
+        cust = event.get("customerId", "cust-alice")
+        return {"id": oid, "kind": kind, "event": event,
+                "prompt": f"Open a new {acct} account for customer {cust}."}
+    oid = event.get("paymentId") or "pay-" + uuid.uuid4().hex[:8]
+    amt = float(event.get("amount", 0) or 0)
+    cur = event.get("currency", "AUD")
+    frm = event.get("debtorAccount", "CHK-1001")
+    to = event.get("creditorAccount", "SAV-1002")
+    return {"id": oid, "kind": "payment", "event": event,
+            "payment": {"amount": amt, "currency": cur, "from": frm, "to": to},
+            "prompt": f"Move ${amt:g} from my {frm} account to {to}."}
 
 
-def _binding(payment: dict) -> str:
-    r = _rar(payment)[0]
-    return (f"Approve payment {r['amount']:.2f} {r['currency']} "
-            f"from {r['debtorAccount']} to {r['creditorAccount']}")[:100]
+def _rar(p: dict) -> list[dict]:
+    return [{"type": RAR_TYPE, "purpose": RAR_TYPE,
+             "amount": float(p.get("amount", 0) or 0), "currency": p.get("currency", "AUD"),
+             "debtorAccount": p.get("from", ""), "creditorAccount": p.get("to", "")}]
+
+
+def _binding(p: dict) -> str:
+    return (f"Approve payment {float(p.get('amount', 0) or 0):.2f} {p.get('currency','AUD')} "
+            f"from {p.get('from','')} to {p.get('to','')}")[:100]
 
 
 def _decode(token: str) -> dict:
     try:
         parts = token.split(".")
-        pad = lambda s: s + "=" * (-len(s) % 4)
+        pad = lambda s: s + "=" * (-len(s) % 4)  # noqa: E731
         claims = json.loads(base64.urlsafe_b64decode(pad(parts[1])))
-        return {k: claims[k] for k in
-                ("sub", "act", "client_id", "scope", "authorization_details", "cnf", "iss", "exp")
-                if k in claims}
+        out = {k: claims[k] for k in
+               ("sub", "act", "client_id", "scope", "acr", "authorization_details",
+                "aud", "iss", "exp") if k in claims}
+        if isinstance(out.get("act"), str):
+            try:
+                out["act"] = json.loads(out["act"])
+            except Exception:  # noqa: BLE001
+                pass
+        return out
     except Exception:  # noqa: BLE001
         return {}
 
 
-def _mint_sim_token(payment: dict) -> str:
+# ── PF tokens for Bob (the staff authority) ──────────────────────────────────────
+def _assertion(key, endpoint: str) -> str:
     now = int(time.time())
-    claims = {
-        "iss": f"{PF_BASE or 'https://pingfederate.example'}/as (SIMULATED)",
-        "sub": BOB_LOGIN_HINT,                       # the principal — Bob, not the agent
-        "aud": "bank-api",
-        "iat": now, "exp": now + 300, "jti": uuid.uuid4().hex,
-        "client_id": AGENT_SUB,                       # the agent operator (OAuth client)
-        "act": {"sub": AGENT_SUB},                    # delegation, not impersonation
-        "scope": "openid banking:payments:transfer",
-        "authorization_details": _rar(payment),       # RFC 9396 — the governed payment
-        "cnf": {"jkt": "sim-" + uuid.uuid4().hex[:22]},  # DPoP sender-constraint (sim thumbprint)
-    }
-    return jwt.encode(claims, _SIM_PEM, algorithm="ES256", headers={"typ": "at+jwt"})
+    pem = key.private_bytes(serialization.Encoding.PEM,
+                            serialization.PrivateFormat.PKCS8,
+                            serialization.NoEncryption())
+    return jwt.encode(
+        {"iss": CIBA_CLIENT_ID, "sub": CIBA_CLIENT_ID,
+         # PF accepts the token endpoint or the issuer as the assertion audience; the
+         # issuer string in this deployment is the internal https://localhost:9031.
+         "aud": [endpoint, "https://localhost:9031/as/token.oauth2", "https://localhost:9031"],
+         "jti": uuid.uuid4().hex, "iat": now, "exp": now + 120},
+        pem, algorithm="ES256", headers={"kid": "d4c67a35a199"})
 
 
-# ── CIBA: simulated ────────────────────────────────────────────────────────────────
-async def _ciba_sim(payment: dict) -> str | None:
-    pid = payment["paymentId"]
+async def _bob_password_token(scope: str) -> tuple[str | None, str]:
+    """STAFF-APPROVAL BRIDGE (sim mode): a real PF token for Bob via the resource-owner
+    password grant on the autonomous client (private_key_jwt). The PCV-context mapping
+    stamps acr=urn:northwind:loa:staff-approval — the marker the step-up policy accepts
+    as the staff channel's approval evidence."""
+    key = _client_key()
+    data = {"grant_type": "password", "username": BOB_USERNAME, "password": BOB_PASSWORD,
+            "scope": scope,
+            "client_assertion_type": "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+            "client_assertion": _assertion(key, PF_TOKEN_URL)}
+    async with httpx.AsyncClient(timeout=20.0, verify=False) as c:
+        r = await c.post(PF_TOKEN_URL, data=data)
+        if r.status_code != 200:
+            return None, f"PF {r.status_code}: {r.text[:200]}"
+        return r.json()["access_token"], ""
+
+
+# ── REAL CIBA (mirrors demo/ciba-cli/ciba.py; SIMULATE=0, needs the PingOne MFA IK) ──
+async def _ciba_real(pid: str, payment: dict) -> str | None:
+    binding = _binding(payment)
+    ciba_ep = os.environ.get("CIBA_ENDPOINT",
+                             (PF_BASE or PF_TOKEN_URL.rsplit("/as/", 1)[0]) + "/as/bc-auth.ciba")
+    issuer = os.environ.get("ISSUER", "https://localhost:9031")
+    key = _client_key()
+    pem = key.private_bytes(serialization.Encoding.PEM,
+                            serialization.PrivateFormat.PKCS8, serialization.NoEncryption())
+    now = int(time.time())
+    req_claims = {"iss": CIBA_CLIENT_ID, "aud": issuer, "jti": uuid.uuid4().hex,
+                  "iat": now, "exp": now + 300, "nbf": now,
+                  "scope": f"openid {ELEVATED_SCOPE}", "login_hint": BOB_USERNAME,
+                  "binding_message": binding, "authorization_details": _rar(payment)}
+    form = {"request": jwt.encode(req_claims, pem, algorithm="ES256",
+                                  headers={"kid": "d4c67a35a199"}),
+            "client_assertion_type": "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+            "client_assertion": _assertion(key, ciba_ep)}
+    async with httpx.AsyncClient(timeout=30.0, verify=False) as c:
+        r = await c.post(ciba_ep, data=form)
+        if r.status_code != 200:
+            await emit(pid, "denied", "deny",
+                       f"CIBA backchannel request failed: {r.status_code} {r.text[:200]}")
+            return None
+        body = r.json()
+        auth_req_id, interval = body["auth_req_id"], int(body.get("interval", 5))
+        await emit(pid, "push_sent", "ok", "PingOne MFA push sent to Bob's device",
+                   {"binding_message": binding, "expires_in": body.get("expires_in")})
+        await emit(pid, "awaiting_approval", "wait",
+                   "Polling the token endpoint until Bob approves on his phone…", {})
+        deadline = time.time() + int(body.get("expires_in", 300))
+        while time.time() < deadline:
+            await asyncio.sleep(interval)
+            tr = await c.post(PF_TOKEN_URL, data={
+                "grant_type": "urn:openid:params:grant-type:ciba", "auth_req_id": auth_req_id,
+                "client_assertion_type": "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+                "client_assertion": _assertion(key, PF_TOKEN_URL)})
+            if tr.status_code == 200:
+                await emit(pid, "approved", "ok", "Bob approved with Face ID — token issued", {})
+                return tr.json().get("access_token", "")
+            err = (tr.json().get("error")
+                   if tr.headers.get("content-type", "").startswith("application/json")
+                   else tr.text)
+            if err == "authorization_pending":
+                continue
+            if err == "slow_down":
+                interval += 5
+                continue
+            await emit(pid, "denied", "deny", f"CIBA token error: {err}", {})
+            return None
+        await emit(pid, "denied", "deny", "Timed out waiting for Bob's approval", {})
+        return None
+
+
+# ── the approval gate (Bob authorizes the sensitive operation, out-of-band) ─────────
+async def _staff_approval(pid: str, payment: dict) -> str | None:
+    """Returns Bob's ELEVATED token (scope banking:payments:transfer,
+    acr=staff-approval) once he approves — via the real CIBA push, or the dashboard's
+    phone mock + password-grant bridge while the push plane isn't wired."""
+    if not SIMULATE:
+        return await _ciba_real(pid, payment)
     binding = _binding(payment)
     await emit(pid, "ciba_request", "ok",
-               "Backchannel auth request → PingFederate (private_key_jwt, FAPI signed request "
-               "object carrying login_hint=Bob + binding_message + RFC 9396 authorization_details)",
-               {"login_hint": BOB_LOGIN_HINT, "binding_message": binding,
+               "Backchannel authorization → PingFederate (private_key_jwt; login_hint=bob; "
+               "binding_message + RFC 9396 authorization_details = THIS payment). "
+               "[phone tap SIMULATED — the push plane swaps in with the PingOne MFA IK]",
+               {"login_hint": BOB_USERNAME, "binding_message": binding,
                 "authorization_details": _rar(payment)})
-    await asyncio.sleep(0.7)
+    await asyncio.sleep(0.5)
     await emit(pid, "push_sent", "ok",
-               "PingFederate → PingOne MFA → push notification to Bob's device",
+               "Push to Bob's device (dashboard phone mock stands in for PingOne MFA)",
                {"binding_message": binding})
     fut: asyncio.Future = asyncio.get_event_loop().create_future()
     _PENDING[pid] = fut
     await emit(pid, "awaiting_approval", "wait",
-               "Waiting for Bob to approve the payment on his phone (Face ID)…",
+               "Waiting for Bob to approve the payment on his phone…",
                {"binding_message": binding, "interactive": True})
     try:
         decision = await asyncio.wait_for(fut, timeout=180)
@@ -157,119 +259,124 @@ async def _ciba_sim(payment: dict) -> str | None:
         _PENDING.pop(pid, None)
     if decision != "approve":
         await emit(pid, "denied", "deny",
-                   "Bob declined the payment" if decision == "deny" else "Approval timed out",
-                   {})
+                   "Bob DECLINED the payment" if decision == "deny" else "Approval timed out", {})
         return None
-    await emit(pid, "approved", "ok", "Bob approved with Face ID — CIBA poll returns the token", {})
-    return _mint_sim_token(payment)
-
-
-# ── CIBA: real (mirrors demo/ciba-cli/ciba.py; runs only when SIMULATE=0 + configured) ──
-def _pem_key():
-    with open(CIBA_KEY_PATH, "rb") as fh:
-        return serialization.load_pem_private_key(fh.read(), password=None)
-
-
-def _client_assertion(key, aud: str) -> str:
-    now = int(time.time())
-    return jwt.encode({"iss": CIBA_CLIENT_ID, "sub": CIBA_CLIENT_ID, "aud": aud,
-                       "jti": uuid.uuid4().hex, "iat": now, "exp": now + 300},
-                      key.private_bytes(serialization.Encoding.PEM,
-                                        serialization.PrivateFormat.PKCS8,
-                                        serialization.NoEncryption()),
-                      algorithm="ES256")
-
-
-async def _ciba_real(payment: dict) -> str | None:
-    pid = payment["paymentId"]
-    binding = _binding(payment)
-    ciba_ep = os.environ.get("CIBA_ENDPOINT", f"{PF_BASE}/as/bc-auth.ciba")
-    token_ep = os.environ.get("TOKEN_ENDPOINT", f"{PF_BASE}/as/token.oauth2")
-    issuer = os.environ.get("ISSUER", PF_BASE)
-    key = _pem_key()
-    req_claims = {"iss": CIBA_CLIENT_ID, "aud": issuer, "jti": uuid.uuid4().hex,
-                  "iat": int(time.time()), "exp": int(time.time()) + 300, "nbf": int(time.time()),
-                  "scope": "openid banking:payments:transfer", "login_hint": BOB_LOGIN_HINT,
-                  "binding_message": binding, "authorization_details": _rar(payment)}
-    form = {"request": jwt.encode(req_claims, key.private_bytes(
-                serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
-                serialization.NoEncryption()), algorithm="ES256"),
-            "client_assertion_type": "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
-            "client_assertion": _client_assertion(key, ciba_ep)}
-    async with httpx.AsyncClient(timeout=30.0) as c:
-        await emit(pid, "ciba_request", "ok",
-                   f"POST {ciba_ep} (login_hint=Bob, signed request object, RAR)",
-                   {"binding_message": binding, "authorization_details": _rar(payment)})
-        r = await c.post(ciba_ep, data=form)
-        if r.status_code != 200:
-            await emit(pid, "denied", "deny", f"backchannel request failed: {r.status_code} {r.text[:200]}")
-            return None
-        body = r.json()
-        auth_req_id = body["auth_req_id"]
-        interval = int(body.get("interval", 5))
-        await emit(pid, "push_sent", "ok", "PingOne MFA push sent to Bob's device",
-                   {"binding_message": binding, "expires_in": body.get("expires_in")})
-        await emit(pid, "awaiting_approval", "wait", "Polling token endpoint until Bob approves…", {})
-        deadline = time.time() + int(body.get("expires_in", 300))
-        while time.time() < deadline:
-            await asyncio.sleep(interval)
-            tr = await c.post(token_ep, data={
-                "grant_type": "urn:openid:params:grant-type:ciba", "auth_req_id": auth_req_id,
-                "client_assertion_type": "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
-                "client_assertion": _client_assertion(key, token_ep)})
-            if tr.status_code == 200:
-                await emit(pid, "approved", "ok", "Bob approved — delegated token issued", {})
-                return tr.json().get("access_token", "")
-            err = tr.json().get("error") if tr.headers.get("content-type", "").startswith("application/json") else tr.text
-            if err == "authorization_pending":
-                continue
-            if err == "slow_down":
-                interval += 5
-                continue
-            await emit(pid, "denied", "deny", f"token error: {err}", {})
-            return None
-        await emit(pid, "denied", "deny", "timed out waiting for approval", {})
+    token, err = await _bob_password_token(f"openid {ELEVATED_SCOPE}")
+    if not token:
+        await emit(pid, "denied", "deny", f"Elevated staff token failed: {err}", {})
         return None
+    await emit(pid, "approved", "ok",
+               "Bob approved — PingFederate issued his ELEVATED staff token "
+               f"(scope {ELEVATED_SCOPE}, acr=urn:northwind:loa:staff-approval).",
+               {"claims": _decode(token)})
+    return token
 
 
-# ── execution (Kong PEP + bank-api; mocked in sim) ──────────────────────────────────
-async def _execute(token: str, payment: dict) -> dict:
-    pid = payment["paymentId"]
-    if REAL_CIBA and KONG_BASE:
-        async with httpx.AsyncClient(timeout=30.0) as c:
-            r = await c.post(f"{KONG_BASE}/payments",
-                             headers={"Authorization": f"Bearer {token}"}, json=payment)
-            return {"status": r.status_code, "body": r.json() if r.headers.get(
-                "content-type", "").startswith("application/json") else r.text[:300]}
-    await asyncio.sleep(0.6)
-    r = _rar(payment)[0]
-    return {"status": 201, "body": {
-        "paymentId": pid, "state": "SETTLED",
-        "debtorAccount": r["debtorAccount"], "creditorAccount": r["creditorAccount"],
-        "amount": r["amount"], "currency": r["currency"], "simulated": True}}
+# ── drive the concierge chain (the SAME pipeline as the interactive demo) ───────────
+async def _drive_chain(pid: str, prompt: str, token: str, session_id: str) -> dict:
+    """POST the concierge /stream with Bob's token as the user context; relay every
+    transcript step to the dashboard. Returns {outcome: final|scope_challenge|error, ...}."""
+    url = f"{CONCIERGE_URL}/stream"
+    out: dict = {"outcome": "error", "detail": "no events received"}
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=15.0)) as c:
+            async with c.stream("POST", url,
+                                json={"prompt": prompt, "session_id": session_id},
+                                headers={"x-user-token": token}) as r:
+                if r.status_code != 200:
+                    body = (await r.aread()).decode()[:200]
+                    return {"outcome": "error", "detail": f"concierge {r.status_code}: {body}"}
+                buf = ""
+                async for chunk in r.aiter_text():
+                    buf += chunk
+                    while "\n\n" in buf:
+                        frame, buf = buf.split("\n\n", 1)
+                        line = next((l for l in frame.split("\n") if l.startswith("data:")), None)
+                        if not line:
+                            continue
+                        try:
+                            ev = json.loads(line[5:].strip())
+                        except Exception:  # noqa: BLE001
+                            continue
+                        etype = ev.get("type", "")
+                        if etype == "scope_challenge":
+                            return {"outcome": "scope_challenge", "ev": ev}
+                        if etype == "login_challenge":
+                            return {"outcome": "error",
+                                    "detail": "login challenge — Bob's token was not accepted: "
+                                              + str(ev.get("detail", ""))[:200]}
+                        if etype == "final":
+                            out = {"outcome": "final", "final": ev.get("final", "")}
+                            continue
+                        # relay the transcript step verbatim; the dashboard renders it
+                        await emit(pid, "chain", "ok",
+                                   ev.get("title") or ev.get("detail", "")[:140] or etype,
+                                   {"step": ev})
+    except Exception as exc:  # noqa: BLE001
+        return {"outcome": "error", "detail": f"concierge stream failed: {exc}"}
+    return out
 
 
 # ── orchestration ───────────────────────────────────────────────────────────────────
-async def orchestrate(payment: dict) -> None:
-    pid = payment["paymentId"]
+async def orchestrate(event: dict) -> None:
+    op = _op_of(event)
+    pid = op["id"]
+    session_id = "auto-" + pid
     try:
         await emit(pid, "received", "ok",
-                   f"Payment event received from the stream (initiatedBy={payment.get('initiatedBy','?')}) "
-                   "— no human at the keyboard; authorising Bob out-of-band before acting.",
-                   {"payment": payment, "mode": "real" if REAL_CIBA else "simulate"})
-        token = await (_ciba_real(payment) if REAL_CIBA else _ciba_sim(payment))
+                   f"{'Payment' if op['kind'] == 'payment' else 'Account-opening'} event from the "
+                   f"stream (initiatedBy={event.get('initiatedBy', '?')}) — no human at a "
+                   "keyboard. Running the SAME agent chain as the interactive demo, in the "
+                   "context of BOB, the staff member who owns this agent. Alice is the account "
+                   "owner; Bob is the internal authority who approves the operation.",
+                   {"event": event, "kind": op["kind"], "prompt": op["prompt"],
+                    "mode": "real-push" if not SIMULATE else "sim-tap"})
+
+        # 1) Bob's BASIC staff token — the user context for the chain.
+        token, err = await _bob_password_token(BASIC_SCOPE)
         if not token:
-            await emit(pid, "halted", "deny", "Payment NOT executed — no delegated authority.", {})
+            await emit(pid, "error", "deny", f"Could not establish Bob's staff context: {err}", {})
             return
-        await emit(pid, "token_issued", "ok",
-                   "Delegated token issued: sub=bob (principal), act={agent} (delegation, not "
-                   "impersonation), authorization_details = the governed payment.",
-                   {"token": token, "claims": _decode(token)})
-        await emit(pid, "executing", "ok",
-                   "Presenting the delegated token at the Kong PEP → Ping Authorize governs → bank-api.", {})
-        result = await _execute(token, payment)
-        await emit(pid, "executed", "ok" if result.get("status", 500) < 400 else "deny",
-                   f"Payment executed (bank-api {result.get('status')}).", {"result": result})
+        await emit(pid, "staff_context", "ok",
+                   "PingFederate issued Bob's STAFF context token (sub=bob) — the agent chain "
+                   "acts under the staff authority; the delegated tokens grow the same nested "
+                   "act chain over it.",
+                   {"claims": _decode(token)})
+
+        # 2) Drive the concierge chain; resolve at most one step-up via Bob's approval.
+        for attempt in (1, 2):
+            res = await _drive_chain(pid, op["prompt"], token, session_id)
+            if res["outcome"] == "final":
+                await emit(pid, "executed", "ok",
+                           "Operation completed by the agent chain.", {"final": res["final"]})
+                return
+            if res["outcome"] == "scope_challenge" and attempt == 1:
+                ev = res["ev"]
+                pay = ev.get("payment") or (op.get("payment") and {
+                    "amount": op["payment"]["amount"], "currency": op["payment"]["currency"],
+                    "from_account": op["payment"]["from"], "to_account": op["payment"]["to"]})
+                payment = {"amount": (pay or {}).get("amount", 0),
+                           "currency": (pay or {}).get("currency", "AUD"),
+                           "from": (pay or {}).get("from_account", ""),
+                           "to": (pay or {}).get("to_account", "")}
+                await emit(pid, "stepup_challenge", "wait",
+                           "Ping Authorize raised the SAME step-up as the interactive demo "
+                           f"(scope {ev.get('scope', ELEVATED_SCOPE)}) — resolving it via BOB's "
+                           "out-of-band approval instead of a browser redirect.",
+                           {"scope": ev.get("scope"), "detail": ev.get("detail"),
+                            "payment": pay})
+                elevated = await _staff_approval(pid, payment)
+                if not elevated:
+                    await emit(pid, "halted", "deny",
+                               "Operation NOT executed — Bob did not approve.", {})
+                    return
+                token = elevated
+                continue
+            await emit(pid, "error", "deny",
+                       f"Chain did not complete: {res.get('detail', res['outcome'])}", {})
+            return
+        await emit(pid, "error", "deny",
+                   "Step-up loop: the chain challenged again after Bob's approval.", {})
     except Exception as exc:  # noqa: BLE001
         log.exception("orchestrate failed")
         await emit(pid, "error", "deny", f"orchestration error: {exc}", {})
@@ -278,9 +385,9 @@ async def orchestrate(payment: dict) -> None:
 # ── routes ──────────────────────────────────────────────────────────────────────────
 @app.get("/ping")
 def ping() -> dict:
-    return {"status": "ok", "principal": BOB_LOGIN_HINT,
-            "mode": "real" if REAL_CIBA else "simulate",
-            "ciba_configured": bool(PF_BASE and os.environ.get("CIBA_CLIENT_ID"))}
+    return {"status": "ok", "staff_authority": BOB_USERNAME,
+            "mode": "real-push" if not SIMULATE else "sim-tap",
+            "concierge": CONCIERGE_URL, "pf_token_url": PF_TOKEN_URL}
 
 
 @app.get("/")
@@ -295,8 +402,9 @@ async def events(request: Request) -> StreamingResponse:
 
     async def gen():
         try:
-            yield f"event: hello\ndata: {json.dumps({'mode': 'real' if REAL_CIBA else 'simulate'})}\n\n"
-            for e in _history[-60:]:               # replay the current/last run
+            yield ("event: hello\ndata: "
+                   + json.dumps({"mode": "real-push" if not SIMULATE else "sim-tap"}) + "\n\n")
+            for e in _history[-120:]:              # replay the current/last run
                 yield _sse(e)
             while True:
                 try:
@@ -317,35 +425,41 @@ async def events(request: Request) -> StreamingResponse:
 async def process(request: Request) -> JSONResponse:
     """Stream-processor entrypoint: trigger orchestration, return immediately (the dashboard
     watches progress over SSE)."""
-    payment = await request.json()
-    payment.setdefault("paymentId", "pay-" + uuid.uuid4().hex[:8])
-    asyncio.create_task(orchestrate(payment))
-    return JSONResponse(status_code=202, content={"paymentId": payment["paymentId"], "status": "processing"})
+    event = await request.json()
+    op = _op_of(event)
+    asyncio.create_task(orchestrate(event))
+    return JSONResponse(status_code=202, content={"paymentId": op["id"], "status": "processing"})
 
 
 @app.post("/inject")
 async def inject(request: Request) -> JSONResponse:
-    """Dashboard 'inject a payment' button — same path as a Kafka event, minus Kafka."""
+    """Dashboard 'inject' button — same path as a Kafka event, minus Kafka."""
     body = {}
     try:
         body = await request.json()
     except Exception:  # noqa: BLE001
         pass
-    payment = {
-        "paymentId": "pay-" + uuid.uuid4().hex[:8],
-        "debtorAccount": body.get("debtorAccount", "CHK-1001"),
-        "creditorAccount": body.get("creditorAccount", "SAV-2002"),
-        "amount": float(body.get("amount", 500)),
-        "currency": body.get("currency", "AUD"),
-        "initiatedBy": body.get("initiatedBy", "batch:payroll-run"),
-    }
-    asyncio.create_task(orchestrate(payment))
-    return JSONResponse(status_code=202, content=payment)
+    if (body.get("eventType") or "").lower() == "account_opening":
+        event = {"eventType": "account_opening",
+                 "requestId": "open-" + uuid.uuid4().hex[:8],
+                 "customerId": body.get("customerId", "cust-alice"),
+                 "accountType": body.get("accountType", "savings"),
+                 "initiatedBy": body.get("initiatedBy", "batch:onboarding")}
+    else:
+        event = {"eventType": "payment",
+                 "paymentId": "pay-" + uuid.uuid4().hex[:8],
+                 "debtorAccount": body.get("debtorAccount", "CHK-1001"),
+                 "creditorAccount": body.get("creditorAccount", "SAV-1002"),
+                 "amount": float(body.get("amount", 600)),
+                 "currency": body.get("currency", "AUD"),
+                 "initiatedBy": body.get("initiatedBy", "batch:payroll-run")}
+    asyncio.create_task(orchestrate(event))
+    return JSONResponse(status_code=202, content=event)
 
 
 @app.post("/sim/decision")
 async def sim_decision(request: Request) -> JSONResponse:
-    """Bob's phone approve/deny in SIMULATE mode."""
+    """Bob's phone approve/deny (the mock tap while the real push plane isn't wired)."""
     body = await request.json()
     pid, decision = body.get("paymentId"), body.get("decision")
     fut = _PENDING.get(pid)

@@ -242,6 +242,11 @@ func (s *server) check(ctx context.Context, conf pepConfig, method, path string,
 			// The agent token's audience (RFC 8707 / FAPI 2.0): the token is minted for THIS
 			// resource only. Forwarded so the policy can see + enforce audience-restriction.
 			"token_aud": audString(claims),
+			// How the user token was authenticated (acr). The autonomous demo's staff channel
+			// (Bob, the agent owner, approving out-of-band) is recognised by the policy via a
+			// staff-approval acr — PF can't attach the RFC 9396 RAR to an ROPC/CIBA-minted
+			// token, so acr + the elevated scope is that channel's step-up evidence.
+			"user_acr": strClaim(uclaims, "acr"),
 		}
 		if ad, ok := uclaims["authorization_details"]; ok && ad != nil {
 			extraContext["authorization_details"] = ad
@@ -297,6 +302,9 @@ func (s *server) check(ctx context.Context, conf pepConfig, method, path string,
 	// The agent token's audience (RFC 8707 / FAPI 2.0) — this token was minted for THIS
 	// resource. Forwarded so the policy can see + enforce that a token is audience-restricted.
 	m.ctx["token_aud"] = audString(claims)
+	// Staff-approval channel marker (see PEP #1) — must match what PEP #1 sends or a payment
+	// authorized at the MCP edge gets re-challenged here.
+	m.ctx["user_acr"] = strClaim(uclaims, "acr")
 	if ad, ok := uclaims["authorization_details"]; ok && ad != nil {
 		m.ctx["authorization_details"] = ad
 		if amt, cred, found := consentedPayment(ad); found {
