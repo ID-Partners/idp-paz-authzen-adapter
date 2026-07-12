@@ -42,14 +42,16 @@ final class MFAManager: ObservableObject {
         // If this device already paired on a previous launch, DON'T show the pairing screen
         // again (re-pairing mints a brand-new PingOne device every time — that's why Bob
         // accumulated several). Reflect the persisted pairing so we reuse the same device.
-        PingOne.getInfo { [weak self] info, error in
+        // Use the labelled `completion:` overload (deviceInfo + errors array) — the unlabelled
+        // getInfo(_:) overload is a different callback shape and makes the call ambiguous.
+        PingOne.getInfo(completion: { [weak self] deviceInfo, errors in
             Task { @MainActor in
-                if info != nil, error == nil {
+                if deviceInfo != nil, (errors == nil || errors!.isEmpty) {
                     self?.state = .paired
                     self?.applyDeviceToken()   // re-assert the push token on the existing device
                 }
             }
-        }
+        })
     }
 
     /// Pair with PingOne using the pairing key minted for Bob (scanned QR or typed).
