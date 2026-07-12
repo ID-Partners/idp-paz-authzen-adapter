@@ -117,7 +117,7 @@ type BuiltRequest struct {
 //   - any field multi-element    -> evaluations API: single-element fields sit
 //     at top level as defaults, multi-element fields are zipped element-wise
 //     into the evaluations array.
-func (cm *CompiledMapping) Build(params, token map[string]any) (*BuiltRequest, error) {
+func (cm *CompiledMapping) Build(params, token map[string]any, extraContext map[string]any) (*BuiltRequest, error) {
 	evalField := func(nodes []*compiledNode) ([]any, error) {
 		out := make([]any, len(nodes))
 		for i, n := range nodes {
@@ -141,6 +141,22 @@ func (cm *CompiledMapping) Build(params, token map[string]any) (*BuiltRequest, e
 	context, err := evalField(cm.context)
 	if err != nil {
 		return nil, err
+	}
+	// Merge gateway-supplied context the mapping can't derive itself (e.g. user_scope
+	// from the logged-in user's X-User-Token, needed by amount/step-up policies). Only
+	// fills keys the mapping didn't set, so declared mappings always win.
+	if len(extraContext) > 0 {
+		for _, cv := range context {
+			m, ok := cv.(map[string]any)
+			if !ok {
+				continue
+			}
+			for k, v := range extraContext {
+				if _, exists := m[k]; !exists {
+					m[k] = v
+				}
+			}
+		}
 	}
 	var action []any
 	if cm.action != nil {

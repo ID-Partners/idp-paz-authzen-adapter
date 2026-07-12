@@ -41,9 +41,10 @@ PRINCIPAL_AGENT_ID = os.environ.get("PRINCIPAL_AGENT_ID", "urn:agent:northwind-c
 # service signs the attestation, PF validates it and issues the token. "local"
 # (default) self-issues an equivalently-shaped token.
 TOKEN_MODE = os.environ.get("TOKEN_MODE", "local").lower()
-ATTESTER_URL = os.environ.get("ATTESTER_URL", "http://attester.railway.internal:8110")
 PF_TOKEN_URL = os.environ.get("PF_TOKEN_URL", "")
-PF_CLIENT_SECRET = os.environ.get("PF_CLIENT_SECRET", "demo-secret-123")
+# No PF_CLIENT_SECRET: agents are PUBLIC clients authenticated by SELF-SIGNED client attestation
+# (stable entity key, public key pre-registered in the AS trust file). No shared attester service,
+# no OpenID Federation, no client secret. (The legacy remote-attester URL is likewise unused.)
 AGENT_CLIENT_ID = os.environ.get("AGENT_CLIENT_ID", "bank-agent")
 AGENT_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-5")
 # The MCP resource this agent calls — the token it mints is audience-scoped to it.
@@ -257,13 +258,16 @@ def _establish_pf(*, agent_id: str, agent_type: str, agent_label: str, role: str
                 "environment": os.environ.get("RAILWAY_ENVIRONMENT_NAME", "production")}
     ad = _authorization_details()
     with httpx.Client(timeout=20.0, verify=False) as c:
-        # 1) Attester service signs the attestation (its key never leaves it).
-        ar = c.post(ATTESTER_URL.rstrip("/") + "/attest",
-                    json={"client_id": agent_id, "cnf": local_jwk,
-                          "workload": workload, "authorization_details": ad})
-        ar.raise_for_status()
-        att = ar.json()
-        attestation = att["attestation"]
+        # 1) SELF-ATTESTATION: the agent signs its OWN client-attestation JWT with its stable
+        #    entity key (AGENT_ENTITY_KEY_PEM). The matching PUBLIC key is pre-registered in the
+        #    AS static trust file (demo/pingfederate/oidf-mock-attesters.json), keyed by the
+        #    agent's client_id — so PF resolves iss=client_id → that key and verifies the
+        #    signature. No attester service, no OpenID Federation, no client secret.
+        att = mint_agent_attestation(
+            client_id=agent_id, agent_id=agent_id, agent_type=agent_type,
+            principal_sub=PRINCIPAL_SUB, agent_public_jwk=local_jwk,
+            authorization_details=ad)
+        attestation = att.jwt
         # 2) Present the attestation + a DPoP proof to PingFederate's token endpoint.
         dpop = jwt.encode({"htm": "POST", "htu": PF_TOKEN_URL,
                            "jti": str(uuid.uuid4()), "iat": now},
@@ -275,22 +279,28 @@ def _establish_pf(*, agent_id: str, agent_type: str, agent_label: str, role: str
         # concierge token is rejected as a subject. That needs the agent ATMs to stamp iss first;
         # until then the nested act comes from the per-agent ATM mapping, not from re-exchange.)
         subject_token = user_token or delegator_token
-        # Carry Alice's consented payment (RFC 9396 RAR) from her subject token onto
-        # this exchange, so PingFederate can bind the delegated token to the SAME
-        # governed authority (RFC 8693: issued authority ⊆ the subject's grant).
+        # Read Alice's consented payment RAR from her subject token FOR DISPLAY ONLY.
+        # We do NOT re-send authorization_details on the exchange: PF's token-exchange grant has
+        # no RAR processor, so any authorization_details → 400 invalid_authorization_details (and
+        # for a non-payment agent like account-opening it's the wrong RAR entirely). The payment
+        # RAR is governed once, at Alice's consent (the authorization endpoint), not per hop.
         subject_ad = _subject_authorization_details(user_token)
+        # NO client_secret: the agent is a PUBLIC client (PF client_auth = NONE) authenticated
+        # by client attestation (attest_jwt_client_auth_dpop) — the attester-signed
+        # OAuth-Client-Attestation JWT + the DPoP proof (cnf-bound key) below ARE the client
+        # credential. PF enforces it via the validateClientAttestation issuance criterion on the
+        # exchange mapping; a request without a valid attestation is refused. The agent clients
+        # are token-exchange-only (no CLIENT_CREDENTIALS grant — PF forbids NONE auth with it),
+        # so the real flow always exchanges a subject token (Alice's login, or the delegator's).
         if subject_token:
             grant = "urn:ietf:params:oauth:grant-type:token-exchange"
             data = {"grant_type": grant,
                     "subject_token": subject_token,
                     "subject_token_type": "urn:ietf:params:oauth:token-type:access_token",
-                    "client_id": agent_id, "client_secret": PF_CLIENT_SECRET}
-            if subject_ad:
-                data["authorization_details"] = json.dumps(subject_ad)
+                    "client_id": agent_id}
         else:
             grant = "client_credentials"
-            data = {"grant_type": grant, "client_id": agent_id,
-                    "client_secret": PF_CLIENT_SECRET}
+            data = {"grant_type": grant, "client_id": agent_id}
         tr = c.post(PF_TOKEN_URL, data=data,
                     headers={"OAuth-Client-Attestation": attestation, "DPoP": dpop})
         if tr.status_code != 200:
@@ -320,16 +330,18 @@ def _establish_pf(*, agent_id: str, agent_type: str, agent_label: str, role: str
     ad_source = ("issued token" if issued_ad
                  else "carried from Alice's consent (subject token)" if subject_ad else None)
     steps = [
-        {"type": "attestation", "title": "Client attestation (signed by the attester service)",
-         "detail": f"Attester '{att.get('attester_issuer')}' signed an attestation JWT for "
-                   f"{agent_id}, binding its DPoP key (cnf) — the private key stays in the attester.",
-         "attester": att.get("attester_issuer"), "client_id": agent_id, "agent": agent_id,
+        {"type": "attestation", "title": "Client attestation (self-signed, pre-registered key)",
+         "detail": f"{agent_id} self-signed a client-attestation JWT with its stable entity key "
+                   f"(iss = its own client_id), binding its DPoP key (cnf). PingFederate verifies it "
+                   f"against the agent's pre-registered public key — no attester service, no "
+                   f"federation, no client secret.",
+         "attester": att.attester_issuer, "client_id": agent_id, "agent": agent_id,
          "agent_type": agent_type, "local_jkt": local_jkt,
-         "auth_method": "attest_jwt_client_auth_dpop", "typ": (att.get("header") or {}).get("typ"),
-         "workload": (att.get("claims") or {}).get("workload"),
-         "attestation_header": att.get("header"), "attestation_claims": att.get("claims"),
+         "auth_method": "attest_jwt_client_auth_dpop", "typ": att.header.get("typ"),
+         "workload": att.claims.get("workload"),
+         "attestation_header": att.header, "attestation_claims": att.claims,
          "attestation_preview": attestation[:24] + "…" + attestation[-12:],
-         "attester_jwks": att.get("attester_jwks"), "role": role, "mode": "pingfederate"},
+         "attester_jwks": att.attester_jwks, "role": role, "mode": "pingfederate"},
         {"type": "auth", "title": "Agent authenticates to PingFederate",
          "detail": f"{agent_id} authenticated to PingFederate as its own OAuth client using the "
                    f"attestation (attest_jwt_client_auth_dpop) — no client secret exposed to the model.",
@@ -358,6 +370,9 @@ def _establish_pf(*, agent_id: str, agent_type: str, agent_label: str, role: str
                          "subject_token_type": "urn:ietf:params:oauth:token-type:access_token",
                          "client_id": agent_id} if subject_token else None),
          "token_preview": tp, "claims": claims, "token_header": jwt.get_unverified_header(token),
+         "curl": _curl_for(PF_TOKEN_URL, data, attest=True, dpop=True),
+         "subject_token_decoded": _decode_jwt(subject_token) if subject_token else None,
+         "issued_token_decoded": {"header": jwt.get_unverified_header(token), "claims": claims},
          "te_endpoint": PF_TOKEN_URL, "role": role, "agent_label": agent_label, "mode": "pingfederate"},
     ]
     return Credential(access_token=token, principal_sub=claims.get("sub", PRINCIPAL_SUB),
@@ -376,22 +391,45 @@ def exchange_for_events(*, agent_id: str, subject_token: str) -> tuple[str, dict
     local = _new_key()
     local_jwk = _pub_jwk(local)
     with httpx.Client(timeout=20.0, verify=False) as c:
-        ar = c.post(ATTESTER_URL.rstrip("/") + "/attest",
-                    json={"client_id": agent_id, "cnf": local_jwk,
-                          "workload": {"software_id": agent_id, "on_behalf_of": PRINCIPAL_SUB},
-                          "authorization_details": []})
-        ar.raise_for_status()
-        attestation = ar.json()["attestation"]
+        # Self-signed attestation (stable entity key; pre-registered public key) — no attester
+        # service, no federation, no secret. Binds this request's local DPoP key via cnf.
+        attestation = mint_agent_attestation(
+            client_id=agent_id, agent_id=agent_id, agent_type="event-publisher",
+            principal_sub=PRINCIPAL_SUB, agent_public_jwk=local_jwk,
+            authorization_details=[]).jwt
         dpop = jwt.encode({"htm": "POST", "htu": PF_TOKEN_URL, "jti": str(uuid.uuid4()), "iat": now},
                           local, algorithm="ES256", headers={"typ": "dpop+jwt", "jwk": local_jwk})
-        tr = c.post(PF_TOKEN_URL, data={
+        edata = {
             "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
             "subject_token": subject_token,
             "subject_token_type": "urn:ietf:params:oauth:token-type:access_token",
             "resource": EVENTS_AUDIENCE,  # ← selects the events ATM → flatten mapping
-            "client_id": agent_id, "client_secret": PF_CLIENT_SECRET},
-            headers={"OAuth-Client-Attestation": attestation, "DPoP": dpop})
-        tr.raise_for_status()
+            # Public client — attestation (below) is the credential, no client_secret.
+            "client_id": agent_id}
+        curl = _curl_for(PF_TOKEN_URL, edata, attest=True, dpop=True)
+        tr = c.post(PF_TOKEN_URL, data=edata,
+                    headers={"OAuth-Client-Attestation": attestation, "DPoP": dpop})
+        if tr.status_code >= 400:
+            # No flattened token yet — surface the ATTEMPT so the activity log still shows the
+            # audience-scoped event exchange (curl + the nested-act subject going in) and WHY it
+            # can't flatten: the events ATM + act→sub mapping (Terraform flatten.tf) isn't applied.
+            try:
+                body = tr.json()
+            except Exception:  # noqa: BLE001
+                body = tr.text[:400]
+            err = body.get("error") if isinstance(body, dict) else body
+            raise PFExchangeError({
+                "type": "token_exchange_flatten", "pending": True, "role": "task_agent",
+                "agent": agent_id,
+                "title": "Audience-scoped exchange (RFC 8693) → FLATTENED event token (attempt)",
+                "summary": f"PF {tr.status_code}: {err}",
+                "detail": (f"Attempted the audience-scoped flatten exchange for aud={EVENTS_AUDIENCE}: the "
+                           f"agent presents its delegated (nested-act) token and asks PingFederate to promote "
+                           f"the ROOT actor into sub and drop the act chain. PF returned {tr.status_code} "
+                           f"({err}) — the events ATM + act→sub flatten mapping (Terraform flatten.tf) isn't "
+                           f"applied yet, so PF can't mint the flattened token."),
+                "resource": EVENTS_AUDIENCE, "curl": curl,
+                "subject_token_decoded": _decode_jwt(subject_token)})
         token = tr.json()["access_token"]
     claims = jwt.decode(token, options={"verify_signature": False})
     step = {
@@ -402,6 +440,9 @@ def exchange_for_events(*, agent_id: str, subject_token: str) -> tuple[str, dict
                    f"publish the event (deliberately NOT delegation, scoped to this one audience)."),
         "sub": claims.get("sub"), "aud": claims.get("aud"), "has_act": "act" in claims,
         "resource": EVENTS_AUDIENCE, "client_id": claims.get("client_id"),
+        "curl": _curl_for(PF_TOKEN_URL, edata, attest=True, dpop=True),
+        "subject_token_decoded": _decode_jwt(subject_token),
+        "issued_token_decoded": {"header": jwt.get_unverified_header(token), "claims": claims},
         "token_preview": token[:20] + "…" + token[-12:], "claims": claims, "mode": "pingfederate"}
     return token, claims, step
 

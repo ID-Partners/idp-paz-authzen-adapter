@@ -228,8 +228,33 @@ func (s *server) check(ctx context.Context, conf pepConfig, method, path string,
 	// 2b) COAZ (AuthZEN MCP profile): tools/call on an MCP route with a
 	//     declared upstream is evaluated per the tool's x-coaz-mapping.
 	if conf.style == "mcp" && conf.mcpUpstreamURL != "" && isToolsCall(body) {
+		// Carry the logged-in USER's token claims (from X-User-Token) into the COAZ AuthZEN
+		// context — the x-coaz-mapping is derived from the AGENT's token + tool params and
+		// can't see them. The PDP checks these against the request:
+		//   user_scope            — the coarse consented scope (RFC 9068); without it the
+		//                           step-up rule's "user hasn't approved" test always trips → loop.
+		//   authorization_details — the fine-grained RAR (RFC 9396) Alice consented to, carried
+		//                           in her rich JWT (userJwtATM emits it). Lets the policy verify
+		//                           THIS payment is within a consented RAR entry, not just the scope.
+		uclaims := jwtClaims(headers["x-user-token"])
+		extraContext := map[string]any{
+			"user_scope": scopeString(uclaims),
+			// The agent token's audience (RFC 8707 / FAPI 2.0): the token is minted for THIS
+			// resource only. Forwarded so the policy can see + enforce audience-restriction.
+			"token_aud": audString(claims),
+		}
+		if ad, ok := uclaims["authorization_details"]; ok && ad != nil {
+			extraContext["authorization_details"] = ad
+			// Pre-extract the consented payment cap + destination from the RAR so the
+			// policy can do a fine-grained match (amount <= consented, account matches)
+			// with plain comparisons instead of parsing JSON itself.
+			if amt, cred, found := consentedPayment(ad); found {
+				extraContext["consented_amount"] = amt
+				extraContext["consented_creditor"] = cred
+			}
+		}
 		v := s.coaz.CheckToolCall(ctx, conf.mcpUpstreamURL, headers["authorization"],
-			[]byte(body), claimsForCEL(claims))
+			[]byte(body), claimsForCEL(claims), extraContext)
 		if v.CoazTool {
 			toolName := toolCallName(body)
 			if v.JSONRPCError != nil {
@@ -261,20 +286,22 @@ func (s *server) check(ctx context.Context, conf pepConfig, method, path string,
 			sub, act, scope)
 	}
 
-	// 3b) Step-up scope: a sensitive action requires a scope the USER
-	//     consented to (checked on X-User-Token).
-	if conf.stepupScope != "" && m.action == conf.stepupAction {
-		uscope := scopeString(jwtClaims(headers["x-user-token"]))
-		if !strings.Contains(" "+uscope+" ", " "+conf.stepupScope+" ") {
-			log.Printf("[%s] 401 insufficient_scope (%s) %s %s", pep, conf.stepupScope, method, path)
-			return deny(typev3.StatusCode_Unauthorized, codes.Unauthenticated, map[string]any{
-				"error":  "insufficient_scope",
-				"scope":  conf.stepupScope,
-				"pep":    pep,
-				"reason": "This action requires the '" + conf.stepupScope + "' scope; sign in to approve it.",
-			}, map[string]string{
-				"WWW-Authenticate": `Bearer error="insufficient_scope", scope="` + conf.stepupScope + `"`,
-			})
+	// 3b) Carry the USER's consented context (from X-User-Token) into the PDP:
+	//     the coarse scope AND the fine-grained RFC 9396 RAR (authorization_details),
+	//     pre-extracting the consented amount + destination. This MUST match what the
+	//     COAZ/MCP path (PEP #1) sends, or a payment authorized at the MCP edge gets
+	//     re-challenged here at the Bank-API edge (PEP #2) because the RAR context is
+	//     missing → the payment fails downstream and the whole flow loops on step-up.
+	uclaims := jwtClaims(headers["x-user-token"])
+	m.ctx["user_scope"] = scopeString(uclaims)
+	// The agent token's audience (RFC 8707 / FAPI 2.0) — this token was minted for THIS
+	// resource. Forwarded so the policy can see + enforce that a token is audience-restricted.
+	m.ctx["token_aud"] = audString(claims)
+	if ad, ok := uclaims["authorization_details"]; ok && ad != nil {
+		m.ctx["authorization_details"] = ad
+		if amt, cred, found := consentedPayment(ad); found {
+			m.ctx["consented_amount"] = amt
+			m.ctx["consented_creditor"] = cred
 		}
 	}
 
@@ -302,11 +329,30 @@ func (s *server) check(ctx context.Context, conf pepConfig, method, path string,
 		"context":  m.ctx,
 	}
 
-	decision, reason, err := s.evaluate(ctx, authzenReq)
+	decision, reason, stepUp, stepUpScope, err := s.evaluate(ctx, authzenReq)
 	if err != nil {
 		log.Printf("[%s] PDP call failed: %v", pep, err)
 		return denySimple(pep, typev3.StatusCode_ServiceUnavailable, codes.Unavailable,
 			"Authorization service unreachable; denying (fail-closed).", nil)
+	}
+
+	// Step-up obligation from the policy: this payment is over the threshold and
+	// the user hasn't approved it yet. Challenge for the step-up scope (RFC 9470)
+	// so the app can step Alice up, rather than a flat 403.
+	if stepUp {
+		scope := stepUpScope
+		if scope == "" {
+			scope = conf.stepupScope
+		}
+		log.Printf("[%s] 401 step-up required (%s) %s %s", pep, scope, m.action, m.rid)
+		return deny(typev3.StatusCode_Unauthorized, codes.Unauthenticated, map[string]any{
+			"error":  "insufficient_scope",
+			"scope":  scope,
+			"pep":    pep,
+			"reason": reason,
+		}, map[string]string{
+			"WWW-Authenticate": `Bearer error="insufficient_scope", scope="` + scope + `"`,
+		})
 	}
 
 	if !decision {
@@ -393,33 +439,60 @@ func checkDpop(pep, scheme, method, path string, headers map[string]string, clai
 	return nil
 }
 
-// evaluate POSTs a single AuthZEN evaluation request to the PDP.
-func (s *server) evaluate(ctx context.Context, authzenReq map[string]any) (bool, string, error) {
+// consentedPayment pulls the amount cap + destination account from the first
+// payment_initiation entry of an RFC 9396 authorization_details value (as decoded
+// from a JWT claim). Returns (amount, creditorAccount, found).
+func consentedPayment(ad any) (float64, string, bool) {
+	arr, ok := ad.([]any)
+	if !ok {
+		return 0, "", false
+	}
+	for _, e := range arr {
+		m, ok := e.(map[string]any)
+		if !ok {
+			continue
+		}
+		if t, _ := m["type"].(string); t != "payment_initiation" {
+			continue
+		}
+		amt, _ := m["amount"].(float64)
+		cred, _ := m["creditorAccount"].(string)
+		return amt, cred, true
+	}
+	return 0, "", false
+}
+
+// evaluate POSTs a single AuthZEN evaluation request to the PDP. It returns the
+// decision, a human reason, and the step-up obligation (whether the policy asks
+// for a step-up challenge, and the scope to challenge for).
+func (s *server) evaluate(ctx context.Context, authzenReq map[string]any) (bool, string, bool, string, error) {
 	payload, _ := json.Marshal(authzenReq)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		s.authzenURL+"/access/v1/evaluation", bytes.NewReader(payload))
 	if err != nil {
-		return false, "", err
+		return false, "", false, "", err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+s.authzenAPIKey)
 	resp, err := s.httpc.Do(req)
 	if err != nil {
-		return false, "", err
+		return false, "", false, "", err
 	}
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return false, "", err
+		return false, "", false, "", err
 	}
 	var data struct {
 		Decision bool `json:"decision"`
 		Context  struct {
-			Reason string `json:"reason"`
+			Reason         string `json:"reason"`
+			StepUpRequired bool   `json:"step_up_required"`
+			StepUpScope    string `json:"step_up_scope"`
 		} `json:"context"`
 	}
 	if err := json.Unmarshal(raw, &data); err != nil {
-		return false, "", fmt.Errorf("bad PDP response (%d): %w", resp.StatusCode, err)
+		return false, "", false, "", fmt.Errorf("bad PDP response (%d): %w", resp.StatusCode, err)
 	}
 	reason := data.Context.Reason
 	if reason == "" {
@@ -429,5 +502,5 @@ func (s *server) evaluate(ctx context.Context, authzenReq map[string]any) (bool,
 			reason = "Denied by policy."
 		}
 	}
-	return data.Decision, reason, nil
+	return data.Decision, reason, data.Context.StepUpRequired, data.Context.StepUpScope, nil
 }

@@ -240,6 +240,11 @@ async def a2a(request: Request):
                 "detail": (f"Event-sink {'accepted' if er.status_code < 400 else 'rejected'} the flattened "
                            f"token (HTTP {er.status_code}) — producer={eclaims.get('sub')}, no act chain."),
                 "response": ebody})
+        except PFExchangeError as exc:
+            # Surface the flatten-exchange ATTEMPT (curl + nested-act subject token + PF error) so the
+            # activity log shows the event-sync token exchange even before the events ATM is applied.
+            exc.diagnostic["agent_label"] = CFG["label"]
+            steps.append(exc.diagnostic)
         except Exception as exc:  # noqa: BLE001
             steps.append({
                 "type": "event_publish_skipped", "role": AGENT_ROLE, "agent_label": CFG["label"],

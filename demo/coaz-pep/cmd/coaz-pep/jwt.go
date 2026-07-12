@@ -95,6 +95,28 @@ func scopeString(claims map[string]any) string {
 	return ""
 }
 
+// audString normalises an `aud` claim that may be a string or an array of
+// strings (RFC 9068 allows both) into a comma-joined string. Used to forward the
+// token's audience to the PDP for RFC 8707 / FAPI 2.0 audience-restriction checks.
+func audString(claims map[string]any) string {
+	if claims == nil {
+		return ""
+	}
+	switch a := claims["aud"].(type) {
+	case string:
+		return a
+	case []any:
+		parts := make([]string, 0, len(a))
+		for _, p := range a {
+			if ps, ok := p.(string); ok {
+				parts = append(parts, ps)
+			}
+		}
+		return strings.Join(parts, ",")
+	}
+	return ""
+}
+
 // claimsForCEL returns the decoded claims normalised for COAZ CEL evaluation:
 // object-valued claims that arrive as JSON strings (PingFederate's JWT ATM
 // emits `act` that way) are decoded so expressions like `token.act.sub` work

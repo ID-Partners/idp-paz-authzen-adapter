@@ -316,26 +316,18 @@ function AuthzenPDP:access(conf)
     return
   end
 
-  -- 3b) Step-up scope: a sensitive action (make_payment) requires a scope the
-  --     USER (Alice) consented to. Check HER token (X-User-Token); if she lacks
-  --     it, return a 401 insufficient_scope challenge so the app can step her up
-  --     at PingFederate to approve the scope, then retry.
-  if conf.stepup_scope and conf.stepup_scope ~= "" and action == (conf.stepup_action or "make_payment") then
+  -- 3b) Carry the USER's (Alice's) consented scope into the PDP context. The step-up
+  --     decision is now the PDP's (see the advice handling after the decision), not a
+  --     hardcoded amount-blind gateway rule: the banking policy compares the payment
+  --     amount to the step-up threshold and checks whether this scope already satisfies
+  --     it, then returns a step_up_required advice the gateway honours below. Small
+  --     payments below the threshold flow without any step-up.
+  do
     local ut = kong.request.get_header("x-user-token")
     local uclaims = ut and jwt_claims(ut) or nil
     local uscope = uclaims and (uclaims.scope or uclaims.scp) or ""
     if type(uscope) == "table" then uscope = table.concat(uscope, " ") end
-    if not string.find(" " .. uscope .. " ", " " .. conf.stepup_scope .. " ", 1, true) then
-      return kong.response.exit(401, {
-        error = "insufficient_scope",
-        scope = conf.stepup_scope,
-        pep = pep,
-        reason = "This action requires the '" .. conf.stepup_scope .. "' scope; sign in to approve it.",
-      }, {
-        ["Content-Type"] = "application/json",
-        ["WWW-Authenticate"] = 'Bearer error="insufficient_scope", scope="' .. conf.stepup_scope .. '"',
-      })
-    end
+    ctx.user_scope = uscope
   end
 
   local authzen_req = {
@@ -373,8 +365,8 @@ function AuthzenPDP:access(conf)
   end
   local data = cjson.decode(res.body) or {}
   local decision = data.decision == true
-  local reason = (type(data.context) == "table" and data.context.reason) or
-                 (decision and "Permitted by policy." or "Denied by policy.")
+  local dctx = (type(data.context) == "table" and data.context) or {}
+  local reason = dctx.reason or (decision and "Permitted by policy." or "Denied by policy.")
 
   -- surface the decision on the response for the demo transcript
   local pdp_ctx = kong.ctx.plugin
@@ -382,6 +374,22 @@ function AuthzenPDP:access(conf)
   pdp_ctx.decision = decision and "PERMIT" or "DENY"
   pdp_ctx.reason = reason
   pdp_ctx.action = action
+
+  -- Step-up advice from the policy: this payment is over the threshold and the user
+  -- hasn't approved it yet. Challenge for the step-up scope (RFC 9470) so the app can
+  -- step Alice up, rather than a flat 403.
+  if dctx.step_up_required then
+    local scope_req = dctx.step_up_scope or conf.stepup_scope or ""
+    return kong.response.exit(401, {
+      error = "insufficient_scope",
+      scope = scope_req,
+      pep = pep,
+      reason = reason,
+    }, {
+      ["Content-Type"] = "application/json",
+      ["WWW-Authenticate"] = 'Bearer error="insufficient_scope", scope="' .. scope_req .. '"',
+    })
+  end
 
   if not decision then
     return deny(pep, 403, reason)

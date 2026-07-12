@@ -1,3 +1,41 @@
 {
-  "https://attester.example.com": { "keys": [ {"kty":"EC","kid":"mock-attester-1","x":"c2pTtxD_E2ZGIMam9QGsiDvlY57axE9Q9LKSnidQUag","y":"ZI_wiUp0BUd_Gmi9412cAet7vBMhi4fkwclL_ujlTSI","crv":"P-256"} ] }
+  "urn:agent:northwind-payments:v1": {
+    "keys": [
+      {
+        "kty": "EC",
+        "kid": "_enL49iVqTtX57o0NTdsp53TRq0EFDdMpqJVHFrMMGc",
+        "crv": "P-256",
+        "x": "QBVWiDRdyBLcsHldAMPIUbNAzSW4A3HRWJo0_4fVG5E",
+        "y": "inSDqOYHekJoZV0qgFJ0AUIzWScJKeleYxscaz4JbxQ",
+        "use": "sig",
+        "alg": "ES256"
+      }
+    ]
+  },
+  "urn:agent:northwind-account:v1": {
+    "keys": [
+      {
+        "kty": "EC",
+        "kid": "jPYOdEkt018H-xF6-Wbt0fOAnVjoeBpvqdcxVq8TK6c",
+        "crv": "P-256",
+        "x": "Qxa6LJSEIiFbPBLuK4KxcFSikCO6JNsxnrfkInMrGsY",
+        "y": "xhb8zm1dsfj6KyDFEW28LT4kYk-qKIm_rvskcJfBCS0",
+        "use": "sig",
+        "alg": "ES256"
+      }
+    ]
+  },
+  "urn:agent:northwind-concierge:v1": {
+    "keys": [
+      {
+        "kty": "EC",
+        "kid": "PFO9-8jE7Mq6LMkDJ7YCzQgeZQ_Bh2CDOdyCo8XTq-4",
+        "crv": "P-256",
+        "x": "sRHA9ELX8g2btEYlgJ_xRQou3AsCJJHKMMey_XHc16k",
+        "y": "rLXZRspBK7xduJyC8or-gwnpmN1rAlvsNr4De--K32w",
+        "use": "sig",
+        "alg": "ES256"
+      }
+    ]
+  }
 }

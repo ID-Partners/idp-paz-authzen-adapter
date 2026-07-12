@@ -1,0 +1,52 @@
+# XcodeGen spec → generates IDPApprover.xcodeproj (with the PingOne MFA SDK, push
+# capability, Face ID usage, and the bundle id already wired).
+#
+#   cd demo/ios-approver
+#   brew install xcodegen        # once
+#   xcodegen generate
+#   open IDPApprover.xcodeproj   # then set your Team under Signing & Capabilities, run on a device
+name: IDPApprover
+options:
+  bundleIdPrefix: com.idpartners
+  deploymentTarget:
+    iOS: "16.0"
+  createIntermediateGroups: true
+
+packages:
+  PingOneSDK:
+    url: https://github.com/pingidentity/pingone-mobile-sdk-ios.git
+    branch: main
+
+targets:
+  IDPApprover:
+    type: application
+    platform: iOS
+    sources:
+      - IDPApprover
+    dependencies:
+      - package: PingOneSDK
+        product: PingOneSDK
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.idpartners.bankapprover
+        MARKETING_VERSION: "1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        GENERATE_INFOPLIST_FILE: YES
+        CODE_SIGN_STYLE: Automatic
+        # Apple Team JH6RX4DRG2 = makefish pty ltd (the one Xcode can provision + that owns the
+        # APNs key RPKF256D8Y + the PingOne Native app). The cert's "(64QD2PMH2S)" label is not a
+        # usable team on this Mac (no Xcode account for it).
+        DEVELOPMENT_TEAM: "JH6RX4DRG2"
+        CODE_SIGN_IDENTITY: "Apple Development"
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        INFOPLIST_KEY_NSFaceIDUsageDescription: "Approve payments with Face ID"
+        INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
+    info:
+      path: IDPApprover/Info.plist
+      properties:
+        UIBackgroundModes: [remote-notification]
+        NSFaceIDUsageDescription: "Approve payments with Face ID"
+    entitlements:
+      path: IDPApprover/IDPApprover.entitlements
+      properties:
+        aps-environment: development

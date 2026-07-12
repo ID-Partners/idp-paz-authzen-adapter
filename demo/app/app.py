@@ -398,6 +398,12 @@ GATEWAY_LABEL = os.environ.get("GATEWAY_LABEL", "Kong")
 MCP_TOOLS_URL = os.environ.get("MCP_TOOLS_URL",
                                "http://bank-mcp.railway.internal:8090/mcp")
 
+# The AuthZEN PDP adapter (the front door to Ping Authorize's governance engine).
+# Its /pdp/events SSE stream feeds the UI's live "PDP decisions" sidebar so you can
+# watch each PERMIT / DENY / step-up as the demo runs.
+ADAPTER_URL = os.environ.get("ADAPTER_URL",
+                             "http://authzen-adapter.railway.internal:8080").rstrip("/")
+
 
 @app.get("/coaz/tools")
 async def coaz_tools():
@@ -417,6 +423,35 @@ async def coaz_tools():
         return JSONResponse({"tools": data.get("result", {}).get("tools", [])})
     except Exception as exc:  # noqa: BLE001 - popup is informational
         return JSONResponse({"error": str(exc), "tools": []}, status_code=502)
+
+
+@app.get("/pdp/stream")
+async def pdp_stream():
+    """Proxy the adapter's live decision SSE feed to the browser's PDP sidebar.
+    Each event is one Ping Authorize decision (PERMIT / DENY / step-up)."""
+    async def gen():
+        try:
+            async with httpx.AsyncClient(timeout=None) as c:
+                async with c.stream("GET", ADAPTER_URL + "/pdp/events") as r:
+                    async for chunk in r.aiter_raw():
+                        yield chunk
+        except Exception as exc:  # noqa: BLE001 - sidebar is informational
+            yield ("event: error\ndata: " +
+                   json.dumps({"error": str(exc)}) + "\n\n").encode()
+
+    return StreamingResponse(gen(), media_type="text/event-stream", headers={
+        "Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"})
+
+
+@app.get("/pdp/recent")
+async def pdp_recent():
+    """One-shot snapshot of recent PDP decisions (polling fallback for the sidebar)."""
+    try:
+        async with httpx.AsyncClient(timeout=8) as c:
+            r = await c.get(ADAPTER_URL + "/pdp/recent")
+        return JSONResponse(r.json())
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse({"error": str(exc), "events": []}, status_code=502)
 
 
 @app.get("/")

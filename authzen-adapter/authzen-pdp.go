@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -72,6 +73,11 @@ type Evaluation struct {
 type EvaluationResponse struct {
 	Decision bool     `json:"decision"`          // Required
 	Context  *Context `json:"context,omitempty"` // Optional
+	// RawPDP is the verbatim governance-engine response body from PingAuthorize —
+	// the same JSON record the product writes to its policy-decision log (id,
+	// deploymentPackageId, decision, statements/advice, status). Surfaced to the
+	// UI's PDP-decisions panel as proof; never sent on the AuthZEN wire.
+	RawPDP string `json:"-"`
 }
 
 type PdpPayload struct {
@@ -436,6 +442,13 @@ func buildPdpDecisionPayload(evalRequest EvaluationRequest) (*PdpPayload, error)
 	pdpPayload.Attributes["resourceType"] = evalRequest.Resource.Type
 	pdpPayload.Attributes["resourceId"] = evalRequest.Resource.ID
 	pdpPayload.Attributes["agentId"] = evalRequest.Subject.ID
+	// The payment's destination account — the policy compares it to the consented
+	// creditorAccount in the RAR (authorization_details) for a fine-grained match.
+	if evalRequest.Resource.Properties != nil {
+		if v, ok := evalRequest.Resource.Properties["to_account"]; ok {
+			pdpPayload.Attributes["to_account"] = fmt.Sprintf("%v", v)
+		}
+	}
 	if evalRequest.Subject.Properties != nil {
 		if v, ok := evalRequest.Subject.Properties["on_behalf_of"]; ok {
 			pdpPayload.Attributes["onBehalfOf"] = fmt.Sprintf("%v", v)
@@ -455,7 +468,58 @@ func buildPdpDecisionPayload(evalRequest EvaluationRequest) (*PdpPayload, error)
 		if v, ok := ctx["channel"]; ok {
 			pdpPayload.Attributes["channel"] = fmt.Sprintf("%v", v)
 		}
+		// The logged-in user's (Alice's) consented scopes, forwarded by the gateway.
+		// The banking policy reads this to decide whether a large payment already has
+		// step-up approval (banking:payments:transfer).
+		if v, ok := ctx["user_scope"]; ok {
+			pdpPayload.Attributes["user_scope"] = fmt.Sprintf("%v", v)
+		}
+		// The fine-grained RAR (RFC 9396 authorization_details) Alice consented to, from her
+		// rich JWT. Passed as a JSON string so the policy can verify THIS payment is within a
+		// consented authorization_details entry (amount/account), not just the coarse scope.
+		if v, ok := ctx["authorization_details"]; ok && v != nil {
+			if b, err := json.Marshal(v); err == nil {
+				pdpPayload.Attributes["authorization_details"] = string(b)
+			}
+		}
+		// Pre-extracted consented cap + destination from the RAR (the gateway parsed the
+		// payment_initiation entry) so the policy matches with plain comparisons.
+		if v, ok := ctx["consented_amount"]; ok {
+			pdpPayload.Attributes["consented_amount"] = fmt.Sprintf("%v", v)
+		}
+		if v, ok := ctx["consented_creditor"]; ok {
+			pdpPayload.Attributes["consented_creditor"] = fmt.Sprintf("%v", v)
+		}
+		// The presented token's audience (RFC 8707 / FAPI 2.0). The policy verifies the
+		// token was minted for this resource (audience-restricted), not a bearer token
+		// replayable anywhere. Forwarded from the gateway, which decoded the token.
+		if v, ok := ctx["token_aud"]; ok {
+			pdpPayload.Attributes["token_aud"] = fmt.Sprintf("%v", v)
+		}
 	}
+
+	// Fine-grained RFC 9396 RAR coverage, pre-computed as booleans. The embedded PDP
+	// (PingAuthorize 11.0.0.2) cannot compare two attributes to each other, so we do the
+	// amount/account match here and hand the policy plain booleans it compares to a constant:
+	//   rar_amount_ok   — this payment's amount is within a consented cap (cap>0 && amount<=cap)
+	//   rar_creditor_ok — this payment's destination matches the consented creditor account
+	// Both false when there is no consent, so an uncovered payment steps up.
+	attrStr := func(k string) string {
+		if v, ok := pdpPayload.Attributes[k]; ok {
+			return fmt.Sprintf("%v", v)
+		}
+		return ""
+	}
+	amtOK := false
+	if amt, err1 := strconv.ParseFloat(attrStr("amount"), 64); err1 == nil {
+		if cap, err2 := strconv.ParseFloat(attrStr("consented_amount"), 64); err2 == nil {
+			amtOK = cap > 0 && amt <= cap
+		}
+	}
+	toAcct, cred := attrStr("to_account"), attrStr("consented_creditor")
+	credOK := cred != "" && toAcct == cred
+	pdpPayload.Attributes["rar_amount_ok"] = strconv.FormatBool(amtOK)
+	pdpPayload.Attributes["rar_creditor_ok"] = strconv.FormatBool(credOK)
 
 	log.Println("Successfully built PdpPayload")
 	log.Printf("PdpPayload: %+v\n", pdpPayload)
@@ -598,20 +662,48 @@ func makeAuthorizationDecisionRequest(pdpPayload *PdpPayload) ([]EvaluationRespo
 
 	var evalResponse EvaluationResponse
 	evalResponse.Decision = authorized
+	evalResponse.RawPDP = string(body) // verbatim PingAuthorize decision record
 
-	// Optionally add context if there is a reason for the decision. Prefer an
-	// explicit "reason"; otherwise surface the first policy statement payload
-	// (how PingAuthorize policies communicate advice back to the caller).
-	if reason, exists := responsePayload["reason"]; exists {
-		context := Context{"reason": reason}
-		evalResponse.Context = &context
-	} else if stmts, ok := responsePayload["statements"].([]interface{}); ok && len(stmts) > 0 {
-		if st, ok := stmts[0].(map[string]interface{}); ok {
-			if p, ok := st["payload"].(string); ok && p != "" {
-				context := Context{"reason": p}
-				evalResponse.Context = &context
+	// Build the response context. First scan policy statements for the step-up advice
+	// (code "step-up-required"): its JSON payload carries {step_up, scope, message}. When
+	// present, surface step_up_required + step_up_scope so the gateway issues an RFC 9470
+	// step-up (insufficient_scope) challenge instead of a flat 403. Otherwise fall back to
+	// a plain reason (explicit "reason", else the first statement payload) — how
+	// PingAuthorize policies communicate advice back to the caller.
+	ctx := Context{}
+	if stmts, ok := responsePayload["statements"].([]interface{}); ok {
+		for _, s := range stmts {
+			st, ok := s.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			if code, _ := st["code"].(string); code == "step-up-required" {
+				ctx["step_up_required"] = true
+				var pj map[string]interface{}
+				if payload, _ := st["payload"].(string); json.Unmarshal([]byte(payload), &pj) == nil {
+					if sc, ok := pj["scope"].(string); ok {
+						ctx["step_up_scope"] = sc
+					}
+					if msg, ok := pj["message"].(string); ok {
+						ctx["reason"] = msg
+					}
+				}
 			}
 		}
+	}
+	if _, hasReason := ctx["reason"]; !hasReason {
+		if reason, exists := responsePayload["reason"]; exists {
+			ctx["reason"] = reason
+		} else if stmts, ok := responsePayload["statements"].([]interface{}); ok && len(stmts) > 0 {
+			if st, ok := stmts[0].(map[string]interface{}); ok {
+				if p, ok := st["payload"].(string); ok && p != "" {
+					ctx["reason"] = p
+				}
+			}
+		}
+	}
+	if len(ctx) > 0 {
+		evalResponse.Context = &ctx
 	}
 
 	return []EvaluationResponse{evalResponse}, nil
@@ -745,6 +837,11 @@ func handleEvaluationRequest(w http.ResponseWriter, r *http.Request) {
 	decisionJSON, _ := json.MarshalIndent(decision, "", "  ")
 	log.Printf("DEBUG: Authorization Decision Response:\n%s\n", decisionJSON)
 
+	// Feed the live PDP-decisions sidebar (best-effort, never blocks).
+	if len(decision) > 0 {
+		feed.publish(pdpEventFrom(pdpPayload, decision[0]))
+	}
+
 	// Send Response. The AuthZEN single-evaluation endpoint returns a single
 	// decision OBJECT ({"decision":bool,"context":{...}}) — NOT an array — so
 	// callers (e.g. the Kong PEP) can read `.decision` directly.
@@ -803,6 +900,11 @@ func handleEvaluationBatchRequests(evalRequests []EvaluationRequest) ([]Evaluati
 		decisionJSON, _ := json.MarshalIndent(decision, "", "  ")
 		log.Printf("DEBUG: Authorization Decision Response for request %d:\n%s\n", i+1, decisionJSON)
 
+		// Feed the live PDP-decisions sidebar (best-effort, never blocks).
+		for _, d := range decision {
+			feed.publish(pdpEventFrom(pdpPayload, d))
+		}
+
 		results = append(results, decision...)
 	}
 
@@ -820,6 +922,9 @@ func main() {
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprintln(w, "OK")
 	})
+	// Live decision feed for the demo UI's PDP sidebar.
+	http.HandleFunc("/pdp/events", handlePdpEvents)
+	http.HandleFunc("/pdp/recent", handlePdpRecent)
 
 	port := os.Getenv("PORT")
 	if port == "" {

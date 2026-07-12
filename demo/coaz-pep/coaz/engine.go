@@ -62,7 +62,8 @@ func NewEngine(opts Options) *Engine {
 //	authorization — the caller's Authorization header (reused for discovery)
 //	rpcBody       — the raw tools/call JSON-RPC request body
 //	tokenClaims   — decoded claims of the caller's access token
-func (e *Engine) CheckToolCall(ctx context.Context, upstreamURL, authorization string, rpcBody []byte, tokenClaims map[string]any) Verdict {
+//	extraContext  — gateway-supplied context the mapping can't derive (e.g. user_scope)
+func (e *Engine) CheckToolCall(ctx context.Context, upstreamURL, authorization string, rpcBody []byte, tokenClaims map[string]any, extraContext map[string]any) Verdict {
 	var rpc struct {
 		ID     any            `json:"id"`
 		Method string         `json:"method"`
@@ -93,20 +94,35 @@ func (e *Engine) CheckToolCall(ctx context.Context, upstreamURL, authorization s
 			JSONRPCError: jsonRPCError(rpc.ID, CodeMappingError, fmt.Sprintf("COAZ mapping error: %v", dt.mappingErr))}
 	}
 
-	built, err := dt.mapping.Build(rpc.Params, tokenClaims)
+	built, err := dt.mapping.Build(rpc.Params, tokenClaims, extraContext)
 	if err != nil {
 		return Verdict{CoazTool: true, Decision: false,
 			Reason:       fmt.Sprintf("COAZ mapping error: %v", err),
 			JSONRPCError: jsonRPCError(rpc.ID, CodeMappingError, fmt.Sprintf("COAZ mapping error: %v", err))}
 	}
 
-	decision, reason, err := e.evaluate(ctx, built)
+	decision, reason, stepUp, stepUpScope, err := e.evaluate(ctx, built)
 	if err != nil {
 		return Verdict{CoazTool: true, Decision: false, PDPRequest: built.Body,
 			Reason:       fmt.Sprintf("PDP error: %v", err),
 			JSONRPCError: jsonRPCError(rpc.ID, CodePDPError, "Authorization service unavailable")}
 	}
 	if !decision {
+		if stepUp {
+			scope := stepUpScope
+			if scope == "" {
+				scope = "banking:payments:transfer"
+			}
+			// RFC 9470 scope step-up — NOT a hard deny. Encode insufficient_scope + the scope in
+			// the JSON-RPC error message so the MCP client relays it as a scope challenge the app
+			// can turn into a RAR step-up (sign in + consent), rather than narrating a flat denial.
+			msg := "insufficient_scope scope=" + scope
+			if reason != "" {
+				msg += " :: " + reason
+			}
+			return Verdict{CoazTool: true, Decision: false, PDPRequest: built.Body, Reason: msg,
+				JSONRPCError: jsonRPCError(rpc.ID, CodeDenied, msg)}
+		}
 		msg := "Access denied"
 		if reason != "" {
 			msg = "Access denied: " + reason
@@ -122,14 +138,14 @@ func (e *Engine) CheckToolCall(ctx context.Context, upstreamURL, authorization s
 
 // evaluate POSTs the built request to the AuthZEN PDP and folds the
 // decision(s): every decision must be true for a permit.
-func (e *Engine) evaluate(ctx context.Context, built *BuiltRequest) (bool, string, error) {
+func (e *Engine) evaluate(ctx context.Context, built *BuiltRequest) (bool, string, bool, string, error) {
 	endpoint := e.pdp.URL + "/access/v1/evaluation"
 	if built.Batch {
 		endpoint = e.pdp.URL + "/access/v1/evaluations"
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(built.Body))
 	if err != nil {
-		return false, "", err
+		return false, "", false, "", err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if e.pdp.APIKey != "" {
@@ -137,51 +153,54 @@ func (e *Engine) evaluate(ctx context.Context, built *BuiltRequest) (bool, strin
 	}
 	resp, err := e.pdpc.Do(req)
 	if err != nil {
-		return false, "", err
+		return false, "", false, "", err
 	}
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return false, "", err
+		return false, "", false, "", err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return false, "", fmt.Errorf("PDP returned %d", resp.StatusCode)
+		return false, "", false, "", fmt.Errorf("PDP returned %d", resp.StatusCode)
 	}
 
 	type decision struct {
 		Decision bool `json:"decision"`
 		Context  *struct {
-			Reason string `json:"reason"`
+			Reason         string `json:"reason"`
+			StepUpRequired bool   `json:"step_up_required"`
+			StepUpScope    string `json:"step_up_scope"`
 		} `json:"context"`
+	}
+	fold := func(d decision) (bool, string, bool, string) {
+		reason, stepUp, scope := "", false, ""
+		if d.Context != nil {
+			reason, stepUp, scope = d.Context.Reason, d.Context.StepUpRequired, d.Context.StepUpScope
+		}
+		return d.Decision, reason, stepUp, scope
 	}
 	if !built.Batch {
 		var d decision
 		if err := json.Unmarshal(raw, &d); err != nil {
-			return false, "", fmt.Errorf("bad PDP response: %w", err)
+			return false, "", false, "", fmt.Errorf("bad PDP response: %w", err)
 		}
-		reason := ""
-		if d.Context != nil {
-			reason = d.Context.Reason
-		}
-		return d.Decision, reason, nil
+		dec, reason, stepUp, scope := fold(d)
+		return dec, reason, stepUp, scope, nil
 	}
 	var batch struct {
 		Evaluations []decision `json:"evaluations"`
 	}
 	if err := json.Unmarshal(raw, &batch); err != nil {
-		return false, "", fmt.Errorf("bad PDP evaluations response: %w", err)
+		return false, "", false, "", fmt.Errorf("bad PDP evaluations response: %w", err)
 	}
 	if len(batch.Evaluations) == 0 {
-		return false, "", fmt.Errorf("PDP evaluations response was empty")
+		return false, "", false, "", fmt.Errorf("PDP evaluations response was empty")
 	}
 	for _, d := range batch.Evaluations {
 		if !d.Decision {
-			reason := ""
-			if d.Context != nil {
-				reason = d.Context.Reason
-			}
-			return false, reason, nil
+			_, reason, stepUp, scope := fold(d)
+			return false, reason, stepUp, scope, nil
 		}
 	}
-	return true, "", nil
+	return true, "", false, "", nil
 }

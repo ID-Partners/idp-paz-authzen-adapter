@@ -63,9 +63,20 @@ def _b64url(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
 
 
-def _int_to_b64url(n: int) -> str:
-    length = (n.bit_length() + 7) // 8
-    return _b64url(n.to_bytes(length, "big"))
+def _coord(n: int) -> str:
+    # P-256 coordinates are ALWAYS the fixed 32-byte big-endian encoding (RFC 7518 §6.2.1.2),
+    # NOT a minimal-length one — otherwise a coordinate with a leading zero byte would produce a
+    # different `x`/`y` (and RFC 7638 thumbprint) than the pre-registered public key, breaking
+    # verification against demo/pingfederate/oidf-mock-attesters.json.
+    return _b64url(n.to_bytes(32, "big"))
+
+
+def _thumbprint(key: ec.EllipticCurvePrivateKey) -> str:
+    """RFC 7638 JWK thumbprint (the canonical kid) for a P-256 public key."""
+    import hashlib
+    nums = key.public_key().public_numbers()
+    canon = '{"crv":"P-256","kty":"EC","x":"%s","y":"%s"}' % (_coord(nums.x), _coord(nums.y))
+    return _b64url(hashlib.sha256(canon.encode()).digest())
 
 
 def _public_jwk(key: ec.EllipticCurvePrivateKey, *, kid: str | None = None) -> dict[str, str]:
@@ -73,26 +84,31 @@ def _public_jwk(key: ec.EllipticCurvePrivateKey, *, kid: str | None = None) -> d
     jwk = {
         "kty": "EC",
         "crv": "P-256",
-        "x": _int_to_b64url(nums.x),
-        "y": _int_to_b64url(nums.y),
+        "x": _coord(nums.x),
+        "y": _coord(nums.y),
     }
     if kid:
         jwk["kid"] = kid
     return jwk
 
 
-def _load_attester_key() -> ec.EllipticCurvePrivateKey:
-    pem = os.environ.get("ATTESTER_PRIVATE_KEY_PEM")
+def _load_entity_key() -> ec.EllipticCurvePrivateKey:
+    # The agent's STABLE entity key — its pre-registered public key lives in the AS's static
+    # attester-trust file (oidf-mock-attesters.json), keyed by the agent's client_id. The agent
+    # SELF-SIGNS its attestation with this key: no shared attester service, no OpenID Federation,
+    # no client secret. Provided per-service via AGENT_ENTITY_KEY_PEM; if absent (local dev) a
+    # throwaway key is generated (its attestation won't verify against the registered public key).
+    pem = os.environ.get("AGENT_ENTITY_KEY_PEM") or os.environ.get("ATTESTER_PRIVATE_KEY_PEM")
     if pem:
         from cryptography.hazmat.primitives.serialization import load_pem_private_key
         return load_pem_private_key(pem.encode(), password=None)  # type: ignore[return-value]
     return ec.generate_private_key(ec.SECP256R1())
 
 
-# The attester's signing key is process-stable so every attestation this instance
-# issues is verifiable against one published JWK set.
-_ATTESTER_KEY = _load_attester_key()
-_ATTESTER_KID = "attester-" + _b64url(os.urandom(6))
+# The agent's stable self-attestation signing key + its canonical (RFC 7638) kid, which MUST match
+# the kid of the pre-registered public key in the AS trust file.
+_ATTESTER_KEY = _load_entity_key()
+_ATTESTER_KID = _thumbprint(_ATTESTER_KEY)
 
 
 def attester_jwks() -> dict[str, Any]:
@@ -164,8 +180,12 @@ def mint_agent_attestation(*, client_id: str, agent_id: str, agent_type: str,
     """
     now = int(time.time())
     instance_id = instance_id or str(uuid.uuid4())
+    # SELF-ATTESTATION: the agent IS its own attester. iss = the agent's client_id, whose public
+    # key is pre-registered in the AS static trust file — so PF resolves iss → that key and verifies
+    # this attestation's signature against it. No third-party attester, no federation, no secret.
+    issuer = client_id
     claims: dict[str, Any] = {
-        "iss": ATTESTER_ISSUER,                 # the trusted attester
+        "iss": issuer,                          # self: the agent's own client_id (pre-registered key)
         "sub": client_id,                       # the agent client_id (== request client_id)
         "iat": now,
         "exp": now + ATTESTATION_TTL,

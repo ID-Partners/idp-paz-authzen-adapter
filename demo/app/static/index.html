@@ -43,6 +43,21 @@
 
   /* interaction graph */
   .graphwrap { width:100%; overflow-x:auto; margin-bottom:4px; }
+  .gnode { cursor:help; }
+  #gtip { position:fixed; z-index:60; max-width:340px; background:#0b0e12; border:1px solid var(--border);
+          border-radius:9px; padding:10px 12px; box-shadow:0 10px 34px rgba(0,0,0,.55); display:none;
+          pointer-events:auto; }
+  #gtip .gt-t { font-weight:700; font-size:12.5px; }
+  #gtip .gt-sw { color:var(--accent); font-size:11.5px; margin:4px 0 7px; }
+  #gtip .gt-l { color:var(--muted); font-size:9.5px; text-transform:uppercase; letter-spacing:.5px; margin:7px 0 2px; }
+  #gtip .gt-cfg { color:#c9d1d9; font-size:11.5px; line-height:1.5; }
+  #gtip .gt-img { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:10.5px; color:#e0b25c; word-break:break-all; }
+  #gtip .gt-links { display:flex; flex-direction:column; gap:3px; }
+  #gtip .gt-links a { color:var(--accent); font-size:11px; text-decoration:none; }
+  #gtip .gt-links a:hover { text-decoration:underline; }
+  #gtip .gt-sdks { margin:0; padding-left:15px; }
+  #gtip .gt-sdks li { color:#c9d1d9; font-size:11px; line-height:1.5; }
+  #gtip .gt-sdks code { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; color:#8ab4f8; }
   #gwtoggle { display:inline-flex; margin-left:12px; vertical-align:middle; border:1px solid var(--border);
               border-radius:7px; overflow:hidden; text-transform:none; letter-spacing:0; }
   #gwtoggle button { background:var(--panel); color:var(--muted); border:none; padding:3px 11px;
@@ -172,6 +187,11 @@
           font-family:ui-monospace,Menlo,monospace; }
   .rar { margin:8px 10px 10px; }
   .rar pre { background:var(--panel2); border-radius:6px; padding:8px; font-size:11.5px; margin:4px 0 0; }
+  /* Activity log restored after a step-up redirect (the pre-step-up context). */
+  .prior-log { opacity:.82; border-left:2px solid var(--border); padding-left:8px; margin:0 0 4px; }
+  .prior-log > .step { margin-bottom:8px; }
+  .step-divider { text-align:center; font-size:11px; color:#e0b25c; margin:6px 0 10px;
+    border-top:1px dashed rgba(224,178,92,.4); padding-top:8px; }
 
   .decision { display:inline-flex; align-items:center; gap:6px; font-weight:600; font-size:13px;
               padding:2px 8px; border-radius:20px; }
@@ -265,6 +285,57 @@
     border:1px solid var(--border); border-radius:8px; padding:10px; word-break:break-all; }
   .tok-badge { display:inline-block; font-size:11px; padding:2px 8px; border-radius:20px;
     background:rgba(59,130,246,.15); color:#8fbcff; border:1px solid rgba(59,130,246,.35); }
+  /* --- live PDP decisions sidebar ---------------------------------------- */
+  #pdpToggle { position:fixed; top:50%; right:0; transform:translateY(-50%); z-index:70;
+    writing-mode:vertical-rl; background:var(--panel); color:var(--text); border:1px solid var(--border);
+    border-right:none; border-radius:10px 0 0 10px; padding:14px 7px; cursor:pointer; font-size:12px;
+    letter-spacing:.4px; display:flex; align-items:center; gap:9px; box-shadow:-3px 0 14px rgba(0,0,0,.35); }
+  #pdpToggle .dot { writing-mode:horizontal-tb; width:8px; height:8px; border-radius:50%;
+    background:#3fb950; box-shadow:0 0 6px #3fb950; }
+  #pdpToggle .dot.off { background:#6e7681; box-shadow:none; }
+  #pdpDrawer { position:fixed; top:0; right:0; height:100vh; width:400px; max-width:92vw; z-index:71;
+    background:var(--panel2); border-left:1px solid var(--border); transform:translateX(100%);
+    transition:transform .22s ease; display:flex; flex-direction:column; box-shadow:-8px 0 26px rgba(0,0,0,.45); }
+  #pdpDrawer.open { transform:translateX(0); }
+  #pdpDrawer .pd-head { padding:14px 16px; border-bottom:1px solid var(--border);
+    display:flex; align-items:center; justify-content:space-between; gap:8px; }
+  #pdpDrawer .pd-head h3 { margin:0; font-size:14px; display:flex; align-items:center; gap:8px; }
+  #pdpDrawer .pd-head .x { background:none; border:none; color:var(--muted); cursor:pointer; font-size:15px; }
+  .pd-sub { font-size:11.5px; color:var(--muted); padding:8px 16px; border-bottom:1px solid var(--border);
+    display:flex; align-items:center; justify-content:space-between; gap:8px; }
+  .pd-conn { display:inline-flex; align-items:center; gap:6px; }
+  .pd-conn .dot { width:8px; height:8px; border-radius:50%; background:#6e7681; }
+  .pd-conn.live .dot { background:#3fb950; box-shadow:0 0 6px #3fb950; }
+  #pdpList { flex:1; overflow-y:auto; padding:10px 12px; display:flex; flex-direction:column; gap:8px; }
+  .pd-empty { color:var(--muted); font-size:12px; text-align:center; padding:34px 12px; line-height:1.5; }
+  .pd-row { border:1px solid var(--border); border-left-width:3px; border-radius:8px; background:var(--panel);
+    padding:8px 10px; font-size:12px; animation:pdIn .25s ease; }
+  @keyframes pdIn { from { opacity:0; transform:translateY(-4px); } to { opacity:1; transform:none; } }
+  .pd-row.permit { border-left-color:#3fb950; }
+  .pd-row.deny { border-left-color:#f85149; }
+  .pd-row.stepup { border-left-color:#e0b25c; }
+  .pd-row .pd-r1 { display:flex; align-items:center; gap:8px; justify-content:space-between; }
+  .pd-verdict { font-weight:700; font-size:10.5px; padding:1px 7px; border-radius:999px; white-space:nowrap; }
+  .pd-verdict.permit { color:#3fb950; background:rgba(63,185,80,.12); }
+  .pd-verdict.deny { color:#f85149; background:rgba(248,81,73,.12); }
+  .pd-verdict.stepup { color:#e0b25c; background:rgba(224,178,92,.12); }
+  .pd-act { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; color:var(--text); font-weight:600; }
+  .pd-time { color:var(--muted); font-size:10.5px; white-space:nowrap; }
+  .pd-reason { color:var(--muted); margin-top:4px; line-height:1.4; }
+  .pd-attrs { margin-top:5px; display:flex; flex-wrap:wrap; gap:4px; }
+  .pd-attrs .a { background:var(--panel2); border:1px solid var(--border); border-radius:5px; padding:1px 6px;
+    font-size:10.5px; font-family:ui-monospace,SFMono-Regular,Menlo,monospace; color:var(--muted); }
+  .pd-attrs .a b { color:var(--text); font-weight:600; }
+  .pd-raw { margin-top:6px; }
+  .pd-raw summary { cursor:pointer; font-size:10.5px; color:var(--muted); list-style:none;
+    display:inline-flex; align-items:center; gap:6px; user-select:none; }
+  .pd-raw summary::before { content:"⧉"; }
+  .pd-raw summary:hover { color:var(--text); }
+  .pd-raw .pd-did { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; color:#7d8590;
+    background:var(--panel2); border:1px solid var(--border); border-radius:4px; padding:0 5px; }
+  .pd-raw pre { margin:6px 0 0; background:var(--panel2); border:1px solid var(--border); border-radius:6px;
+    padding:8px 10px; font-size:10.5px; line-height:1.45; color:var(--text); overflow-x:auto; white-space:pre;
+    font-family:ui-monospace,SFMono-Regular,Menlo,monospace; max-height:280px; overflow-y:auto; }
 </style>
 </head>
 <body>
@@ -330,6 +401,7 @@
     <svg id="graph" viewBox="0 0 520 624" preserveAspectRatio="xMinYMin meet" role="img"
          aria-label="Interaction graph: Alice delegates to a principal agent, which delegates to a task agent; agents are attested and exchange tokens at the AS, then call the bank through two __GATEWAY__ policy enforcement points backed by Ping Authorize."></svg>
   </div>
+  <div id="gtip" role="tooltip"></div>
   <p class="pdp-note">Alice authorises a <b class="c-a">principal agent</b>, which <b class="c-a">delegates</b> to a task agent.
     At <b>every resource boundary</b> the caller does a <b style="color:#e0b25c">token exchange</b> at PingFederate for a
     token <b>scoped to that resource</b>: each agent exchanges for an <b>MCP-audience</b> token to call PEP&nbsp;#1, and the
@@ -391,6 +463,70 @@
         <div><dt>AuthZEN <span class="std">OpenID</span></dt><dd>Standard request/response for asking a PDP "can this subject do this action on this resource?"</dd></div>
         <div><dt>MCP</dt><dd>Model Context Protocol — how the agent discovers and calls the bank's tools (JSON-RPC).</dd></div>
       </dl>
+    </div>
+  </details>
+
+  <details class="legend">
+    <summary>RAR — how fine-grained payment consent works <span class="std">RFC 9396</span></summary>
+    <div style="padding:0 14px 14px">
+      <p class="ck" style="font-size:12px;line-height:1.55;margin:2px 0 12px">
+        A coarse OAuth <b>scope</b> says <i>"this agent may initiate payments."</i> <b>RAR</b>
+        (<code>authorization_details</code>) says <i>"Alice approved <b>THIS</b> payment — $1,500 from
+        CHK-1001 to SAV-2002"</i> — and <b>Ping Authorize governs it at the moment PingFederate issues
+        the token</b>, not just later at the gateway.
+      </p>
+      <ol style="font-size:12.5px;line-height:1.5;color:var(--text);padding-left:18px;margin:0">
+        <li style="margin-bottom:7px"><b>The agent proposes the payment.</b> The app (BFF) builds an
+          RFC&nbsp;9396 <code>authorization_details</code> entry describing that <em>specific</em> payment
+          (type, amount, currency, debtor + creditor accounts).</li>
+        <li style="margin-bottom:7px"><b>Pushed via PAR</b>
+          (<a href="https://www.rfc-editor.org/rfc/rfc9126" target="_blank">RFC&nbsp;9126</a>) to
+          PingFederate so the payload never rides on the browser URL, and Alice is redirected with
+          <code>prompt=login&nbsp;consent</code> — re-authenticate + consent
+          (<a href="https://www.rfc-editor.org/rfc/rfc9470" target="_blank">RFC&nbsp;9470</a> step-up).</li>
+        <li style="margin-bottom:7px"><b>Governed at issuance.</b> PingFederate's
+          <code>pf-rar-paz-plugin</code> (an <code>AuthorizationDetailProcessor</code>) hands each entry to
+          <b>Ping&nbsp;Authorize</b> → <span style="color:var(--ok);font-weight:600">PERMIT&nbsp;≤&nbsp;AUD&nbsp;2,000</span>
+          / <span style="color:var(--deny);font-weight:600">DENY above</span>. The decision's
+          <code>UserID</code> is <b>Alice</b> (the resource owner, folded in as <code>_principal_sub</code>);
+          the agent is recorded as the <b>actor</b>.</li>
+        <li style="margin-bottom:7px"><b>Alice consents.</b> On PERMIT, the consent page shows the payment
+          <em>attributes</em> (amount, from, to); she approves; the issued <b>token carries the governed
+          <code>authorization_details</code></b>.</li>
+        <li><b>Governed once, not per hop.</b> The RAR is governed at Alice's consent (the authorization
+          endpoint) — it is <b>not</b> re-sent on each agent's RFC&nbsp;8693 exchange (PF's exchange grant
+          has no RAR processor; re-sending it → <code>invalid_authorization_details</code>). Every delegated
+          hop inherits that governed authority via <code>sub=alice</code>.</li>
+      </ol>
+      <div class="ck" style="font-size:11px;margin:12px 0 3px">the <code>authorization_details</code> Alice consents to</div>
+      <pre class="rar" style="white-space:pre">[{
+  "type": "payment_initiation",
+  "amount": 1500.00,
+  "currency": "AUD",
+  "debtorAccount": "CHK-1001",
+  "creditorAccount": "SAV-2002"
+}]</pre>
+      <p class="ck" style="font-size:11.5px;line-height:1.5;margin:10px 0 0">
+        <b>Scope + RAR coexist:</b> <code>scope=banking:payments:transfer</code> gates the coarse
+        capability; the RAR pins the specific instance (this amount, this counterparty). You can see it
+        live when you run a payment — the <b>📝&nbsp;Payment authorization</b> step and the delegated-token
+        panel's <code>authorization_details</code>.
+      </p>
+    </div>
+  </details>
+
+  <details class="legend">
+    <summary>Deep dives — how the identity plumbing actually works</summary>
+    <div style="padding:0 14px 14px;font-size:12.5px;line-height:1.55">
+      <p style="color:var(--muted);margin:2px 0 10px">Two write-ups on the novel token-exchange machinery behind this demo:</p>
+      <p style="margin:10px 0">
+        🔗 <a href="/static/docs-token-exchange-nesting.html" target="_blank"><b>Token exchange in PingFederate — nested actor chains</b></a><br>
+        <span style="color:var(--muted);font-size:13px">How each delegation hop is recorded as <code>act</code> nesting (RFC 8693 + RFC 7519 <code>act</code>): the subject-token processor exposes the inbound <code>act</code>, and an OGNL mapping wraps the calling agent around it — delegation, never impersonation.</span>
+      </p>
+      <p style="margin:10px 0">
+        🔗 <a href="/static/docs-act-flatten.html" target="_blank"><b>Ping Authorize policy-based <code>act</code>→<code>sub</code> flatten</b></a><br>
+        <span style="color:var(--muted);font-size:13px">How an audience-scoped exchange promotes the root orchestration agent (innermost <code>act.sub</code>) to <code>sub</code> and drops the chain for the event sink — governed by a Ping Authorize policy so the flip only happens where it's authorized.</span>
+      </p>
     </div>
   </details>
   </div><!-- .col-right -->
@@ -494,20 +630,38 @@ async function ensureAuth(){
 async function showActiveRar(){
   try {
     const t = await fetch('/session/token', {credentials:'include'}).then(r => r.ok ? r.json() : null);
-    const rar = t && t.claims && t.claims.authorization_details;
-    if (rar && rar.length){
-      out.appendChild(el('step tool_result convo',
-        `<div class="label">📝 Payment authorization — RFC 9396 (governed by Ping Authorize)</div>
-         <div class="ck" style="font-size:11px;margin:4px 0 6px">Alice approved THIS specific payment at PingFederate; the issued token carries the governed <code>authorization_details</code>.</div>
-         <div class="rar"><pre>${pretty(rar)}</pre></div>`));
-      autoScroll();
-    }
+    if(!t) return;
+    const claims = (t && t.claims) || {};
+    const rar = claims.authorization_details;
+    const rarBlock = (rar && rar.length)
+      ? `<div class="ck" style="font-size:11px;margin:4px 0 6px">Alice approved THIS specific payment at PingFederate; the issued <b>access token</b> carries the governed <code>authorization_details</code> (RFC 9396).</div>
+         <div class="rar"><div class="ck" style="font-size:11px">authorization_details (RAR) <span class="std">RFC 9396</span> — the consented rich payload</div><pre>${pretty(rar)}</pre></div>`
+      : `<div class="ck" style="font-size:11px;margin:4px 0 6px">The access token PingFederate issued for this step-up (no <code>authorization_details</code> present).</div>`;
+    // The FULL decoded access token that now carries the consented payload — header + claims + raw.
+    const wire = wireDetails('decoded access token — the rich AT Alice consented to (unverified)', [
+      { label:'JOSE header', json: t.header || {} },
+      { label:'claims', desc:'note authorization_details — the consented rich payload', json: claims },
+    ]);
+    out.appendChild(el('step tool_result convo',
+      `<div class="label">📝 Payment authorization — RFC 9396 (governed by Ping Authorize)</div>
+       ${rarBlock}${wire}
+       ${t.token_preview ? `<div class="ck" style="font-size:11px;margin:6px 0 3px">raw access token</div><div class="tok-raw" style="font-size:10px;word-break:break-all">${esc(t.token_preview)}</div>`:''}`));
+    autoScroll();
   } catch(e){}
 }
 function resumePending(){
   const p = sessionStorage.getItem('pending_prompt');
   if(!p) return;
   sessionStorage.removeItem('pending_prompt');
+  // Restore the activity log captured just before the step-up redirect, so the
+  // pre-step-up context (the payment attempt + the authorization_details request)
+  // survives the round-trip to PingFederate instead of being lost on reload.
+  const saved = sessionStorage.getItem('pending_transcript');
+  if(saved){
+    sessionStorage.removeItem('pending_transcript');
+    out.appendChild(el('prior-log', saved));
+    out.appendChild(el('step-divider', '⤵ returned from PingFederate step-up — the same request continues below'));
+  }
   out.appendChild(el('step agent convo', `<div class="label">✅ Signed in with PingFederate</div>Resuming your request…`));
   showActiveRar();
   setTimeout(()=>runPrompt(p), 400);
@@ -669,6 +823,86 @@ const GN = {
   adapter:   {x:188, y:486, ic:'🔌', t:'AuthZEN adapter',  s:'ext_authz → AuthZEN'},
   bankapi:   {x:360, y:562, ic:'🏦', t:'Bank API',        s:'resource server'},
   pdp:       {x:30,  y:562, ic:'⚖️', t:'Ping Authorize',  s:'policy decision point'},
+  eventsink: {x:186, y:562, ic:'📮', t:'Event sink',      s:'flattened token · aud=events'},
+};
+// Per-component software, image/runtime, config + real source/registry links, shown on hover.
+// __GW__ → the current gateway; the PEP/adapter img+links are gateway-dependent (see GW_META).
+const REPO   = 'https://github.com/ID-Partners/idp-paz-authzen-adapter/tree/main/demo';
+const HUB_PY = ['Docker Hub · python','https://hub.docker.com/_/python'];
+const AUTHZEN_SPEC = ['AuthZEN Authorization API 1.0','https://openid.net/specs/authorization-api-1_0-01.html'];
+const GMETA = {
+  alice:     {sw:'Web browser → PingFederate hosted login', img:'— (end-user browser, no container)',
+              cfg:'OIDC authorization-code + PKCE · demo user alice / 2Federate · everyday scopes openid, banking:accounts:list/originate (banking:payments:transfer via RFC 9470 step-up)',
+              links:[['OpenID Connect — how it works','https://openid.net/developers/how-connect-works/']]},
+  principal: {sw:'Python · FastAPI · Anthropic Claude (claude-sonnet-5)', img:'python:3.12-slim',
+              cfg:'OAuth client urn:agent:northwind-concierge:v1 · auth = attest_jwt_client_auth_dpop (no client secret) · fresh DPoP key · A2A + MCP client',
+              sdks:['<code>anthropic</code> — LLM tool-use loop, model claude-sonnet-5',
+                    '<code>mcp</code> — MCP client (streamable HTTP)',
+                    'A2A — JSON-RPC over <code>httpx</code>: agent-card.json + message/send',
+                    '<code>PyJWT</code> + <code>cryptography</code> — EC P-256 DPoP proofs + attestation JWT',
+                    '<code>token_validator</code> — verifies inbound bearer tokens',
+                    '<code>fastapi</code> + <code>uvicorn</code>'],
+              links:[HUB_PY, ['agent code · demo/agent', REPO+'/agent'], ['LLM loop · agent_core.py', REPO+'/agent/agent_core.py'], ['A2A client · a2a_client.py', REPO+'/agent/a2a_client.py']]},
+  account:   {sw:'Python · FastAPI · A2A skill executor (no LLM)', img:'python:3.12-slim',
+              cfg:'client urn:agent:northwind-account:v1 · A2A skills list_accounts · get_balance · open_account · DPoP-bound delegated token',
+              sdks:['A2A server — JSON-RPC over <code>httpx</code>: message/send skills',
+                    '<code>mcp</code> — MCP client → bank tools via PEP #1',
+                    '<code>PyJWT</code> + <code>cryptography</code> — EC P-256 DPoP + RFC 8693 exchange',
+                    '<code>token_validator</code> — verifies inbound bearer tokens',
+                    '<code>fastapi</code> + <code>uvicorn</code>'],
+              links:[HUB_PY, ['agent code · demo/task-agent', REPO+'/task-agent'], ['token exchange · identity.py', REPO+'/task-agent/identity.py']]},
+  payments:  {sw:'Python · FastAPI · A2A skill executor (no LLM)', img:'python:3.12-slim',
+              cfg:'client urn:agent:northwind-payments:v1 · A2A skill make_payment · DPoP-bound delegated token',
+              sdks:['A2A server — JSON-RPC over <code>httpx</code>: message/send skills',
+                    '<code>mcp</code> — MCP client → make_payment via PEP #1',
+                    '<code>PyJWT</code> + <code>cryptography</code> — EC P-256 DPoP + RFC 8693 exchange',
+                    '<code>token_validator</code> — verifies inbound bearer tokens',
+                    '<code>fastapi</code> + <code>uvicorn</code>'],
+              links:[HUB_PY, ['agent code · demo/task-agent', REPO+'/task-agent'], ['token exchange · identity.py', REPO+'/task-agent/identity.py']]},
+  attester:  {sw:'Python · FastAPI · attestation issuer', img:'python:3.12-slim',
+              cfg:'issues attestation JWTs (attest_jwt_client_auth_dpop) · binds each agent’s DPoP key via cnf · OIDF-trusted issuer · its signing key never leaves it',
+              sdks:['<code>PyJWT</code> + <code>cryptography</code> — EC P-256, signs the attestation JWTs',
+                    'client-attestation-sdk (draft-09 attest_jwt format)',
+                    '<code>fastapi</code> + <code>uvicorn</code>'],
+              links:[['source · demo/attester', REPO+'/attester'], ['client-attestation-sdk-polyglot','https://github.com/dphhyland/client-attestation-sdk-polyglot']]},
+  as:        {sw:'PingFederate 13.0.3', img:'pingidentity/pingfederate:13.0.3-alpine_3.23.4-al21-latest',
+              cfg:'RFC 8693 token exchange · PAR (RFC 9126) · pf-oidf-modules (client attestation) · pf-rar-paz-plugin (RAR → Ping Authorize) · JWT ATMs RS256, per-agent act',
+              links:[['Docker Hub · pingfederate','https://hub.docker.com/r/pingidentity/pingfederate'], ['pf-oidf-modules (source)','https://github.com/dphhyland/pf-oidf-modules']]},
+  pep1:      {sw:'__GW__ · Policy Enforcement Point (MCP edge)',
+              cfg:'validates JWT + DPoP cnf.jkt · AuthZEN eval → Ping Authorize · access_mcp + per-tool authorization · RFC 9470 login/scope challenges'},
+  mcp:       {sw:'Python · MCP server (JSON-RPC over streamable HTTP)', img:'python:3.12-slim',
+              cfg:'tools list_accounts · get_balance · open_account · make_payment · forwards the delegated token to the Bank API through PEP #2',
+              sdks:['<code>mcp</code> — MCP server SDK (streamable HTTP transport)',
+                    '<code>httpx</code> — calls the Bank API through PEP #2'],
+              links:[HUB_PY, ['source · demo/mcp-server', REPO+'/mcp-server'], ['Model Context Protocol','https://modelcontextprotocol.io']]},
+  pep2:      {sw:'__GW__ · Policy Enforcement Point (API edge)',
+              cfg:'AuthZEN eval → Ping Authorize for the bank call · governs the payment amount (≤ AUD 500 permit · > AUD 500 to 2,000 requires step-up · > 2,000 deny)'},
+  adapter:   {sw:'AuthZEN adapter — ext_authz → PingAuthorize',
+              cfg:'translates the AuthZEN Authorization API → PingAuthorize governance-engine · maps subject/action/resource/context · fails closed if the PDP is unreachable'},
+  bankapi:   {sw:'Python · FastAPI · Resource Server', img:'python:3.12-slim',
+              cfg:'executes the banking operation · consumes the delegated DPoP-bound token · records the sub/act delegation chain for audit',
+              sdks:['<code>fastapi</code> + <code>uvicorn</code>', '<code>pydantic</code> — request/response models'],
+              links:[HUB_PY, ['source · demo/bank-api', REPO+'/bank-api']]},
+  pdp:       {sw:'PingAuthorize 11.0.0.2 (Symphonic)', img:'pingidentity/pingauthorize:11.0.0.2-latest',
+              cfg:'Policy Decision Point · Trust Framework policy · make_payment: ≤ AUD 500 permit · > AUD 500 to 2,000 requires step-up (banking:payments:transfer, RFC 9470) · > 2,000 deny · governs BOTH token issuance (RAR) and the gateway calls (AuthZEN)',
+              links:[['Docker Hub · pingauthorize','https://hub.docker.com/r/pingidentity/pingauthorize'], ['policy repo · idp-paz-simplifid-policy','https://github.com/dphhyland/idp-paz-simplifid-policy']]},
+  eventsink: {sw:'Python · FastAPI · event consumer', img:'python:3.12-slim',
+              cfg:'consumes the FLATTENED token from the audience-scoped exchange · validates aud = events, sub = the agent (root actor), and that there is NO act chain · rejects a delegated (act-bearing) token',
+              sdks:['<code>fastapi</code> + <code>uvicorn</code>', 'validates the flattened at+jwt (aud/sub/no-act)'],
+              links:[['source · demo/event-sink', REPO+'/event-sink'], ['flatten deep-dive','/static/docs-act-flatten.html']]},
+};
+// Gateway-dependent image + links for the two PEPs and the AuthZEN adapter node.
+const GW_META = {
+  Kong: {
+    pep:     {img:'kong:3.7', links:[['Docker Hub · kong','https://hub.docker.com/_/kong']]},
+    adapter: {sw:'Lua plugin (authzen-pdp), in-process in Kong', img:'kong:3.7 + authzen-pdp Lua plugin',
+              links:[['source · demo/kong/plugins/authzen-pdp', REPO+'/kong/plugins/authzen-pdp'], AUTHZEN_SPEC]},
+  },
+  agentgateway: {
+    pep:     {img:'ghcr.io/agentgateway/agentgateway:v1.3.1', links:[['agentgateway (GitHub)','https://github.com/agentgateway/agentgateway']]},
+    adapter: {sw:'Go coaz-pep — Envoy ext_authz → AuthZEN (MCP profile)', img:'golang:1.26-alpine → alpine:3.20',
+              links:[['source · demo/coaz-pep', REPO+'/coaz-pep'], AUTHZEN_SPEC]},
+  },
 };
 const GE = [
   ['alice','principal','acts for'],
@@ -690,6 +924,7 @@ const GE = [
   ['pep2','adapter','AuthZEN','dash'],
   ['adapter','pdp','evaluate','dash'],
   ['as','pdp','governs issuance','dash'],
+  ['payments','eventsink','flatten act→sub','tx'],
 ];
 function gcenter(n){ return [n.x+GW/2, n.y+GH/2]; }
 function gboundary(n, tx, ty){
@@ -735,7 +970,7 @@ function setNode(node, state, flag){
   if(state) n.classList.add(state);
   if(flag!==undefined){ const f=n.querySelector('.flag, .gflag'); if(f) f.textContent = flag; }
 }
-function resetPipeline(){ ['alice','principal','account','payments','attester','as','pep1','mcp','pep2','adapter','bankapi','pdp'].forEach(n=>setNode(n,'','')); }
+function resetPipeline(){ ['alice','principal','account','payments','attester','as','pep1','mcp','pep2','adapter','bankapi','pdp','eventsink'].forEach(n=>setNode(n,'','')); }
 // A transcript step's `role` maps directly to a graph node id (principal/account/payments).
 function agentNode(role){ return (role==='principal'||role==='account'||role==='payments') ? role : null; }
 
@@ -754,6 +989,58 @@ function applyGateway(g){
 }
 document.querySelectorAll('#gwtoggle button').forEach(b => b.addEventListener('click', () => applyGateway(b.dataset.gw)));
 applyGateway(gateway);
+
+// Hover a component to reveal its software, image/runtime, config + source/registry links.
+// Delegated on the graphwrap (which persists across buildGraph re-renders); __GW__ and the
+// PEP/adapter image+links resolve to the live gateway. The tip is interactive (links click),
+// so hiding is deferred briefly to let the cursor travel from node to tip.
+(function(){
+  const wrap = document.querySelector('.graphwrap');
+  const tip = document.getElementById('gtip');
+  if(!wrap || !tip) return;
+  let hideT = null;
+  const gw = s => String(s||'').replace(/__GW__/g, gateway);
+  const hide = () => { tip.style.display = 'none'; };
+  const scheduleHide = () => { clearTimeout(hideT); hideT = setTimeout(hide, 260); };
+  const cancelHide = () => { clearTimeout(hideT); hideT = null; };
+  function place(e){
+    const pad = 14, r = tip.getBoundingClientRect();
+    let x = e.clientX + pad, y = e.clientY + pad;
+    if(x + r.width  > window.innerWidth  - 8) x = e.clientX - r.width  - pad;
+    if(y + r.height > window.innerHeight - 8) y = e.clientY - r.height - pad;
+    tip.style.left = Math.max(8, x) + 'px';
+    tip.style.top  = Math.max(8, y) + 'px';
+  }
+  function metaFor(id){
+    let m = Object.assign({}, GMETA[id]);
+    // PEPs and the adapter carry gateway-dependent image + links.
+    if(id === 'pep1' || id === 'pep2') Object.assign(m, GW_META[gateway] ? GW_META[gateway].pep : {});
+    if(id === 'adapter') Object.assign(m, GW_META[gateway] ? GW_META[gateway].adapter : {});
+    return m;
+  }
+  wrap.addEventListener('mousemove', e => {
+    const g = e.target.closest && e.target.closest('.gnode');
+    const id = g && g.getAttribute('data-node');
+    const n = id && GN[id], m = id && metaFor(id);
+    if(!n || !m || !m.sw){ if(!hideT) scheduleHide(); return; }
+    cancelHide();
+    const links = (m.links || []).map(([label,url]) =>
+      `<a href="${esc(url)}" target="_blank" rel="noopener noreferrer">${esc(label)} ↗</a>`).join('');
+    // sdks entries are hardcoded literals containing trusted <code> markup — not escaped.
+    const sdks = (m.sdks || []).map(s => `<li>${s}</li>`).join('');
+    tip.innerHTML = `<div class="gt-t">${esc(n.ic)} ${esc(n.t)}</div>`
+      + `<div class="gt-sw">${esc(gw(m.sw))}</div>`
+      + (m.img ? `<div class="gt-l">image / runtime</div><div class="gt-img">${esc(gw(m.img))}</div>` : '')
+      + `<div class="gt-l">configuration</div><div class="gt-cfg">${esc(gw(m.cfg))}</div>`
+      + (sdks ? `<div class="gt-l">SDKs / libraries</div><ul class="gt-sdks">${sdks}</ul>` : '')
+      + (links ? `<div class="gt-l">links</div><div class="gt-links">${links}</div>` : '');
+    tip.style.display = 'block';
+    place(e);
+  });
+  wrap.addEventListener('mouseleave', scheduleHide);
+  tip.addEventListener('mouseenter', cancelHide);
+  tip.addEventListener('mouseleave', scheduleHide);
+})();
 
 function scopeChips(scope){
   if(!scope) return '';
@@ -910,19 +1197,22 @@ function render(steps) {
         parties.push(`<span class="who agent"${hl}><div class="k">agent · ${role}${isNew?' ✦':''}</div><div class="v">${esc(short(a,26))}</div></span>`);
       });
       const chain = `<div class="chain">${parties.join('')}</div>`;
-      const wire = wireDetails('wire detail — the actual exchange', [
+      const wire = wireDetails('wire detail — the actual exchange (curl, DPoP, decoded tokens)', [
         { label:'1 · Token exchange request', desc:'RFC 8693 — subject = prior token, actor = the delegate',
           http:`POST ${s.te_endpoint||'/as/token.oauth2'}`, json: s.te_request || {} },
-        { label:'2 · DPoP proof', desc:'RFC 9449 — signed by the agent key, sent as the DPoP header',
+        { label:'2 · Subject bearer token (decoded, unverified)', desc:'the delegated token presented AS the subject_token',
+          json: s.subject_token_decoded || {} },
+        { label:'3 · DPoP proof', desc:'RFC 9449 — signed by the agent key, sent as the DPoP header',
           json: s.dpop_example || {} },
-        { label:'3 · Decoded delegated token', desc:'note the nested act chain in the claims',
-          json: { header: s.token_header || {alg:'ES256',typ:'JWT'}, payload: s.claims || {} } },
+        { label:'4 · Issued delegated token (decoded)', desc:'note the nested act chain in the claims',
+          json: s.issued_token_decoded || { header: s.token_header || {alg:'ES256',typ:'JWT'}, payload: s.claims || {} } },
       ]);
+      const curlBlock = s.curl ? `<div class="ck" style="font-size:11px;margin:8px 0 2px">curl — the exact RFC 8693 request (tokens/secrets elided)</div><pre>${esc(s.curl)}</pre>` : '';
       const hopBadge = s.hops > 1 ? ` <span style="font-weight:400;color:var(--muted)">(nesting act · hop ${s.hop}/${s.hops})</span>` : '';
       out.appendChild(el('step identity',
         `<div class="label">② ${esc(s.title||'Token exchange (RFC 8693)')}</div>${esc(s.detail)}
          ${chain}${tokenPanel(s)}
-         <div class="explain">Delegation, not impersonation: each hop <b>nests</b> the <code>act</code> claim, so the token records the whole chain — every downstream action is attributable to the human <i>and</i> every agent that delegated.${hopBadge}</div>${wire}`));
+         <div class="explain">Delegation, not impersonation: each hop <b>nests</b> the <code>act</code> claim, so the token records the whole chain — every downstream action is attributable to the human <i>and</i> every agent that delegated.${hopBadge}</div>${curlBlock}${wire}`));
     } else if (s.type === 'connect') {
       { const n = agentNode(s.role); if (n) setNode(n,'done'); }
       setNode('pep1','permit','permit'); setNode('mcp','done'); setNode('pdp','permit','PERMIT');
@@ -1008,6 +1298,60 @@ function render(steps) {
          <div class="reason">${esc(s.detail||'')}</div>
          <div class="ck" style="font-size:11px;margin:8px 0 2px">curl — the exact RFC 8693 request (tokens/secrets elided)</div>
          <pre>${esc(s.curl||'')}</pre>${wire}`));
+    } else if (s.type === 'token_exchange_flatten' && s.pending) {
+      // Flatten ATTEMPTED but PF can't mint the flattened token yet (events ATM / act→sub
+      // mapping not applied). Show the attempt: the RFC 8693 request + nested-act subject + why.
+      setNode('as','deny','flatten pending');
+      const subj = s.subject_token_decoded || {};
+      const pwire = wireDetails('wire detail — the audience-scoped flatten exchange (curl, subject token, PF response)', [
+        { label:'1 · Exchange request (resource = events audience)', desc:'RFC 8693 — resource selects the events ATM → flatten mapping',
+          json:{ grant_type:'urn:ietf:params:oauth:grant-type:token-exchange', resource:s.resource, subject_token:'<prior delegated token>' } },
+        { label:'2 · Subject bearer token (decoded) — the nested-act delegated token going IN', json:subj },
+        { label:'3 · PingFederate response', desc:'why it can’t flatten yet', json:{ error: s.summary } },
+      ]);
+      const pcurl = s.curl ? `<div class="ck" style="font-size:11px;margin:8px 0 2px">curl — the exact flatten request (tokens/secrets elided)</div><pre>${esc(s.curl)}</pre>` : '';
+      out.appendChild(el('step identity',
+        `<div class="label">③ ${esc(s.title||'Audience-scoped flatten (RFC 8693) — attempt')}</div>${esc(s.detail||'')}
+         <div class="explain">⏳ <b>Flatten pending</b> — PingFederate can’t mint the flattened token until the <b>events ATM + <code>act</code>→<code>sub</code> mapping</b> (Terraform <code>flatten.tf</code>) is applied. This shows the <b>attempt</b>: the RFC 8693 request and the nested-<code>act</code> delegated token going in. The flip (sub = root actor, act dropped, aud = events) lights up once the mapping lands.</div>${pcurl}${pwire}`));
+    } else if (s.type === 'token_exchange_flatten') {
+      setNode('as','done','flattened');
+      { const n = agentNode(s.role); if (n) setNode(n,'done'); }
+      setNode('eventsink','active');
+      // Show the FLIP: the nested delegation chain (from the prior token) collapses to a
+      // single flat sub = the root actor; the act chain is dropped; aud is pinned to events.
+      const beforeSub = CTX.sub || 'alice';
+      const beforeAct = CTX.act || '(agent chain)';
+      const flip = `<div class="chain">
+         <span class="who principal"><div class="k">before · sub</div><div class="v">${esc(short(beforeSub,24))}</div></span>
+         <span class="arrow2">act ▸</span>
+         <span class="who agent"><div class="k">nested act — dropped</div><div class="v" style="text-decoration:line-through;opacity:.55">${esc(short(beforeAct,24))}</div></span>
+         <span class="arrow2">⇒ flatten ⇒</span>
+         <span class="who agent" style="outline:2px solid var(--ok);outline-offset:1px;border-radius:6px"><div class="k">after · sub = ROOT actor ✦</div><div class="v">${esc(short(s.sub,24)||'?')}</div></span>
+       </div>`;
+      const fwire = wireDetails('wire detail — the audience-scoped flatten exchange (curl, decoded tokens)', [
+        { label:'1 · Exchange request (resource = events audience)', desc:'RFC 8693 — resource selects the events ATM → flatten mapping',
+          json:{ grant_type:'urn:ietf:params:oauth:grant-type:token-exchange', resource:s.resource, subject_token:'<prior delegated token>' } },
+        { label:'2 · Subject bearer token (decoded, unverified)', desc:'the nested-act delegated token going IN', json:s.subject_token_decoded || {} },
+        { label:'3 · Flattened token (decoded) — going OUT', desc:'sub = root actor · aud = events · NO act', json:s.issued_token_decoded || { header:s.token_header, payload:s.claims } || {} },
+      ]);
+      const fcurl = s.curl ? `<div class="ck" style="font-size:11px;margin:8px 0 2px">curl — the exact flatten request (tokens/secrets elided)</div><pre>${esc(s.curl)}</pre>` : '';
+      out.appendChild(el('step identity',
+        `<div class="label">③ ${esc(s.title||'Audience-scoped flatten (RFC 8693)')}</div>${esc(s.detail||'')}
+         ${flip}
+         <div class="explain">The <code>act</code> chain is <b>flipped away</b>: the root orchestration agent (innermost <code>act.sub</code>) becomes <code>sub</code>, and the token is hard-scoped to <code>aud=${esc(s.aud||'events')}</code>. Deliberately <b>not delegation</b> — the agent publishes as itself, carrying none of Alice's authority. Governed by the Ping Authorize flatten policy.${s.has_act?' <b style="color:var(--err)">⚠ act still present — flatten mapping not applied</b>':''}</div>${fcurl}${fwire}`));
+    } else if (s.type === 'event_published') {
+      setNode('eventsink', s.accepted?'done':'deny', s.accepted?'accepted':'rejected');
+      const ewire = wireDetails('wire detail — event-sink response', [
+        { label:`event-sink response (HTTP ${s.status})`, json:s.response },
+      ]);
+      out.appendChild(el('step tool_result',
+        `<div class="label">📮 Event published ← ${esc(s.agent_label||'payments agent')}</div>
+         <span class="decision ${s.accepted?'permit':'deny'}">${s.accepted?'✓ accepted':'✘ rejected'}</span>
+         <div class="reason">${esc(s.detail||'')}</div>${ewire}`));
+    } else if (s.type === 'event_publish_skipped') {
+      out.appendChild(el('step tool_result',
+        `<div class="label">📮 Event publish skipped ← ${esc(s.agent_label||'payments agent')}</div>
+         <div class="reason">${esc(s.detail||'')}</div>`));
     }
     autoScroll();
   }
@@ -1090,6 +1434,8 @@ async function streamRun(prompt, spin){
         else setNode('pep1','deny','login required');
         const title = ev.stage === 'token_exchange' ? '🔒 Sign-in required for token exchange' : '🔒 Sign-in required';
         out.appendChild(el('step tool_result convo', `<div class="label">${title}</div><div>${esc(ev.detail||'Policy requires an authenticated user.')} Redirecting you to PingFederate…</div>`));
+        // Persist the log so it survives the full-page redirect to PingFederate.
+        sessionStorage.setItem('pending_transcript', out.innerHTML);
         setTimeout(()=>{ location.href = ev.login_url || '/login'; }, 1800);
         return;
       }
@@ -1108,7 +1454,18 @@ async function streamRun(prompt, spin){
                + '&from=' + encodeURIComponent(p.from_account||'')
                + '&to=' + encodeURIComponent(p.to_account||'')
                + '&cur=' + encodeURIComponent(p.currency||'AUD');
+          // Show the RFC 9396 authorization_details the app is about to push to PingFederate
+          // (via PAR) — the exact rich payload Alice is asked to consent to for THIS payment.
+          const reqRar = [{ type:'payment_initiation', purpose:'payment_initiation',
+                            amount: Number(p.amount), currency: p.currency||'AUD',
+                            debtorAccount: p.from_account||'', creditorAccount: p.to_account||'' }];
+          out.appendChild(el('step tool_result convo',
+            `<div class="label">📤 Requesting payment consent — RFC 9396 <code>authorization_details</code> (pushed via PAR)</div>
+             <div class="ck" style="font-size:11px;margin:4px 0 6px">The app pushes THIS specific payment to PingFederate as an <code>authorization_details</code> request; Alice approves it on the consent page and Ping Authorize governs issuance.</div>
+             <div class="rar"><pre>${pretty(reqRar)}</pre></div>`));
         }
+        // Persist the log so the pre-step-up context survives the full-page redirect.
+        sessionStorage.setItem('pending_transcript', out.innerHTML);
         setTimeout(()=>{ location.href = url; }, 2200);
         return;
       }
@@ -1151,6 +1508,89 @@ resetBankBtn.addEventListener('click', async () => {
     resetBankBtn.disabled = false; resetBankBtn.textContent = prev; input.focus();
   }
 });
+</script>
+
+<button id="pdpToggle" type="button" title="Live Ping Authorize (PDP) decisions">
+  <span class="dot off" id="pdpDot"></span>PDP decisions</button>
+<aside id="pdpDrawer" aria-label="Live PDP decisions">
+  <div class="pd-head">
+    <h3>⚖️ PDP decisions <span style="font-weight:400;color:var(--muted);font-size:11px">Ping&nbsp;Authorize</span></h3>
+    <button type="button" class="x" id="pdpCloseBtn" title="Close">✕</button>
+  </div>
+  <div class="pd-sub">
+    <span>Live authorization decisions at the gateway</span>
+    <span class="pd-conn" id="pdpConn"><span class="dot"></span><span id="pdpConnTxt">offline</span></span>
+  </div>
+  <div id="pdpList">
+    <div class="pd-empty" id="pdpEmpty">No decisions yet.<br>Run a prompt — each MCP tool call and API call
+      that hits the gateway shows up here as PERMIT, DENY, or STEP-UP.</div>
+  </div>
+</aside>
+
+<script>
+/* --- live PDP decisions sidebar ------------------------------------------- */
+(function initPdpSidebar(){
+  const toggle=document.getElementById('pdpToggle');
+  const drawer=document.getElementById('pdpDrawer');
+  const closeBtn=document.getElementById('pdpCloseBtn');
+  const list=document.getElementById('pdpList');
+  const empty=document.getElementById('pdpEmpty');
+  const dot=document.getElementById('pdpDot');
+  const conn=document.getElementById('pdpConn');
+  const connTxt=document.getElementById('pdpConnTxt');
+  const OPEN_KEY='pdp_open';
+  const seen=new Set();
+  let es=null;
+
+  function setConn(state){
+    const live=state==='live';
+    conn.classList.toggle('live',live);
+    connTxt.textContent=state;
+    dot.classList.toggle('off',!live);
+  }
+  function setOpen(o){
+    drawer.classList.toggle('open',o);
+    localStorage.setItem(OPEN_KEY, o?'1':'0');
+  }
+  toggle.addEventListener('click',()=>setOpen(!drawer.classList.contains('open')));
+  closeBtn.addEventListener('click',()=>setOpen(false));
+
+  function fmtTime(ts){ try { return new Date(ts).toLocaleTimeString([],{hour12:false}); } catch(_) { return ''; } }
+  function verdict(e){ return e.step_up ? 'stepup' : (e.decision==='PERMIT' ? 'permit' : 'deny'); }
+  function verdictLabel(v){ return v==='stepup' ? 'STEP-UP' : v.toUpperCase(); }
+
+  function addRow(e){
+    if(e.seq!=null){ if(seen.has(e.seq)) return; seen.add(e.seq); }
+    if(empty) empty.style.display='none';
+    const v=verdict(e);
+    const attrs=Object.entries(e.attrs||{})
+      .map(([k,val])=>`<span class="a"><b>${esc(k)}</b> ${esc(String(val))}</span>`).join('');
+    const row=document.createElement('div');
+    row.className='pd-row '+v;
+    const raw = e.raw ? `<details class="pd-raw"><summary>raw PingAuthorize record${e.decision_id?` · <span class="pd-did">${esc(e.decision_id.slice(0,8))}</span>`:''}</summary><pre>${esc(e.raw)}</pre></details>` : '';
+    row.innerHTML=
+      `<div class="pd-r1"><span><span class="pd-verdict ${v}">${verdictLabel(v)}</span> `+
+      `<span class="pd-act">${esc(e.action||e.resource||'decision')}</span></span>`+
+      `<span class="pd-time">${fmtTime(e.ts)}</span></div>`+
+      (e.reason?`<div class="pd-reason">${esc(e.reason)}</div>`:'')+
+      (attrs?`<div class="pd-attrs">${attrs}</div>`:'')+
+      raw;
+    list.insertBefore(row, list.firstChild);   // newest on top
+    while(list.children.length>140) list.removeChild(list.lastChild);
+  }
+
+  function connect(){
+    if(es) return;
+    setConn('connecting');
+    es=new EventSource('/pdp/stream');
+    es.addEventListener('decision', ev=>{ try { addRow(JSON.parse(ev.data)); } catch(_){} });
+    es.onopen=()=>setConn('live');
+    es.onerror=()=>setConn('offline');   // EventSource auto-reconnects; seq set de-dupes the backlog replay
+  }
+
+  connect();
+  if(localStorage.getItem(OPEN_KEY)==='1') drawer.classList.add('open');
+})();
 </script>
 </body>
 </html>

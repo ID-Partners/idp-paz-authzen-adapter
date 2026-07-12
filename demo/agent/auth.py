@@ -675,26 +675,24 @@ def _acquire_principal_pf(user_token: str | None = None) -> PrincipalCredential:
     exchange — sub is derived from HER authenticated identity."""
     local = _new_key(); local_jkt = _jkt(local); local_jwk = _pub_jwk(local)
     now = int(time.time())
-    workload = {"software_id": PRINCIPAL_AGENT_ID, "agent_type": "orchestrator",
-                "on_behalf_of": PRINCIPAL_SUB}
     with httpx.Client(timeout=20.0, verify=False) as c:
-        ar = c.post(ATTESTER_URL.rstrip("/") + "/attest",
-                    json={"client_id": PRINCIPAL_AGENT_ID, "cnf": local_jwk,
-                          "workload": workload, "authorization_details": _authorization_details()})
-        ar.raise_for_status(); att = ar.json()
+        # SELF-ATTESTATION: the concierge signs its OWN client-attestation JWT with its stable
+        # entity key (AGENT_ENTITY_KEY_PEM); the matching public key is pre-registered in the AS
+        # trust file keyed by its client_id. No attester service, no federation, no client secret.
+        att = mint_agent_attestation(
+            client_id=PRINCIPAL_AGENT_ID, agent_id=PRINCIPAL_AGENT_ID, agent_type="orchestrator",
+            principal_sub=PRINCIPAL_SUB, agent_public_jwk=local_jwk,
+            authorization_details=_authorization_details())
         dpop = jwt.encode({"htm": "POST", "htu": PF_TOKEN_URL, "jti": str(uuid.uuid4()), "iat": now},
                           local, algorithm="ES256", headers={"typ": "dpop+jwt", "jwk": local_jwk})
-        if user_token:
-            grant = "urn:ietf:params:oauth:grant-type:token-exchange"
-            data = {"grant_type": grant, "subject_token": user_token,
-                    "subject_token_type": "urn:ietf:params:oauth:token-type:access_token",
-                    "client_id": PRINCIPAL_AGENT_ID, "client_secret": PF_CLIENT_SECRET}
-        else:
-            grant = "client_credentials"
-            data = {"grant_type": grant, "client_id": PRINCIPAL_AGENT_ID,
-                    "client_secret": PF_CLIENT_SECRET}
+        # PUBLIC client (client_auth = NONE): NO client_secret — the attestation + DPoP ARE the
+        # credential. Token-exchange only (the concierge exchanges Alice's login token as subject).
+        grant = "urn:ietf:params:oauth:grant-type:token-exchange"
+        data = {"grant_type": grant, "subject_token": user_token,
+                "subject_token_type": "urn:ietf:params:oauth:token-type:access_token",
+                "client_id": PRINCIPAL_AGENT_ID}
         tr = c.post(PF_TOKEN_URL, data=data,
-                    headers={"OAuth-Client-Attestation": att["attestation"], "DPoP": dpop})
+                    headers={"OAuth-Client-Attestation": att.jwt, "DPoP": dpop})
         tr.raise_for_status(); token = tr.json()["access_token"]
     claims = jwt.decode(token, options={"verify_signature": False})
     act = claims.get("act")
@@ -703,15 +701,17 @@ def _acquire_principal_pf(user_token: str | None = None) -> PrincipalCredential:
         except Exception: act = {"sub": act}  # noqa: BLE001
     labels = _actor_chain_labels(act) if isinstance(act, dict) else [PRINCIPAL_AGENT_ID]
     steps = [
-        {"type": "attestation", "title": "Client attestation (signed by the attester service)",
-         "detail": f"Attester '{att.get('attester_issuer')}' signed the concierge's attestation "
-                   f"binding its DPoP key — the private key stays in the attester.",
-         "attester": att.get("attester_issuer"), "client_id": PRINCIPAL_AGENT_ID,
+        {"type": "attestation", "title": "Client attestation (self-signed, pre-registered key)",
+         "detail": f"The concierge self-signed a client-attestation JWT with its stable entity key "
+                   f"(iss = its own client_id), binding its DPoP key (cnf). PingFederate verifies it "
+                   f"against the concierge's pre-registered public key — no attester service, no "
+                   f"federation, no client secret.",
+         "attester": att.attester_issuer, "client_id": PRINCIPAL_AGENT_ID,
          "agent": PRINCIPAL_AGENT_ID, "agent_type": "orchestrator", "local_jkt": local_jkt,
-         "auth_method": "attest_jwt_client_auth_dpop", "typ": (att.get("header") or {}).get("typ"),
-         "workload": (att.get("claims") or {}).get("workload"),
-         "attestation_header": att.get("header"), "attestation_claims": att.get("claims"),
-         "attester_jwks": att.get("attester_jwks"), "role": "principal", "mode": "pingfederate"},
+         "auth_method": "attest_jwt_client_auth_dpop", "typ": att.header.get("typ"),
+         "workload": att.claims.get("workload"),
+         "attestation_header": att.header, "attestation_claims": att.claims,
+         "attester_jwks": att.attester_jwks, "role": "principal", "mode": "pingfederate"},
         {"type": "auth", "title": "Principal Agent authenticates to PingFederate",
          "detail": f"{PRINCIPAL_AGENT_ID} authenticated to PingFederate as its own client via the "
                    f"attestation (attest_jwt_client_auth_dpop).",

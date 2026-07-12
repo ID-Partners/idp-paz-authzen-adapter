@@ -1,0 +1,11 @@
+# Terraform state can contain secrets — never commit it
+*.tfstate
+*.tfstate.*
+.terraform/
+.terraform.lock.hcl
+crash.log
+# generated on first import-reconcile; fold its content into token-exchange.tf then delete
+generated.tf
+# never commit creds
+*.auto.tfvars
+terraform.tfvars

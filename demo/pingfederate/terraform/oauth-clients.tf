@@ -42,7 +42,13 @@ resource "pingfederate_oauth_client" "northwind_webapp" {
     }
   }
 
-  # The client secret is set out-of-band (it already exists on the imported
-  # client); never commit it. client_auth.secret is write-only in the API, so
-  # terraform can't read it back — leave the auth block to the live config.
+  # Demo client secret, managed declaratively so the exported data.zip always
+  # carries a WORKING secret (the snapshot's encrypted secret had drifted from
+  # what the app sends → 401 invalid_client on staging). This is the same demo
+  # value already public in demo/app/app.py's OIDC_CLIENT_SECRET default —
+  # NOT a production credential. Write-only in the API (plan can't read it back).
+  client_auth = {
+    type   = "SECRET"
+    secret = var.webapp_client_secret
+  }
 }

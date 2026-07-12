@@ -7,3 +7,8 @@ __pycache__/
 
 # local Claude Code session data
 .claude/
+
+# build/dependency caches — also keeps 'railway up' payloads small
+.spm-cache/
+.terraform/
+.DS_Store

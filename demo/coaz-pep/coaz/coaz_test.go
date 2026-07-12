@@ -50,7 +50,7 @@ func TestSingleValuedExample(t *testing.T) {
 		"name":      "get_customer",
 		"arguments": map[string]any{"id": "cust-12345", "case": "case-67890"},
 	}
-	built, err := cm.Build(params, specToken)
+	built, err := cm.Build(params, specToken, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -86,7 +86,7 @@ func TestMultiValuedExample(t *testing.T) {
 			"destination": "/bucket/archive/q1.pdf",
 		},
 	}
-	built, err := cm.Build(params, specToken)
+	built, err := cm.Build(params, specToken, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -129,7 +129,7 @@ func TestCELConditionalsAndTypes(t *testing.T) {
 		"name":      "transfer_funds",
 		"arguments": map[string]any{"from_account": "acc-1", "amount": 9000.0},
 	}
-	built, err := cm.Build(params, specToken)
+	built, err := cm.Build(params, specToken, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -175,7 +175,7 @@ func TestMissingArgumentIsMappingError(t *testing.T) {
 	  "context":  [{"agent": "token.client_id"}]
 	}`)
 	params := map[string]any{"name": "get_customer", "arguments": map[string]any{"id": "x"}}
-	if _, err := cm.Build(params, specToken); err == nil {
+	if _, err := cm.Build(params, specToken, nil); err == nil {
 		t.Fatal("expected evaluation error for missing argument")
 	}
 }
@@ -240,7 +240,7 @@ func TestEnginePermit(t *testing.T) {
 	for _, sse := range []bool{false, true} {
 		e, mcp, _, _ := newEngineForTest(t, sse, true, "ok by policy")
 		v := e.CheckToolCall(context.Background(), mcp.URL, "Bearer tok",
-			toolCall("get_customer", map[string]any{"id": "cust-1"}), specToken)
+			toolCall("get_customer", map[string]any{"id": "cust-1"}), specToken, nil)
 		if !v.CoazTool || !v.Decision || v.JSONRPCError != nil {
 			t.Fatalf("sse=%v expected permit, got %+v", sse, v)
 		}
@@ -250,7 +250,7 @@ func TestEnginePermit(t *testing.T) {
 func TestEngineDeny401(t *testing.T) {
 	e, mcp, _, _ := newEngineForTest(t, false, false, "insufficient permissions for customer record")
 	v := e.CheckToolCall(context.Background(), mcp.URL, "Bearer tok",
-		toolCall("get_customer", map[string]any{"id": "cust-1"}), specToken)
+		toolCall("get_customer", map[string]any{"id": "cust-1"}), specToken, nil)
 	if v.Decision || v.JSONRPCError == nil {
 		t.Fatalf("expected deny, got %+v", v)
 	}
@@ -268,7 +268,7 @@ func TestEngineMappingError32602(t *testing.T) {
 	e, mcp, _, _ := newEngineForTest(t, false, true, "")
 	// `region` is not supplied -> CEL evaluation error -> -32602
 	v := e.CheckToolCall(context.Background(), mcp.URL, "Bearer tok",
-		toolCall("get_customer", nil), specToken)
+		toolCall("get_customer", nil), specToken, nil)
 	if v.Decision || v.JSONRPCError == nil {
 		t.Fatalf("expected mapping error, got %+v", v)
 	}
@@ -281,7 +281,7 @@ func TestEngineMappingError32602(t *testing.T) {
 func TestEngineNonCoazPassthrough(t *testing.T) {
 	e, mcp, _, bodies := newEngineForTest(t, false, false, "")
 	v := e.CheckToolCall(context.Background(), mcp.URL, "Bearer tok",
-		toolCall("plain_tool", map[string]any{}), specToken)
+		toolCall("plain_tool", map[string]any{}), specToken, nil)
 	if v.CoazTool || !v.Decision {
 		t.Fatalf("expected non-COAZ passthrough, got %+v", v)
 	}
@@ -294,7 +294,7 @@ func TestEnginePDPUnreachable32603(t *testing.T) {
 	e, mcp, pdp, _ := newEngineForTest(t, false, true, "")
 	pdp.Close()
 	v := e.CheckToolCall(context.Background(), mcp.URL, "Bearer tok",
-		toolCall("get_customer", map[string]any{"id": "c"}), specToken)
+		toolCall("get_customer", map[string]any{"id": "c"}), specToken, nil)
 	if v.Decision || v.JSONRPCError == nil {
 		t.Fatalf("expected fail-closed, got %+v", v)
 	}

@@ -46,6 +46,11 @@ class BankStore:
         self._customers: dict[str, Customer] = {}
         self._accounts: dict[str, Account] = {}
         self._acct_seq = itertools.count(1002)
+        # The most recent open_account result per (customer, type). Lets open_account
+        # be idempotent while the account is still empty, so a step-up retry funds the
+        # SAME account the user consented to (RFC 9396 RAR pins the creditor account) —
+        # otherwise each retry would open a fresh account and never match the consent.
+        self._last_opened: dict[tuple[str, str], str] = {}
         self._seed()
 
     def _seed(self) -> None:
@@ -79,12 +84,24 @@ class BankStore:
 
     def open_account(self, customer_id: str, account_type: str, nickname: str,
                      currency: str = "AUD") -> Account:
+        # Idempotent while empty: if the last account we opened for this
+        # (customer, type) still exists and hasn't been funded yet, return it
+        # instead of minting a new id. This keeps the destination account stable
+        # across a step-up retry so it matches the account the user consented to
+        # in the RAR. Once the account is funded (balance > 0), a subsequent
+        # open_account creates a genuinely new account.
+        prev_id = self._last_opened.get((customer_id, account_type))
+        if prev_id:
+            prev = self._accounts.get(prev_id)
+            if prev is not None and prev.customer_id == customer_id and prev.balance == 0.0:
+                return prev
         acct_id = f"{account_type[:3].upper()}-{next(self._acct_seq)}"
         acct = Account(id=acct_id, customer_id=customer_id, type=account_type,
                        nickname=nickname or f"{account_type.title()} Account",
                        currency=currency, balance=0.0)
         self._accounts[acct_id] = acct
         self._customers[customer_id].accounts.append(acct_id)
+        self._last_opened[(customer_id, account_type)] = acct_id
         return acct
 
     def transfer(self, from_id: str, to_id: str, amount: float) -> None:

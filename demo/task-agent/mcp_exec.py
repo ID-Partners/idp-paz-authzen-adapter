@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import inspect
 import json
+import logging
 import os
+import re
 from typing import Any
 
 import httpx
@@ -12,6 +14,27 @@ from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
 
 from identity import Credential
+
+log = logging.getLogger("task-agent-mcp")
+
+
+def _leaf_exceptions(exc: BaseException) -> list[BaseException]:
+    """Flatten an anyio/asyncio ExceptionGroup (the MCP client raises these) down to
+    the real leaf exceptions, so the actual cause isn't hidden behind 'TaskGroup'."""
+    out: list[BaseException] = []
+    stack = [exc]
+    seen = set()
+    while stack:
+        e = stack.pop()
+        if id(e) in seen:
+            continue
+        seen.add(id(e))
+        subs = getattr(e, "exceptions", None)
+        if subs:
+            stack.extend(subs)
+        else:
+            out.append(e)
+    return out
 
 MCP_SERVER_URL = os.environ.get("MCP_SERVER_URL", "http://kong.railway.internal:8000/mcp")
 
@@ -100,8 +123,32 @@ async def call_tool(cred: Credential, tool: str, arguments: dict[str, Any],
                 }
     except LoginRequired:
         raise
-    except Exception as exc:  # noqa: BLE001
-        msg = str(exc)
-        if "401" in msg or "login_required" in msg.lower() or "Unauthorized" in msg:
-            raise LoginRequired(msg) from exc
-        raise
+    except BaseException as exc:  # noqa: BLE001 - the MCP client raises ExceptionGroups
+        leaves = _leaf_exceptions(exc)
+        detail = "; ".join(f"{type(e).__name__}: {e}" for e in leaves if str(e)) or repr(exc)
+        low = detail.lower()
+        log.warning("MCP call_tool(%s) failed → %s", tool, detail)
+        # RFC 9470 scope step-up (NOT a hard deny): the PDP wants a scope the user hasn't
+        # consented to. coaz-pep encodes it as "insufficient_scope scope=<scope> :: <reason>".
+        # Surface it as an insufficient_scope result so the agent triggers the RAR step-up
+        # (sign in + consent to THIS payment), rather than narrating a flat denial.
+        if "insufficient_scope" in low:
+            m = re.search(r"scope=(\S+)", detail)
+            scope = m.group(1) if m else "banking:payments:transfer"
+            reason = detail.split("::", 1)[1].strip() if "::" in detail else detail
+            log.info("MCP call_tool(%s) → step-up required (scope=%s)", tool, scope)
+            return {"result": {"authorized": False, "insufficient_scope": True,
+                               "scope_required": scope, "policy_reason": reason},
+                    "authorized": False, "insufficient_scope": True, "scope_required": scope,
+                    "policy_reason": reason, "pep": "gateway", "pep_action": tool}
+        if "401" in detail or "login_required" in low or "unauthorized" in low:
+            raise LoginRequired(detail) from exc
+        # A gateway/PDP DENY surfaces as a 403 on the proxied call. Turn it into a clean
+        # DENY tool-result instead of a raw TaskGroup crash, so the transcript shows ✘ DENY.
+        if "403" in detail or "forbidden" in low or "denied" in low:
+            reason = next((str(e) for e in leaves if "403" in str(e) or "forbidden" in str(e).lower()), detail)
+            return {"result": {"authorized": False, "policy_reason": reason},
+                    "authorized": False, "policy_reason": reason, "pep": "gateway",
+                    "pep_action": tool}
+        # Anything else (real connectivity/protocol error) — raise with the UNWRAPPED cause.
+        raise RuntimeError(detail) from exc

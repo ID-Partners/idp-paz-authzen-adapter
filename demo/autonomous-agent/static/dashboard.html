@@ -1,0 +1,311 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ID Partners Bank · Autonomous payments — CIBA + PingOne MFA</title>
+<style>
+  :root{
+    --bg:#0d1117; --panel:#161b22; --panel2:#1c222b; --border:#2d333b;
+    --text:#e6edf3; --muted:#8b949e; --accent:#FF6600; --accent2:#58a6ff;
+    --ok:#3fb950; --wait:#d29922; --deny:#f85149;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);
+       font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
+  header{padding:16px 24px;border-bottom:1px solid var(--border);display:flex;
+         align-items:center;gap:14px;flex-wrap:wrap}
+  header h1{font-size:16px;margin:0;font-weight:600}
+  .brand-sq{width:13px;height:13px;background:var(--accent);border-radius:2px;display:inline-block;
+            vertical-align:-1px;margin-right:8px}
+  .brand-o{color:var(--accent)}
+  header .tag{font-size:12px;color:var(--muted)}
+  .mode{margin-left:auto;font-size:11px;font-weight:700;letter-spacing:.5px;text-transform:uppercase;
+        padding:5px 11px;border-radius:20px;border:1px solid var(--border)}
+  .mode.sim{color:var(--wait);border-color:#5a4a1e;background:#241d0e}
+  .mode.live{color:var(--ok);border-color:#1e5a2e;background:#0e2414}
+  .wrap{max-width:1500px;margin:0 auto;padding:20px 24px;display:grid;
+        grid-template-columns:minmax(0,1fr) 360px;gap:24px;align-items:start}
+  @media(max-width:900px){.wrap{grid-template-columns:1fr}}
+
+  h2.sec{font-size:11px;text-transform:uppercase;letter-spacing:.7px;color:var(--muted);
+         margin:0 0 12px;font-weight:600}
+  .card{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:16px}
+  .card + .card{margin-top:18px}
+
+  /* pipeline */
+  .pipe{display:flex;flex-direction:column;gap:0}
+  .node{display:flex;gap:12px;align-items:flex-start;position:relative;padding:2px 0}
+  .rail{display:flex;flex-direction:column;align-items:center;width:34px;flex:none}
+  .dot{width:34px;height:34px;border-radius:50%;background:var(--panel2);border:1.5px solid var(--border);
+       display:flex;align-items:center;justify-content:center;font-size:16px;transition:all .3s;z-index:1}
+  .line{width:2px;flex:1;min-height:20px;background:var(--border);transition:background .3s}
+  .node:last-child .line{display:none}
+  .body{padding:4px 0 20px;flex:1;min-width:0}
+  .body .t{font-size:13.5px;font-weight:600}
+  .body .s{font-size:11.5px;color:var(--muted);margin-top:2px}
+  .body .d{font-size:12px;color:var(--muted);margin-top:6px;line-height:1.45;display:none}
+  .node.active .dot{border-color:var(--accent);box-shadow:0 0 0 4px rgba(255,102,0,.15);background:#241605}
+  .node.active .body .t{color:var(--accent)}
+  .node.done .dot{border-color:var(--ok);background:#0e2414;color:var(--ok)}
+  .node.done .line{background:var(--ok)}
+  .node.deny .dot{border-color:var(--deny);background:#2a0f0e;color:var(--deny)}
+  .node.deny .body .t{color:var(--deny)}
+  .node.active .body .d, .node.done .body .d{display:block}
+
+  /* phone mock */
+  .phone{width:250px;margin:0 auto;background:#000;border-radius:34px;padding:11px;
+         border:1px solid #30363d;box-shadow:0 12px 40px rgba(0,0,0,.5)}
+  .screen{background:linear-gradient(180deg,#12161c,#0b0e12);border-radius:24px;min-height:380px;
+          padding:16px 14px;display:flex;flex-direction:column;position:relative;overflow:hidden}
+  .notch{width:96px;height:20px;background:#000;border-radius:0 0 14px 14px;position:absolute;
+         top:0;left:50%;transform:translateX(-50%)}
+  .phone-idle{margin:auto;text-align:center;color:#4b535d;font-size:12px;line-height:1.6}
+  .push{margin-top:34px;background:#1c222b;border:1px solid #2d333b;border-radius:16px;padding:13px;
+        animation:slideIn .35s ease}
+  @keyframes slideIn{from{opacity:0;transform:translateY(-10px)}to{opacity:1;transform:none}}
+  .push .app{display:flex;align-items:center;gap:7px;font-size:11px;color:var(--muted);margin-bottom:8px}
+  .push .app .ic{width:16px;height:16px;background:var(--accent);border-radius:4px}
+  .push .msg{font-size:13px;font-weight:600;line-height:1.4}
+  .push .amt{font-size:22px;font-weight:700;margin:10px 0 2px}
+  .push .rte{font-size:11.5px;color:var(--muted);font-family:ui-monospace,Menlo,monospace}
+  .push .btns{display:flex;gap:8px;margin-top:14px}
+  .push button{flex:1;border:none;border-radius:9px;padding:11px;font-weight:600;font-size:13px;cursor:pointer}
+  .approve{background:var(--ok);color:#06210f}
+  .deny{background:#21262d;color:var(--deny);border:1px solid #3a2020!important}
+  .push .bio{text-align:center;font-size:10.5px;color:#4b535d;margin-top:9px}
+  .resolved{margin:auto;text-align:center}
+  .resolved .big{font-size:38px}
+  .resolved .txt{font-size:13px;font-weight:600;margin-top:6px}
+
+  /* inject form */
+  label{display:block;font-size:11px;color:var(--muted);margin:10px 0 3px}
+  input,select{width:100%;background:var(--panel2);border:1px solid var(--border);color:var(--text);
+               border-radius:8px;padding:8px 10px;font-size:13px}
+  .row{display:flex;gap:10px}.row>div{flex:1}
+  button.primary{width:100%;margin-top:14px;background:var(--accent);color:#1a0f00;border:none;
+                 border-radius:9px;padding:11px;font-weight:700;font-size:13px;cursor:pointer}
+  button.primary:disabled{opacity:.5;cursor:not-allowed}
+  .presets{display:flex;gap:8px;margin-top:10px}
+  .presets button{flex:1;background:var(--panel2);border:1px solid var(--border);color:var(--muted);
+                  border-radius:8px;padding:7px;font-size:11px;cursor:pointer}
+  .presets button:hover{border-color:var(--accent);color:var(--text)}
+
+  /* token panel */
+  .tok{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;background:#0b0e12;
+       border:1px solid var(--border);border-radius:8px;padding:12px;margin-top:6px;overflow-x:auto}
+  .tok .k{color:var(--accent2)} .tok .p{color:var(--accent)} .tok pre{margin:0;white-space:pre-wrap;word-break:break-word}
+  .chip{display:inline-block;font-size:10px;padding:2px 7px;border-radius:20px;border:1px solid var(--border);
+        color:var(--muted);margin-left:6px}
+
+  /* event log */
+  .log{max-height:260px;overflow-y:auto;font-size:12px}
+  .ev{padding:7px 2px;border-bottom:1px solid #21262d;display:flex;gap:8px}
+  .ev:last-child{border-bottom:none}
+  .ev .badge{flex:none;width:8px;height:8px;border-radius:50%;margin-top:5px;background:var(--muted)}
+  .ev.ok .badge{background:var(--ok)}.ev.wait .badge{background:var(--wait)}.ev.deny .badge{background:var(--deny)}
+  .ev .stg{font-weight:600;text-transform:uppercase;font-size:10px;letter-spacing:.4px;color:var(--muted)}
+  .ev .dt{color:var(--muted);line-height:1.4}
+  .empty{color:#4b535d;font-size:12px;text-align:center;padding:20px}
+</style>
+</head>
+<body>
+<header>
+  <h1><span class="brand-sq"></span>ID <span class="brand-o">PARTNERS</span> Bank — Autonomous Payments</h1>
+  <span class="tag">Kafka → autonomous agent (principal&nbsp;·&nbsp;Bob) → FAPI-CIBA → PingOne MFA · RFC&nbsp;9396 RAR</span>
+  <span id="mode" class="mode sim">simulation</span>
+</header>
+
+<div class="wrap">
+  <!-- LEFT: the pipeline + token -->
+  <div>
+    <div class="card">
+      <h2 class="sec">Autonomous payment pipeline <span id="pid" class="chip" style="display:none"></span></h2>
+      <div class="pipe" id="pipe"></div>
+    </div>
+    <div class="card" id="tokCard" style="display:none">
+      <h2 class="sec">Delegated access token — <span style="color:var(--text)">sub=bob</span>, act={agent} <span class="chip">delegation, not impersonation</span></h2>
+      <div class="tok" id="tok"></div>
+      <div style="font-size:11.5px;color:var(--muted);margin-top:10px;line-height:1.5">
+        The agent held <b>no authority</b> until Bob approved <b>this</b> payment. The token names Bob as
+        <code>sub</code> (principal) and the agent as <code>act.sub</code> (delegate), and carries the payment
+        as governed <code>authorization_details</code> (RFC&nbsp;9396). Every downstream action is attributable
+        to the human who approved it.
+      </div>
+    </div>
+  </div>
+
+  <!-- RIGHT: controls + phone + log -->
+  <div>
+    <div class="card">
+      <h2 class="sec">Bob's phone <span class="chip">PingOne MFA</span></h2>
+      <div class="phone"><div class="screen"><div class="notch"></div>
+        <div id="phone"><div class="phone-idle">🔒<br>No pending approvals.<br>Inject a payment to trigger a push.</div></div>
+      </div></div>
+    </div>
+
+    <div class="card">
+      <h2 class="sec">Inject a payment event</h2>
+      <div class="row">
+        <div><label>From</label><input id="from" value="CHK-1001"></div>
+        <div><label>To</label><input id="to" value="SAV-2002"></div>
+      </div>
+      <div class="row">
+        <div><label>Amount</label><input id="amount" type="number" value="500"></div>
+        <div><label>Currency</label><input id="ccy" value="AUD"></div>
+      </div>
+      <div class="presets">
+        <button data-amt="500">Payroll · $500</button>
+        <button data-amt="4200">Vendor · $4,200</button>
+        <button data-amt="25000">Large · $25,000</button>
+      </div>
+      <button class="primary" id="inject">▶ Publish to Kafka topic</button>
+      <div style="font-size:10.5px;color:#4b535d;margin-top:8px;line-height:1.5">
+        Simulates <code>payment.requested</code> landing on the stream — no keyboard, no session.
+        The agent must get Bob's out-of-band approval before it can move money.
+      </div>
+    </div>
+
+    <div class="card">
+      <h2 class="sec">Event stream</h2>
+      <div class="log" id="log"><div class="empty">Waiting for the first payment event…</div></div>
+    </div>
+  </div>
+</div>
+
+<script>
+const STAGES = [
+  {key:'received',    node:'stream',  t:'Payment event on the stream',        s:'Kafka payment.requested → stream-processor → autonomous agent',        ic:'📩'},
+  {key:'ciba_request',node:'ciba',    t:'CIBA backchannel request',           s:'agent → PingFederate · private_key_jwt · FAPI signed request · RAR',    ic:'📡'},
+  {key:'push_sent',   node:'push',    t:'PingOne MFA push',                    s:'PingFederate → PingOne → Bob’s device',                                 ic:'📲'},
+  {key:'awaiting_approval',node:'wait',t:'Awaiting Bob’s approval',            s:'out-of-band · Face ID · the one human touchpoint',                      ic:'⏳'},
+  {key:'token_issued',node:'token',   t:'Delegated token issued',             s:'sub=bob · act={agent} · authorization_details = the payment',           ic:'🎫'},
+  {key:'executing',   node:'pep',     t:'Execute via Kong PEP',               s:'Ping Authorize governs the call · bank-api',                            ic:'🛡️'},
+  {key:'executed',    node:'done',    t:'Payment settled',                     s:'bank-api resource server',                                              ic:'🏦'},
+];
+// stage → pipeline node + whether it's terminal
+const NODE_OF = {received:'stream', ciba_request:'ciba', push_sent:'push',
+  awaiting_approval:'wait', approved:'wait', denied:'wait', token_issued:'token',
+  executing:'pep', executed:'done', halted:'done', error:'done'};
+
+const pipe = document.getElementById('pipe');
+STAGES.forEach(st => {
+  const n = document.createElement('div'); n.className='node'; n.id='n-'+st.node;
+  n.innerHTML = `<div class="rail"><div class="dot">${st.ic}</div><div class="line"></div></div>
+    <div class="body"><div class="t">${st.t}</div><div class="s">${st.s}</div><div class="d" id="d-${st.node}"></div></div>`;
+  pipe.appendChild(n);
+});
+
+const $ = id => document.getElementById(id);
+const esc = s => String(s).replace(/[&<>]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+let curPid = null;
+
+function setMode(m){
+  const el=$('mode'); el.textContent = m==='real'?'live':'simulation';
+  el.className = 'mode '+(m==='real'?'live':'sim');
+}
+
+function resetPipeline(){
+  document.querySelectorAll('.node').forEach(n=>n.className='node');
+  document.querySelectorAll('.d').forEach(d=>d.textContent='');
+  $('tokCard').style.display='none';
+}
+
+function markNode(node, cls, detail){
+  const order = STAGES.map(s=>s.node);
+  const idx = order.indexOf(node);
+  order.forEach((nm,i)=>{ const el=$('n-'+nm); if(i<idx && !el.classList.contains('deny')) el.className='node done'; });
+  const el=$('n-'+node);
+  el.className = 'node '+cls;
+  if(detail){ $('d-'+node).textContent = detail; }
+}
+
+function phonePush(d){
+  const r = (d.authorization_details && d.authorization_details[0]) || {};
+  $('phone').innerHTML = `<div class="push">
+    <div class="app"><span class="ic"></span>ID Partners Bank · Approve payment</div>
+    <div class="msg">${esc(d.binding_message||'Approve this payment')}</div>
+    ${r.amount!=null?`<div class="amt">${Number(r.amount).toLocaleString()} ${esc(r.currency||'')}</div>
+      <div class="rte">${esc(r.debtorAccount||'')} → ${esc(r.creditorAccount||'')}</div>`:''}
+    <div class="btns">
+      <button class="approve" id="pa">Approve</button>
+      <button class="deny" id="pd">Deny</button>
+    </div>
+    <div class="bio">🙂 Face ID to approve</div>
+  </div>`;
+  $('pa').onclick = ()=>decide('approve');
+  $('pd').onclick = ()=>decide('deny');
+}
+function phoneResolved(ok){
+  $('phone').innerHTML = `<div class="resolved"><div class="big">${ok?'✅':'⛔'}</div>
+    <div class="txt" style="color:${ok?'var(--ok)':'var(--deny)'}">${ok?'Approved with Face ID':'Declined'}</div></div>`;
+}
+function phoneIdle(){
+  $('phone').innerHTML = `<div class="phone-idle">🔒<br>No pending approvals.<br>Inject a payment to trigger a push.</div>`;
+}
+async function decide(decision){
+  document.querySelectorAll('.push button').forEach(b=>b.disabled=true);
+  await fetch('/sim/decision',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({paymentId:curPid, decision})});
+}
+
+function renderToken(claims){
+  $('tokCard').style.display='';
+  const rows = [];
+  const push = (k,v)=>rows.push(`<span class="k">${k}</span> = ${v}`);
+  if(claims.sub) push('sub', `<span class="p">${esc(claims.sub)}</span>  <span style="color:var(--muted)">(principal)</span>`);
+  if(claims.act) push('act', `<span class="p">${esc(claims.act.sub||'')}</span>  <span style="color:var(--muted)">(delegate — the agent)</span>`);
+  if(claims.client_id) push('client_id', esc(claims.client_id)+`  <span style="color:var(--muted)">(agent operator)</span>`);
+  if(claims.scope) push('scope', esc(claims.scope));
+  if(claims.cnf) push('cnf.jkt', esc(claims.cnf.jkt||'')+`  <span style="color:var(--muted)">(DPoP binding)</span>`);
+  let rar='';
+  if(claims.authorization_details) rar = `<div style="margin-top:8px"><span class="k">authorization_details</span> <span style="color:var(--muted)">(RFC 9396 RAR — the governed payment)</span>
+    <pre style="margin-top:4px">${esc(JSON.stringify(claims.authorization_details,null,2))}</pre></div>`;
+  $('tok').innerHTML = `<pre>${rows.join('\n')}</pre>${rar}`;
+}
+
+function logEvent(e){
+  const log=$('log'); if(log.querySelector('.empty')) log.innerHTML='';
+  const div=document.createElement('div'); div.className='ev '+e.status;
+  div.innerHTML=`<div class="badge"></div><div><span class="stg">${esc(e.stage)}</span><div class="dt">${esc(e.detail)}</div></div>`;
+  log.insertBefore(div, log.firstChild);
+}
+
+function handle(e){
+  // new payment run → reset the board
+  if(e.stage==='received'){
+    if(e.paymentId!==curPid){ curPid=e.paymentId; resetPipeline(); phoneIdle();
+      $('pid').style.display=''; $('pid').textContent=e.paymentId; }
+    if(e.data && e.data.mode) setMode(e.data.mode);
+  }
+  if(e.paymentId && e.paymentId!==curPid && e.stage!=='received') return; // ignore stale
+  logEvent(e);
+  const node = NODE_OF[e.stage];
+  const cls = e.status==='deny' ? 'deny' : (e.stage==='executed'||e.stage==='approved') ? 'done' : 'active';
+
+  if(e.stage==='push_sent') phonePush(e.data||{});
+  if(e.stage==='awaiting_approval' && e.data && e.data.interactive) phonePush(e.data||{});
+  if(e.stage==='approved') phoneResolved(true);
+  if(e.stage==='denied') phoneResolved(false);
+  if(e.stage==='token_issued' && e.data && e.data.claims) renderToken(e.data.claims);
+
+  if(node) markNode(node, cls, e.detail);
+  if(e.stage==='executed') markNode('done','done',e.detail);
+}
+
+// live stream
+const es = new EventSource('/events');
+es.addEventListener('hello', ev=>{ try{ setMode(JSON.parse(ev.data).mode); }catch(_){} });
+es.addEventListener('stage', ev=>{ try{ handle(JSON.parse(ev.data)); }catch(err){ console.error(err); } });
+
+// inject
+$('inject').onclick = async ()=>{
+  $('inject').disabled=true; setTimeout(()=>$('inject').disabled=false, 1200);
+  await fetch('/inject',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({debtorAccount:$('from').value, creditorAccount:$('to').value,
+      amount:parseFloat($('amount').value)||0, currency:$('ccy').value})});
+};
+document.querySelectorAll('.presets button').forEach(b=>b.onclick=()=>{ $('amount').value=b.dataset.amt; });
+</script>
+</body>
+</html>

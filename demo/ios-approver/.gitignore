@@ -1,0 +1,6 @@
+.spm-cache/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+.DS_Store
+*.p8
