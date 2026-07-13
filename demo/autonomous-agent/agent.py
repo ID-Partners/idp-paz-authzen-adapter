@@ -124,11 +124,70 @@ def _rar(p: dict) -> list[dict]:
 
 def _binding(p: dict) -> str:
     # FAPI-CIBA constrains binding_message to <=20 chars, charset ^[a-zA-Z0-9-._+/!?#]{1,20}$
-    # (NO spaces) — verified against PF (a long/spaced value → 400 invalid_binding_message). It's
-    # a short confirmation CODE Bob sees; the full payment detail rides in the push body via the
-    # authenticator template. e.g. "Pay-600.00-AUD".
+    # (NO spaces) — verified against PF (>20 or spaced → 400 invalid_binding_message). This is the
+    # ONLY per-payment string that reaches Bob's device: PF's PingOne-MFA authenticator builds the
+    # push from a fixed pi.template ("transaction") whose sole dynamic field is authUserBindingMessage
+    # (= this value). The richer "Client Context" JSON path is NOT delivered on the pi.flow push
+    # (verified in PF wire logs). So pack the essentials — amount+currency and the debtor/creditor
+    # account tails — into 20 chars, e.g. "600AUD-1001-1002" (600 AUD, acct …1001 → …1002).
     amt = float(p.get("amount", 0) or 0)
-    return f"Pay-{amt:.2f}-{p.get('currency', 'AUD')}"[:20]
+    ccy = (p.get("currency") or "AUD")
+    amt_s = f"{amt:.0f}" if amt == int(amt) else f"{amt:.2f}"
+    tail = lambda a: "".join(c for c in str(a or "") if c.isalnum())[-4:] or "x"  # noqa: E731
+    return f"{amt_s}{ccy}-{tail(p.get('from'))}-{tail(p.get('to'))}"[:20]
+
+
+# ── consent store (rich authorization detail the approver app pulls up by code) ─────
+# The CIBA push can carry only a 20-char binding code (hard PingOne/PF limit — see
+# ciba-push-payment-detail-limits). So the push carries a short REFERENCE CODE and Bob's
+# approver app fetches the FULL authorization consent (amount, debtor/creditor, the RFC 9396
+# authorization_details, the account owner, the requesting agent) from GET /consent/{code}
+# over its own channel — no length limit. This mirrors real bank approval apps: the push is
+# the trigger, the rich consent screen is an out-of-band fetch. The code doubles as the
+# binding_message so it also shows on the push banner.
+_CONSENTS: dict[str, dict] = {}
+_CONSENT_TTL = 600  # seconds a pending consent stays fetchable
+
+
+def _consent_code(p: dict) -> str:
+    # <=20 chars, charset ^[a-zA-Z0-9-._+/!?#]{1,20}$ — amount (human-meaningful on the banner)
+    # plus a short unique tail so the app can look up THIS payment. e.g. "600AUD-3F2A".
+    amt = float(p.get("amount", 0) or 0)
+    ccy = (p.get("currency") or "AUD")
+    amt_s = f"{amt:.0f}" if amt == int(amt) else f"{amt:.2f}"
+    return f"{amt_s}{ccy}-{uuid.uuid4().hex[:4].upper()}"[:20]
+
+
+def _register_consent(pid: str, payment: dict, owner: str = "alice") -> str:
+    """Store the full authorization consent, keyed by a short code; return the code
+    (also used as the CIBA binding_message)."""
+    now = time.time()
+    for k in [k for k, v in _CONSENTS.items() if now - v.get("ts", 0) > _CONSENT_TTL]:
+        _CONSENTS.pop(k, None)
+    code = _consent_code(payment)
+    _CONSENTS[code] = {
+        "code": code, "paymentId": pid, "status": "pending", "ts": now,
+        "amount": float(payment.get("amount", 0) or 0),
+        "currency": payment.get("currency", "AUD"),
+        "debtorAccount": payment.get("from", ""),
+        "creditorAccount": payment.get("to", ""),
+        "accountOwner": owner,
+        "authorization_details": _rar(payment),
+        "requestedBy": "Autonomous Agent (staff-authorized)",
+        "approver": BOB_USERNAME,
+    }
+    return code
+
+
+def _resolve_consent(code: str, status: str) -> None:
+    c = _CONSENTS.get(code)
+    if c:
+        c["status"] = status
+
+
+def _latest_pending_consent() -> dict | None:
+    pend = [v for v in _CONSENTS.values() if v.get("status") == "pending"]
+    return max(pend, key=lambda v: v["ts"]) if pend else None
 
 
 def _decode(token: str) -> dict:
@@ -182,8 +241,7 @@ async def _bob_password_token(scope: str) -> tuple[str | None, str]:
 
 
 # ── REAL CIBA (mirrors demo/ciba-cli/ciba.py; SIMULATE=0, needs the PingOne MFA IK) ──
-async def _ciba_real(pid: str, payment: dict) -> str | None:
-    binding = _binding(payment)
+async def _ciba_real(pid: str, payment: dict, binding: str) -> str | None:
     ciba_ep = os.environ.get("CIBA_ENDPOINT",
                              (PF_BASE or PF_TOKEN_URL.rsplit("/as/", 1)[0]) + "/as/bc-auth.ciba")
     issuer = os.environ.get("ISSUER", "https://localhost:9031")
@@ -191,10 +249,14 @@ async def _ciba_real(pid: str, payment: dict) -> str | None:
     pem = key.private_bytes(serialization.Encoding.PEM,
                             serialization.PrivateFormat.PKCS8, serialization.NoEncryption())
     now = int(time.time())
-    # NOTE: authorization_details (RAR) is deliberately NOT sent on the CIBA backchannel request —
-    # PF rejects it there (400 invalid_authorization_details, verified). The payment is conveyed to
-    # Bob via binding_message + the push template; RAR governance stays at the token-exchange/PDP
-    # plane (the staff-approval acr channel), same as the sim bridge.
+    # NOTE on payment detail delivery: PF's PingOne-MFA authenticator builds the push from a FIXED
+    # pi.template ("transaction") whose only dynamic per-payment field is authUserBindingMessage
+    # (= binding_message). authorization_details (RAR) is rejected on the backchannel request, and
+    # the authenticator's rich "Client Context" JSON is NOT delivered on the pi.flow push path
+    # (both verified against PF wire logs). So the amount + debtor/creditor tails are packed into
+    # the 20-char binding_message (see _binding); RAR governance stays at the token-exchange/PDP
+    # plane (the staff-approval acr channel). The full structured breakdown is shown in the
+    # dashboard, not on the phone.
     req_claims = {"iss": CIBA_CLIENT_ID, "aud": issuer, "jti": uuid.uuid4().hex,
                   "iat": now, "exp": now + 300, "nbf": now,
                   "scope": f"openid {ELEVATED_SCOPE}", "login_hint": BOB_USERNAME,
@@ -240,13 +302,20 @@ async def _ciba_real(pid: str, payment: dict) -> str | None:
 
 
 # ── the approval gate (Bob authorizes the sensitive operation, out-of-band) ─────────
-async def _staff_approval(pid: str, payment: dict) -> str | None:
+async def _staff_approval(pid: str, payment: dict, owner: str = "alice") -> str | None:
     """Returns Bob's ELEVATED token (scope banking:payments:transfer,
     acr=staff-approval) once he approves — via the real CIBA push, or the dashboard's
-    phone mock + password-grant bridge while the push plane isn't wired."""
+    phone mock + password-grant bridge while the push plane isn't wired.
+
+    The push carries only a short reference code (= binding_message); Bob's approver app
+    pulls the full consent up from GET /consent/{code}. Register it first so the app can
+    fetch it the moment the push lands."""
+    code = _register_consent(pid, payment, owner)
     if not SIMULATE:
-        return await _ciba_real(pid, payment)
-    binding = _binding(payment)
+        token = await _ciba_real(pid, payment, code)
+        _resolve_consent(code, "approved" if token else "declined")
+        return token
+    binding = code
     await emit(pid, "ciba_request", "ok",
                "Backchannel authorization → PingFederate (private_key_jwt; login_hint=bob; "
                "binding_message + RFC 9396 authorization_details = THIS payment). "
@@ -269,13 +338,16 @@ async def _staff_approval(pid: str, payment: dict) -> str | None:
     finally:
         _PENDING.pop(pid, None)
     if decision != "approve":
+        _resolve_consent(code, "declined")
         await emit(pid, "denied", "deny",
                    "Bob DECLINED the payment" if decision == "deny" else "Approval timed out", {})
         return None
     token, err = await _bob_password_token(f"openid {ELEVATED_SCOPE}")
     if not token:
+        _resolve_consent(code, "declined")
         await emit(pid, "denied", "deny", f"Elevated staff token failed: {err}", {})
         return None
+    _resolve_consent(code, "approved")
     await emit(pid, "approved", "ok",
                "Bob approved — PingFederate issued his ELEVATED staff token "
                f"(scope {ELEVATED_SCOPE}, acr=urn:northwind:loa:staff-approval).",
@@ -380,7 +452,7 @@ async def orchestrate(event: dict) -> None:
                            "out-of-band approval instead of a browser redirect.",
                            {"scope": ev.get("scope"), "detail": ev.get("detail"),
                             "payment": pay})
-                elevated = await _staff_approval(pid, payment)
+                elevated = await _staff_approval(pid, payment, op["owner"])
                 if not elevated:
                     await emit(pid, "halted", "deny",
                                "Operation NOT executed — Bob did not approve.", {})
@@ -403,6 +475,76 @@ def ping() -> dict:
     return {"status": "ok", "staff_authority": BOB_USERNAME,
             "mode": "real-push" if not SIMULATE else "sim-tap",
             "concierge": CONCIERGE_URL, "pf_token_url": PF_TOKEN_URL}
+
+
+# ── consent detail (Bob's approver app pulls the full authorization up by code) ──────
+# The CIBA push carries only a short reference code (binding_message). The approver app
+# resolves it to the full consent here. `/consent` (no code) returns the latest pending one
+# — a demo convenience so the app can fetch even if it can't parse the code from the push.
+# NOTE (demo): unauthenticated + code-guarded. The code is short-lived and unguessable
+# enough for a demo; a production build would bind this to the approver's own token.
+def _consent_view(c: dict) -> dict:
+    return {k: c[k] for k in ("code", "paymentId", "status", "amount", "currency",
+                              "debtorAccount", "creditorAccount", "accountOwner",
+                              "authorization_details", "requestedBy", "approver") if k in c}
+
+
+@app.get("/consent")
+def consent_latest() -> dict:
+    c = _latest_pending_consent()
+    if not c:
+        return JSONResponse({"error": "no pending consent"}, status_code=404)
+    return _consent_view(c)
+
+
+@app.get("/consent/{code}")
+def consent_by_code(code: str) -> dict:
+    c = _CONSENTS.get(code)
+    if not c:
+        return JSONResponse({"error": "unknown or expired code"}, status_code=404)
+    return _consent_view(c)
+
+
+@app.post("/phone-log")
+async def phone_log(request: Request) -> JSONResponse:
+    """Lifecycle breadcrumbs from Bob's approver app (push received, SDK ready, screen shown,
+    tap, biometric, SDK result) — independent of any consent code, so we can see exactly how far
+    the phone got even when nothing else fires."""
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        body = {}
+    ev = str(body.get("event", "?"))
+    detail = str(body.get("detail", ""))
+    pid = str(body.get("code") or "phone")
+    log.info("PHONE-LOG [%s] %s %s", pid, ev, detail)
+    await emit(pid, "phone_log", "ok", f"📱 {ev}" + (f": {detail}" if detail else ""),
+               {"event": ev, "detail": detail})
+    return JSONResponse({"ok": True})
+
+
+@app.post("/consent/{code}/report")
+async def consent_report(code: str, request: Request) -> JSONResponse:
+    """Bob's approver app reports back what happened when he tapped — the SDK decision, any
+    error, and PingOne's device-requirements verdict. Gives the dashboard (and us) eyes on the
+    phone side, independent of PF's poll."""
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        body = {}
+    c = _CONSENTS.get(code)
+    pid = (c or {}).get("paymentId", code)
+    decision = str(body.get("decision", "?"))
+    err = body.get("error")
+    devreq = body.get("deviceRequirements")
+    msg = f"Bob's phone reported: {decision}"
+    if err:
+        msg += f" — SDK error: {err}"
+    if devreq:
+        msg += f" — device requirements: {devreq}"
+    await emit(pid, "phone_report", "deny" if (err or decision == "deny") else "ok", msg,
+               {"decision": decision, "error": err, "deviceRequirements": devreq})
+    return JSONResponse({"ok": True})
 
 
 @app.get("/")

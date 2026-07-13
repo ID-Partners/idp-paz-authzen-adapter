@@ -140,6 +140,27 @@ resource "pingfederate_oauth_access_token_mapping" "ropc_user_jwt" {
   }
 }
 
+# THE REAL CIBA MAPPING (Phase F). After the PingOne MFA device authentication COMPLETES, PF mints
+# the CIBA access token via userJwtATM — but PF has no per-authenticator access-token-mapping context
+# for CIBA (CIBA_AUTHENTICATOR/OOB_AUTH are not valid AccessTokenMappingType enums), so the CIBA grant
+# falls through to the DEFAULT mapping. Without this, PF returned invalid_grant "No attributes found in
+# the context of this grant" even though PingOne reported the approval COMPLETED (verified end-to-end
+# with a real phone approval). Same acr as the ROPC bridge above, so the step-up policy is unchanged
+# sim → real. sub is TEXT "bob": in a DEFAULT context the subject is NOT exposed as a CONTEXT attr,
+# and the autonomous CIBA principal is always Bob (the staff-authority client).
+resource "pingfederate_oauth_access_token_mapping" "ciba_default_user_jwt" {
+  context                  = { type = "DEFAULT" }
+  access_token_manager_ref = { id = "userJwtATM" }
+
+  attribute_contract_fulfillment = {
+    "sub"       = { source = { type = "TEXT" }, value = "bob" }
+    "name"      = { source = { type = "TEXT" }, value = "bob" }
+    "acr"       = { source = { type = "TEXT" }, value = "urn:northwind:loa:staff-approval" }
+    "auth_time" = { source = { type = "TEXT" }, value = "0" }
+    "client_id" = { source = { type = "CONTEXT" }, value = "ClientId" }
+  }
+}
+
 # The autonomous agent's OAuth client. PUBLIC-key client auth (private_key_jwt) — FAPI-CIBA
 # requires confidential client auth; the JWKS is the committed demo/ciba-cli/ciba-pub-jwk.json
 # (its private key rides in the orchestrator's CIBA_CLIENT_KEY_PEM env var, never the repo).

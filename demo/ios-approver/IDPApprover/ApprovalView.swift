@@ -9,6 +9,8 @@ struct PendingPayment: Identifiable, Equatable {
     let fromAccount: String
     let toAccount: String
     var bindingMessage: String
+    var accountOwner: String = ""   // whose accounts (Alice) — Bob approves as staff
+    var reference: String = ""      // the short push reference code
 }
 
 /// ID Partners Bank — payment approval screen shown when a CIBA push arrives.
@@ -50,6 +52,12 @@ struct ApprovalView: View {
                             .padding(.top, 2).padding(.bottom, 12)
                         row("From account", payment.fromAccount)
                         row("To account", payment.toAccount)
+                        if !payment.accountOwner.isEmpty {
+                            row("Account owner", payment.accountOwner.capitalized)
+                        }
+                        if !payment.reference.isEmpty {
+                            row("Reference", payment.reference)
+                        }
                         Text("Rich Authorization Request · RFC 9396 · governed by Ping Authorize")
                             .font(.system(size: 11)).foregroundColor(Brand.muted).padding(.top, 12)
                     }

@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="220" viewBox="0 0 900 220">
+  <!-- ID Partners horizontal lockup: orange square i-dot · "iD" ink · "PARTNERS" orange.
+       Swap the ink fill (#111111) for #FFFFFF to get the on-dark variant. -->
+  <g>
+    <!-- lowercase "i": square dot over a stem -->
+    <rect x="40"  y="60"  width="40" height="40" rx="6" fill="#FF6600"/>
+    <rect x="40"  y="116" width="40" height="84" rx="4" fill="#111111"/>
+    <!-- "D" ink, "PARTNERS" orange -->
+    <text x="96" y="200" font-family="Helvetica Neue, Arial, sans-serif"
+          font-weight="800" font-size="180" letter-spacing="-2">
+      <tspan fill="#111111">D</tspan><tspan fill="#FF6600">PARTNERS</tspan>
+    </text>
+  </g>
+</svg>
