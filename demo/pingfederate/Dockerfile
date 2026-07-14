@@ -1,4 +1,9 @@
-# Staging PF: stock PF 13.0.3 + prod config-archive + license + the REBUILT oidf module (with SD-JWT).
+# Staging PF: stock PF 13.0.3 + prod config-archive + the REBUILT oidf module (with SD-JWT).
+# LICENSING: DevOps-licensed — no pingfederate.lic is baked. The stock image's startup hooks
+# fetch a fresh 30-day eval license when PING_IDENTITY_DEVOPS_USER / PING_IDENTITY_DEVOPS_KEY
+# (+ PING_IDENTITY_ACCEPT_EULA=YES) are set as Railway service vars and NO license file exists.
+# Every restart/redeploy re-fetches, so licenses never need re-baking. Do NOT re-add a
+# COPY pingfederate.lic line: an existing file takes precedence and disables the DevOps fetch.
 FROM pingidentity/pingfederate:13.0.3-alpine_3.23.4-al21-latest
 USER root
 # Config restore via PF's native drop-in-deployer: the DataDeployer timer
@@ -13,7 +18,6 @@ COPY --chown=9031:0 overlay/pf.jwk /opt/in/instance/server/default/data/pf.jwk
 COPY --chown=9031:0 overlay/pingfederate-system-keys.xml /opt/in/instance/server/default/data/pingfederate-system-keys.xml
 # Force import: the raw-zipped archive carries no version stamp; both sides are 13.0.3.
 COPY --chown=9031:0 overlay/config-store/org.sourceid.saml20.domain.mgmt.impl.DataDeployer.xml /opt/in/instance/server/default/data/config-store/org.sourceid.saml20.domain.mgmt.impl.DataDeployer.xml
-COPY --chown=9031:0 pingfederate.lic /opt/in/instance/server/default/conf/pingfederate.lic
 COPY --chown=9031:0 oidf.war /opt/in/instance/server/default/deploy/oidf.war
 COPY --chown=9031:0 pf-oidf-modules.jar /opt/in/instance/server/default/deploy/pf-oidf-modules.jar
 COPY --chown=9031:0 jose4j-0.9.6.jar /opt/in/instance/server/default/deploy/jose4j-0.9.6.jar
