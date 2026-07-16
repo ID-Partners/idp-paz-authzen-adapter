@@ -1,0 +1,149 @@
+# Local run of the demo with the ACCOUNTS/PAYMENTS SPLIT topology.
+#   docker compose -f docker-compose.split.yml up --build
+#
+# This is the split of the MCP + gateway + service layer: each banking domain has
+# its own vertical stack (MCP server → gateway/PEP → REST service), so the
+# accounts domain and the payments domain are enforced at independent
+# policy-enforcement points. The task agents were already role-specific; here the
+# layers BELOW them are separated too.
+#
+# Topology:
+#   account task-agent  ─▶ kong-accounts:/mcp (PEP#1) ─▶ accounts-mcp
+#                                accounts-mcp ─▶ kong-accounts:/bank (PEP#2) ─▶ accounts-api
+#   payments task-agent ─▶ kong-payments:/mcp (PEP#1) ─▶ payments-mcp
+#                                payments-mcp ─▶ kong-payments:/bank (PEP#2) ─▶ payments-api
+#                                payments-api ─▶ accounts-api  (DIRECT, internal move)
+#   every PEP ─AuthZEN─▶ authzen-adapter ─▶ Ping Authorize   (tools/call via the shared coaz-pep)
+#
+# accounts-api is the account system-of-record. The payment is fully authorized at
+# the PAYMENTS gateway against a policy that CARRIES A COPY OF THE ACCOUNT RULES
+# (so the payment PDP already enforces what the account domain would), then the
+# debit executes directly against accounts-api — no second gateway hop, so the
+# working payment path stays low-risk. Point PDP_URL / PDP_SECRET at Ping Authorize.
+
+services:
+  authzen-adapter:
+    build: ../authzen-adapter
+    environment:
+      PORT: "8080"
+      API_KEY: "${AUTHZEN_API_KEY:-Password1}"
+      PDP_DOMAIN_PREFIX: "idpartners"
+      PDP_ATTRIBUTE_PREFIX: "AuthZEN"
+      PDP_SERVICE: "AuthZEN"
+      PDP_ACTION: "authorize"
+      PDP_URL: "${PDP_URL:-https://host.docker.internal:1443/governance-engine}"
+      QUERY_URL: "${QUERY_URL:-https://host.docker.internal:1443/governance-engine/query}"
+      PDP_SECRET_HEADER: "${PDP_SECRET_HEADER:-CLIENT_TOKEN}"
+      PDP_SECRET: "${PDP_SECRET:-2FederateM0re}"
+    ports:
+      - "8080:8080"
+
+  # One shared COAZ (AuthZEN MCP profile) engine; both gateways delegate
+  # tools/call authorization to it. Stateless — discovery is per-request from the
+  # target MCP server's tools/list.
+  coaz-pep:
+    build: ./coaz-pep
+    environment:
+      AUTHZEN_URL: "http://authzen-adapter:8080"
+      AUTHZEN_API_KEY: "${AUTHZEN_API_KEY:-Password1}"
+    expose:
+      - "9191"
+      - "9192"
+    depends_on:
+      - authzen-adapter
+
+  # ── Accounts vertical stack ────────────────────────────────────────────────
+  accounts-api:
+    build: ./accounts-api
+    environment:
+      PORT: "8070"
+    expose:
+      - "8070"
+
+  accounts-mcp:
+    build: ./accounts-mcp
+    environment:
+      PORT: "8090"
+      # accounts tools call the Accounts API through the accounts gateway (PEP #2)
+      BANK_API_BASE_URL: "http://kong-accounts:8000/bank"
+      AGENT_ID: "urn:agent:northwind-onboarding:v1"
+    expose:
+      - "8090"
+
+  kong-accounts:
+    build: ./kong
+    environment:
+      BANK_MCP_URL: "http://accounts-mcp:8090"
+      BANK_API_URL: "http://accounts-api:8070"
+      AUTHZEN_URL: "http://authzen-adapter:8080"
+      AUTHZEN_API_KEY: "${AUTHZEN_API_KEY:-Password1}"
+      COAZ_URL: "http://coaz-pep:9192"
+    ports:
+      - "8010:8000"   # accounts proxy on host:8010
+    depends_on:
+      - authzen-adapter
+      - coaz-pep
+      - accounts-api
+      - accounts-mcp
+
+  # ── Payments vertical stack ────────────────────────────────────────────────
+  payments-api:
+    build: ./payments-api
+    environment:
+      PORT: "8071"
+      # execute the money move DIRECTLY against the accounts system-of-record; the
+      # payment was already authorized at the payments gateway by a policy that
+      # carries a copy of the account rules, so no second gateway hop is needed.
+      ACCOUNTS_API_BASE: "http://accounts-api:8070"
+    expose:
+      - "8071"
+
+  payments-mcp:
+    build: ./payments-mcp
+    environment:
+      PORT: "8090"
+      # payments tools call the Payments API through the payments gateway (PEP #2)
+      BANK_API_BASE_URL: "http://kong-payments:8000/bank"
+      AGENT_ID: "urn:agent:northwind-onboarding:v1"
+    expose:
+      - "8090"
+
+  kong-payments:
+    build: ./kong
+    environment:
+      BANK_MCP_URL: "http://payments-mcp:8090"
+      BANK_API_URL: "http://payments-api:8071"
+      AUTHZEN_URL: "http://authzen-adapter:8080"
+      AUTHZEN_API_KEY: "${AUTHZEN_API_KEY:-Password1}"
+      COAZ_URL: "http://coaz-pep:9192"
+    ports:
+      - "8011:8000"   # payments proxy on host:8011
+    depends_on:
+      - authzen-adapter
+      - coaz-pep
+      - payments-api
+      - payments-mcp
+
+  # The two role-specific task agents point at their domain gateway (env only —
+  # no task-agent code change; MCP_SERVER_URL is the single switch).
+  account-agent:
+    build: ./task-agent
+    environment:
+      PORT: "8000"
+      AGENT_ROLE: "account"
+      MCP_SERVER_URL: "http://kong-accounts:8000/mcp"
+    expose:
+      - "8000"
+    depends_on:
+      - kong-accounts
+
+  payments-agent:
+    build: ./task-agent
+    environment:
+      PORT: "8000"
+      AGENT_ROLE: "payments"
+      MCP_SERVER_URL: "http://kong-payments:8000/mcp"
+    expose:
+      - "8000"
+    depends_on:
+      - kong-payments
