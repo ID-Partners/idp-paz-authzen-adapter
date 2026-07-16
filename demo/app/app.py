@@ -567,59 +567,175 @@ _SIGNUP_HTML = """<!doctype html><html><head><meta charset="utf-8">
 <title>Sign up — ID Partners Bank</title>
 <style>body{font-family:-apple-system,system-ui,sans-serif;background:#101418;color:#e8e8e8;
 display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}
-.card{background:#1a2027;border:1px solid #2a323c;border-radius:14px;padding:34px;width:340px}
+.card{background:#1a2027;border:1px solid #2a323c;border-radius:14px;padding:34px;width:360px}
 h1{font-size:19px;margin:0 0 6px}p{color:#9aa5b1;font-size:13px;line-height:1.5}
 input{width:100%;box-sizing:border-box;padding:11px;border-radius:8px;border:1px solid #2a323c;
 background:#101418;color:#e8e8e8;font-size:15px;margin:12px 0}
 button{width:100%;padding:12px;border:0;border-radius:8px;background:#2d7a4f;color:#fff;
-font-size:15px;font-weight:600;cursor:pointer}</style></head><body>
+font-size:15px;font-weight:600;cursor:pointer}button:disabled{opacity:.5}
+#msg{font-size:13px;margin-top:12px;min-height:18px}.err{color:#ff8b7b}.ok{color:#5fd08a}</style>
+</head><body>
 <div class="card"><h1>🔑 Create your account</h1>
-<p>Choose a username. No password — you'll secure your account with a <b>passkey</b>
-(Face&nbsp;ID) on the next screen.</p>
-<form method="get" action="/signup">
-<input name="user" placeholder="username (e.g. carol)" pattern="[a-z0-9._-]{2,30}"
- title="lowercase letters, digits, . _ -" required autofocus>
-<button type="submit">Continue → passkey</button></form></div></body></html>"""
+<p>Choose a username, then create a <b>passkey</b> — Face&nbsp;ID on this device, or scan the
+QR to save it to your iPhone. No password, ever.</p>
+<input id="u" placeholder="username (e.g. carol)" pattern="[a-z0-9._-]{2,30}" autofocus>
+<button id="go">Create passkey</button>
+<div id="msg"></div></div>
+<script>
+const b64uToBuf = s => { s = s.replace(/-/g,'+').replace(/_/g,'/'); s += '='.repeat((4-s.length%4)%4);
+  const bin = atob(s); const b = new Uint8Array(bin.length);
+  for (let i=0;i<bin.length;i++) b[i]=bin.charCodeAt(i); return b.buffer; };
+const bufToB64u = buf => { const b = new Uint8Array(buf); let s='';
+  for (let i=0;i<b.length;i++) s+=String.fromCharCode(b[i]);
+  return btoa(s).replace(/\\+/g,'-').replace(/\\//g,'_').replace(/=+$/,''); };
+const msg = (t,c) => { const m=document.getElementById('msg'); m.textContent=t; m.className=c||''; };
+document.getElementById('go').onclick = async () => {
+  const user = document.getElementById('u').value.trim().toLowerCase();
+  if(!/^[a-z0-9._-]{2,30}$/.test(user)){ msg('Pick a valid username.', 'err'); return; }
+  const btn = document.getElementById('go'); btn.disabled = true;
+  try {
+    msg('Setting up your account…');
+    const beg = await fetch('/signup/passkey/begin', {method:'POST',
+      headers:{'content-type':'application/json'}, body: JSON.stringify({user})}).then(r=>r.json());
+    if(beg.error){ msg(beg.error+(beg.detail?': '+beg.detail:''), 'err'); btn.disabled=false; return; }
+    const o = beg.creationOptions;
+    o.challenge = b64uToBuf(o.challenge);
+    o.user.id = b64uToBuf(o.user.id);
+    (o.excludeCredentials||[]).forEach(c => c.id = b64uToBuf(c.id));
+    msg('Follow your device prompt to create the passkey…');
+    const cred = await navigator.credentials.create({publicKey: o});
+    const att = {
+      id: cred.id, type: cred.type,
+      rawId: bufToB64u(cred.rawId),
+      response: {
+        clientDataJSON: bufToB64u(cred.response.clientDataJSON),
+        attestationObject: bufToB64u(cred.response.attestationObject),
+      }
+    };
+    msg('Finishing…');
+    const fin = await fetch('/signup/passkey/finish', {method:'POST',
+      headers:{'content-type':'application/json'},
+      body: JSON.stringify({userId: beg.userId, deviceId: beg.deviceId, user,
+                            origin: location.origin, attestation: JSON.stringify(att)})}).then(r=>r.json());
+    if(fin.ok){ msg('✓ Passkey created — signing you in…', 'ok');
+      setTimeout(()=>location.href='/?signedup=1', 700); }
+    else msg(fin.error+(fin.detail?': '+fin.detail:''), 'err');
+  } catch(e){ msg('Passkey cancelled or failed: '+e.message, 'err'); }
+  btn.disabled = false;
+};
+</script></body></html>"""
 
 
 @app.get("/signup")
 async def signup(user: str = ""):
-    """Passkey-only sign-up: the BFF creates the PingOne user (worker API — NO password
-    credential ever exists), then sends the customer to PingOne where the passkey-only
-    sign-on policy enrols a passkey on first sign-on. login_hint identifies the user."""
-    if not (P1_ENV and SIGNUP_CLIENT_ID and SIGNUP_CLIENT_SECRET):
-        return HTMLResponse("Sign-up not configured — set SIGNUP_CLIENT_ID / "
-                            "SIGNUP_CLIENT_SECRET.", status_code=503)
-    user = (user or "").strip().lower()
-    if not user:
-        return HTMLResponse(_SIGNUP_HTML)
-    # Create the user passwordless (find-or-create + MFA-enable), provision SCIM + link.
+    """Passkey sign-up (BFF-orchestrated WebAuthn). The whole passkey ceremony runs on THIS
+    origin so the browser's WebAuthn works directly (Safari Face ID + save-to-iPhone QR):
+    the BFF creates the PingOne user, PingOne's FIDO2 device API issues the
+    publicKeyCredentialCreationOptions (rp.id = this host), the browser creates the passkey,
+    and the BFF activates it. No password, no DaVinci, no PingOne hosted redirect."""
+    return HTMLResponse(_SIGNUP_HTML)
+
+
+# WebAuthn RP id = this BFF's host (the passkey binds to it; the browser ceremony must run
+# on this exact origin). PingOne's FIDO2 policy default was pointed at a host-matching rp.
+def _rp_id() -> str:
+    return urllib.parse.urlparse(APP_BASE_URL).hostname or "localhost"
+
+
+def _b64u(b: bytes) -> str:
+    return base64.urlsafe_b64encode(b).decode().rstrip("=")
+
+
+def _bytes_to_b64u(arr: list) -> str:
+    """PingOne returns challenge/user.id as Java signed-byte arrays; the browser needs
+    base64url. Fold negatives into 0-255 first."""
+    return _b64u(bytes((x + 256) if x < 0 else x for x in arr))
+
+
+@app.post("/signup/passkey/begin")
+async def passkey_begin(request: Request):
+    """Create the PingOne user (passwordless) + a FIDO2 device, and return WebAuthn
+    creationOptions the browser hands to navigator.credentials.create()."""
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        body = {}
+    user = str(body.get("user") or "").strip().lower()
+    if not user or not P1_ENV:
+        return JSONResponse(status_code=400, content={"error": "username required"})
     try:
         async with httpx.AsyncClient(timeout=25.0) as c:
             tok = await _p1_token(c)
             uid = await _p1_ensure_user(c, tok, user)
+            # provision SCIM (best-effort)
+            try:
+                sr = await c.get(f"{PROOFING_DIRECTORY_URL}/scim/v2/Users",
+                                 params={"filter": f'userName eq "{user}"'})
+                if not sr.json().get("Resources"):
+                    await c.post(f"{PROOFING_DIRECTORY_URL}/scim/v2/Users",
+                                 json={"userName": user, "displayName": user.title(),
+                                       "active": True})
+                await _scim_set_p1id(user, uid)
+            except Exception:  # noqa: BLE001
+                pass
+            # clear any stale pending FIDO2 devices, then create a fresh one
+            dr = await c.get(f"{P1_API}/v1/environments/{P1_ENV}/users/{uid}/devices",
+                             headers={"Authorization": f"Bearer {tok}"})
+            for d in (dr.json().get("_embedded") or {}).get("devices") or []:
+                if d.get("status") == "ACTIVATION_REQUIRED":
+                    await c.delete(f"{P1_API}/v1/environments/{P1_ENV}/users/{uid}/devices/{d['id']}",
+                                   headers={"Authorization": f"Bearer {tok}"})
+            r = await c.post(
+                f"{P1_API}/v1/environments/{P1_ENV}/users/{uid}/devices",
+                headers={"Authorization": f"Bearer {tok}",
+                         "Content-Type": "application/vnd.pingidentity.device.fido2+json"},
+                json={"type": "FIDO2",
+                      "rp": {"id": _rp_id(), "name": "ID Partners Bank"}})
+            if r.status_code >= 300:
+                return JSONResponse(status_code=502, content={
+                    "error": "device create failed", "detail": r.text[:300]})
+            dev = r.json()
     except Exception as exc:  # noqa: BLE001
-        return HTMLResponse(f"Could not create your account: {exc}", status_code=502)
+        return JSONResponse(status_code=502, content={"error": str(exc)})
+    # creationOptions arrives as a JSON string with signed-byte arrays; convert the two
+    # binary fields (challenge, user.id) to base64url for the browser.
+    opts = json.loads(dev.get("publicKeyCredentialCreationOptions") or "{}")
+    opts["challenge"] = _bytes_to_b64u(opts["challenge"])
+    opts["user"]["id"] = _bytes_to_b64u(opts["user"]["id"])
+    for ec in opts.get("excludeCredentials") or []:
+        if isinstance(ec.get("id"), list):
+            ec["id"] = _bytes_to_b64u(ec["id"])
+    return {"userId": uid, "deviceId": dev["id"], "user": user, "creationOptions": opts}
+
+
+@app.post("/signup/passkey/finish")
+async def passkey_finish(request: Request):
+    """Activate the FIDO2 device with the browser's attestation, then sign the user in
+    (BFF session). The passkey now lives in PingOne bound to this RP."""
+    body = await request.json()
+    uid = body.get("userId"); did = body.get("deviceId")
+    attestation = body.get("attestation"); user = str(body.get("user") or "").lower()
+    origin = body.get("origin") or APP_BASE_URL
+    if not (uid and did and attestation):
+        return JSONResponse(status_code=400, content={"error": "missing fields"})
     try:
-        async with httpx.AsyncClient(timeout=8.0) as c:
-            sr = await c.get(f"{PROOFING_DIRECTORY_URL}/scim/v2/Users",
-                             params={"filter": f'userName eq "{user}"'})
-            if not sr.json().get("Resources"):
-                await c.post(f"{PROOFING_DIRECTORY_URL}/scim/v2/Users",
-                             json={"userName": user, "displayName": user.title(),
-                                   "active": True})
-        await _scim_set_p1id(user, uid)
-    except Exception:  # noqa: BLE001
-        pass
-    state = secrets.token_urlsafe(16)
-    params = {"client_id": SIGNUP_CLIENT_ID, "response_type": "code",
-              "redirect_uri": APP_BASE_URL + "/signup/callback",
-              "scope": "openid profile", "state": state,
-              "login_hint": user}
-    resp = RedirectResponse(f"{P1_AUTH}/{P1_ENV}/as/authorize?"
-                            + urllib.parse.urlencode(params), status_code=302)
-    resp.set_cookie(SIGNUP_TX_COOKIE, _sign({"state": state}, 900),
-                    httponly=True, secure=True, samesite="lax", max_age=900)
+        async with httpx.AsyncClient(timeout=20.0) as c:
+            tok = await _p1_token(c)
+            r = await c.post(
+                f"{P1_API}/v1/environments/{P1_ENV}/users/{uid}/devices/{did}",
+                headers={"Authorization": f"Bearer {tok}",
+                         "Content-Type": "application/vnd.pingidentity.device.activate+json"},
+                json={"origin": origin, "attestation": attestation})
+            if r.status_code >= 300:
+                return JSONResponse(status_code=400, content={
+                    "error": "activation failed", "detail": r.text[:300]})
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse(status_code=502, content={"error": str(exc)})
+    # Passkey enrolled + activated → the customer is authenticated. Establish the session.
+    session = {"sub": user, "name": user.title(), "acr": "urn:northwind:loa:passkey"}
+    resp = JSONResponse({"ok": True, "sub": user})
+    resp.set_cookie(SESSION_COOKIE, _sign(session, SESSION_TTL),
+                    httponly=True, secure=True, samesite="lax", max_age=SESSION_TTL)
     return resp
 
 
