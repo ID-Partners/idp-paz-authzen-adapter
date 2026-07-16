@@ -26,3 +26,31 @@ resource "davinci_variable" "company" {
   value          = each.value.value != "" ? each.value.value : null
   mutable        = true
 }
+
+# ── OOTB Passwordless template company variables (flow reads {{global.variables.*}}) ─────────
+# Passkey-only posture: passwordless required, magic-link off, agreement off.
+locals {
+  ootb_company_variables = {
+    ciam_passwordlessRequired          = { value = "true", desc = "Passwordless-only: never fall back to password" }
+    ciam_magicLinkEnabled              = { value = "false", desc = "Magic-link authentication disabled" }
+    registartionPopulationId           = { value = "fbd0b138-43fe-4db6-a3c7-ff500da75e81", desc = "Population for registrations (template's spelling)" }
+    rpid                               = { value = "auth.pingone.asia", desc = "WebAuthn relying-party id" }
+    ciam_recoveryValidationAttempts    = { value = "5", desc = "Recovery code attempt limit" }
+    ciam_verificationValidationAttempts = { value = "5", desc = "Verification code attempt limit" }
+    agreementId                        = { value = "", desc = "Agreement (ToS) id — unused, agreement disabled" }
+    ciam_authMethod                    = { value = "", desc = "Runtime scratch (flow-written)" }
+    ciam_deviceId                      = { value = "", desc = "Runtime scratch (flow-written)" }
+    ciam_errorMessage                  = { value = "", desc = "Runtime scratch (flow-written)" }
+  }
+}
+
+resource "davinci_variable" "ootb_company" {
+  for_each       = local.ootb_company_variables
+  environment_id = var.pingone_env_id
+  context        = "company"
+  name           = each.key
+  description    = each.value.desc
+  type           = "string"
+  value          = each.value.value != "" ? each.value.value : null
+  mutable        = true
+}

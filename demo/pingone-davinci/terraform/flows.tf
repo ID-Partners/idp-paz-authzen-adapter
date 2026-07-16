@@ -44,7 +44,9 @@ resource "davinci_application_flow_policy" "bank_signup_registration" {
   name           = "Bank Signup Passkey Registration"
   status         = "enabled"
   policy_flow {
-    flow_id    = davinci_flow.passkey_registration.id
+    # The OOTB Passwordless main flow: authorize-integrated + no-device→enrol branch.
+    # Policy CHANGED IN PLACE (same policyId) per davinci-pingone-integration invariant 1.
+    flow_id    = davinci_flow.ootb_passwordless_main.id
     version_id = -1
     weight     = 100
   }
