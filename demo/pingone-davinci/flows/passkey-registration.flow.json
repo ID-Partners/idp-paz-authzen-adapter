@@ -15,7 +15,7 @@
  "currentVersion": 1,
  "customerId": "",
  "deployedDate": 1719402906327,
- "description": "Last updated: June 26th, 2024",
+ "description": "Bank signup passkey flow (redeploy after variable creation)",
  "flowStatus": "enabled",
  "isOutputSchemaSaved": false,
  "name": "Bank Signup - Passwordless Registration (Passkey)",
@@ -368,7 +368,9 @@
        "nodeTitle": {
         "value": "Issue updating user's MFA device to active"
        },
-       "nodeDescription": {},
+       "nodeDescription": {
+        "value": "Error: could not activate the user's MFA device."
+       },
        "errorDescription": {
         "value": "[\n  {\n    \"children\": [\n      {\n        \"text\": \"There was a problem activating your MFA device on your PingOne user account with PingOne MFA.\"\n      }\n    ]\n  }\n]"
        },
@@ -788,7 +790,9 @@
        "nodeTitle": {
         "value": "Failed to register FIDO device"
        },
-       "nodeDescription": {}
+       "nodeDescription": {
+        "value": "Error: FIDO2 device registration failed."
+       }
       }
      },
      "position": {
@@ -1896,7 +1900,9 @@
        "title": {
         "value": "[\n  {\n    \"children\": [\n      {\n        \"text\": \"Registration Success!\"\n      },\n      {\n        \"text\": \"\"\n      }\n    ]\n  }\n]"
        },
-       "nodeDescription": {},
+       "nodeDescription": {
+        "value": "Registration complete page; continues to the OIDC completion node."
+       },
        "textOne": {
         "value": "[\n  {\n    \"children\": [\n      {\n        \"text\": \"\"\n      },\n      {\n        \"text\": \"Your Passkey device is now ready for account sign on.\"\n      }\n    ]\n  }\n]"
        },
@@ -1904,7 +1910,7 @@
         "value": "[\n  {\n    \"children\": [\n      {\n        \"text\": \"\"\n      },\n      {\n        \"text\": \"\"\n      }\n    ]\n  }\n]"
        },
        "oeInteractionCacheExpire": {
-        "value": true
+        "value": false
        }
       },
       "idUnique": "jflq570dwh"
@@ -2012,6 +2018,9 @@
        },
        "nodeTitle": {
         "value": "Enable Users MFA"
+       },
+       "nodeDescription": {
+        "value": "Passkey (FIDO2) registration step."
        }
       }
      },
@@ -2069,6 +2078,9 @@
        },
        "nodeTitle": {
         "value": "Enable MFA Error"
+       },
+       "nodeDescription": {
+        "value": "Error: could not enable MFA for the user."
        }
       }
      },
@@ -2268,6 +2280,9 @@
        },
        "nodeTitle": {
         "value": "Resend Verification Code"
+       },
+       "nodeDescription": {
+        "value": "Email verification step."
        }
       }
      },
@@ -2549,6 +2564,9 @@
        },
        "nodeTitle": {
         "value": "Error Validating Code"
+       },
+       "nodeDescription": {
+        "value": "Error: verification code validation failed."
        }
       }
      },
@@ -2835,6 +2853,9 @@
        },
        "formFieldsList": {
         "value": []
+       },
+       "nodeDescription": {
+        "value": "Collect the new customer's details."
        }
       },
       "idUnique": "g9fybbwj88"
@@ -2899,6 +2920,9 @@
           "nameDefault": "p1UserId"
          }
         ]
+       },
+       "nodeDescription": {
+        "value": "Complete the PingOne-invoked sign-on (returns the created user)."
        }
       }
      },
@@ -4150,5 +4174,16 @@
    "companyId": ""
   }
  ],
- "connections": []
+ "connections": [],
+ "trigger": {},
+ "inputSchema": [],
+ "inputSchemaCompiled": {
+  "parameters": {
+   "type": "object",
+   "properties": {},
+   "additionalProperties": false,
+   "required": []
+  }
+ },
+ "isInputSchemaSaved": false
 }
