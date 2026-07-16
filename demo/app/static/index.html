@@ -354,8 +354,13 @@
     <button id="loginbtn" class="login-btn" type="button" onclick="location.href='/login'">
       🎫 Sign in with PingFederate
     </button>
+    <button class="login-btn" type="button" style="background:#2d7a4f;margin-top:8px"
+            onclick="location.href='/signup'">
+      🔑 New customer? Sign up with a passkey
+    </button>
     <div class="login-hint">You'll be redirected to the PingFederate login page.<br>
-      Demo credentials — <b>alice</b> / <b>2Federate</b></div>
+      Demo credentials — <b>alice</b> / <b>2Federate</b><br>
+      Sign-up registers you at PingOne with a passkey — no password needed after that.</div>
   </div>
 </div>
 
@@ -368,12 +373,15 @@
     <span class="avatar" id="waAvatar">A</span>
     <span>Signed in as <b id="waName">Alice</b> <span id="waSub" style="color:var(--muted)"></span></span>
     <button type="button" class="logout" id="viewtoken" title="Show the PingFederate token in this session">🔑 View token</button>
+    <button type="button" class="logout" id="pairphone" title="Pair your phone for approvals (QR)">📱 Pair phone</button>
     <button type="button" class="logout" id="logout">Sign out</button>
   </span>
   <span id="signedout" class="whoami" hidden>
     <span style="color:var(--muted)">Not signed in</span>
     <button type="button" class="login-btn" style="width:auto;padding:7px 14px;margin:0"
             onclick="location.href='/login'">🎫 Sign in with PingFederate</button>
+    <button type="button" class="login-btn" style="width:auto;padding:7px 14px;margin:0;background:#2d7a4f"
+            onclick="location.href='/signup'">🔑 Sign up</button>
   </span>
 </header>
 
@@ -656,7 +664,38 @@ async function showActiveRar(){
     autoScroll();
   } catch(e){}
 }
+// Onboarding: after sign-up (?signedup=1) — or the header 📱 button — show the QR that
+// pairs the customer's phone. Scanning it with the iPhone camera opens the approver app
+// (idpapprover:// URL scheme), which pairs automatically → identity-proofing and payment
+// pushes work for this user.
+async function showOnboardingQr(auto){
+  let q;
+  try { q = await fetch('/onboarding/qr').then(r=>r.json()); } catch(e){ q = {error:String(e)}; }
+  if(q.error || !q.svg){
+    out.appendChild(el('step tool_result',
+      `<div class="label">📱 Phone pairing</div><span class="decision deny">✘ unavailable</span>
+       <div class="reason">${esc(q.error||'Could not mint a pairing key.')}</div>`));
+    return;
+  }
+  out.appendChild(el('step tool_result convo',
+    `<div class="label">${auto ? '🎉 Welcome! One more step — pair your phone' : '📱 Pair your phone'}</div>
+     <div>Scan this with your iPhone <b>camera</b>. It opens the ID Partners approver app and
+     pairs it to <b>${esc(q.user)}</b> — that's how you'll approve payments and present your
+     licence when opening accounts.</div>
+     <div style="background:#fff;border-radius:10px;padding:14px;margin:10px 0;max-width:260px">${q.svg}</div>
+     <div style="font-size:11px;color:var(--muted)">Key expires ${esc(q.expiresAt||'soon')} —
+     press 📱 Pair phone up top to mint a fresh one.</div>`));
+  autoScroll();
+}
 function resumePending(){
+  if(new URLSearchParams(location.search).get('signedup') === '1'){
+    history.replaceState(null, '', '/');   // don't re-trigger on reload
+    out.appendChild(el('step agent convo',
+      `<div class="label">✅ Account created — signed in with a passkey</div>
+       Your identity was registered at PingOne and brokered into a PingFederate session
+       (RFC 8693 token exchange), so everything here works exactly as it does for alice.`));
+    showOnboardingQr(true);
+  }
   const p = sessionStorage.getItem('pending_prompt');
   if(!p) return;
   sessionStorage.removeItem('pending_prompt');
@@ -710,6 +749,7 @@ async function openToken(){
 }
 function closeToken(){ tokenModal.classList.remove('open'); }
 document.getElementById('viewtoken').addEventListener('click', openToken);
+document.getElementById('pairphone').addEventListener('click', ()=>showOnboardingQr(false));
 document.getElementById('tokClose').addEventListener('click', closeToken);
 tokenModal.addEventListener('click', (e)=>{ if(e.target===tokenModal) closeToken(); });
 document.addEventListener('keydown', (e)=>{ if(e.key==='Escape') closeToken(); });

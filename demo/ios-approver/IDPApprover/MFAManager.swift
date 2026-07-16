@@ -465,6 +465,39 @@ final class MFAManager: ObservableObject {
         }
     }
 
+    /// Pair from a scanned onboarding QR (idpapprover://enroll?user=&key=): the web chat
+    /// already minted this identity's pairing key, so pair directly — no enrol fetch.
+    func pairFromLink(user: String, key: String) {
+        guard !signingIn else { return }
+        signingIn = true
+        Self.phoneLog("qr_pair", user)
+        PingOne.pair(key) { [weak self] _, error in
+            Task { @MainActor in
+                defer { self?.signingIn = false }
+                if let error {
+                    Self.phoneLog("qr_pair_error", "\(user): code=\(error.code) \(error.localizedDescription)")
+                    await Self.reconcilePairing(user: user)
+                    await self?.loadIdentities()
+                    if self?.identities.first(where: { $0.userName == user })?.paired == true {
+                        self?.activeUser = user
+                        self?.state = .paired
+                        self?.applyDeviceToken()
+                        self?.lastError = nil
+                        return
+                    }
+                    self?.lastError = "QR pairing failed: \(error.localizedDescription)"
+                    return
+                }
+                Self.phoneLog("qr_pair_ok", user)
+                self?.activeUser = user
+                self?.state = .paired
+                self?.applyDeviceToken()
+                await Self.reportPairing(user: user, paired: true)
+                await self?.loadIdentities()
+            }
+        }
+    }
+
     /// Ask the web app to check PingOne directly for this user's device state and sync the
     /// directory — recovers the "pair() errored but the device actually paired" case.
     private static func reconcilePairing(user: String) async {

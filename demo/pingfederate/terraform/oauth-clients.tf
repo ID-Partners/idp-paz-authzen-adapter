@@ -18,7 +18,13 @@ resource "pingfederate_oauth_client" "northwind_webapp" {
   name      = "Northwind Web App (BFF)"
   enabled   = true
 
-  grant_types = ["AUTHORIZATION_CODE"]
+  # TOKEN_EXCHANGE: the BFF brokers PingOne sign-up ID tokens into PF user tokens via the
+  # signupTE processor policy (see signup.tf) — RFC 8693, subject_token_type=id_token.
+  grant_types = ["AUTHORIZATION_CODE", "TOKEN_EXCHANGE"]
+
+  token_exchange_processor_policy_ref = {
+    id = pingfederate_oauth_token_exchange_processor_policy.signup.policy_id
+  }
 
   redirect_uris = [
     "https://northwind-app-production.up.railway.app/callback", # production

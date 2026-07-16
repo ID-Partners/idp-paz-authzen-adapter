@@ -68,6 +68,18 @@ struct RootView: View {
                              onPresent: mfa.openWalletForProofing,
                              onDecline: mfa.dismissProofing)
             }
+            // Onboarding by QR: the web chat shows a QR encoding
+            // idpapprover://enroll?user=<u>&key=<pairingKey>. Scanning it with the iPhone
+            // camera opens the app here, which pairs that identity automatically.
+            .onOpenURL { url in
+                guard url.scheme == "idpapprover", url.host == "enroll" else { return }
+                let q = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems
+                let user = q?.first(where: { $0.name == "user" })?.value ?? ""
+                let key = q?.first(where: { $0.name == "key" })?.value ?? ""
+                if !user.isEmpty, !key.isEmpty {
+                    mfa.pairFromLink(user: user, key: key)
+                }
+            }
     }
 }
 

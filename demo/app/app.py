@@ -552,6 +552,131 @@ def me(request: Request):
     return {"principal": {"sub": s.get("sub"), "name": s.get("name"), "acr": s.get("acr")}}
 
 
+# ── Sign-up: self-service registration + PASSKEY at PingOne, brokered into PF ────────
+# New customers register at PingOne (sign-on policy Bank_Signup_Passkey: create account →
+# enrol a passkey). The BFF then EXCHANGES the PingOne ID token at PF (RFC 8693, policy
+# signupTE) for a first-class PF user token — same userJwtATM shape as alice's login —
+# so the whole delegation chain works for the new user unchanged.
+SIGNUP_CLIENT_ID = os.environ.get("SIGNUP_CLIENT_ID", "")
+SIGNUP_CLIENT_SECRET = os.environ.get("SIGNUP_CLIENT_SECRET", "")
+SIGNUP_TX_COOKIE = "nw_signup_tx"
+
+
+@app.get("/signup")
+async def signup():
+    """Send the new customer to PingOne's hosted sign-on (register + passkey)."""
+    if not (P1_ENV and SIGNUP_CLIENT_ID and SIGNUP_CLIENT_SECRET):
+        return HTMLResponse("Sign-up not configured — set SIGNUP_CLIENT_ID / "
+                            "SIGNUP_CLIENT_SECRET.", status_code=503)
+    state = secrets.token_urlsafe(16)
+    params = {"client_id": SIGNUP_CLIENT_ID, "response_type": "code",
+              "redirect_uri": APP_BASE_URL + "/signup/callback",
+              "scope": "openid profile", "state": state}
+    resp = RedirectResponse(f"{P1_AUTH}/{P1_ENV}/as/authorize?"
+                            + urllib.parse.urlencode(params), status_code=302)
+    resp.set_cookie(SIGNUP_TX_COOKIE, _sign({"state": state}, 900),
+                    httponly=True, secure=True, samesite="lax", max_age=900)
+    return resp
+
+
+@app.get("/signup/callback")
+async def signup_callback(request: Request):
+    """PingOne redirect: exchange the code, broker the ID token into a PF user token."""
+    tx = _verify(request.cookies.get(SIGNUP_TX_COOKIE))
+    code = request.query_params.get("code")
+    state = request.query_params.get("state")
+    if not tx or not code or state != tx.get("state"):
+        return JSONResponse(status_code=400, content={"error": "invalid signup state"})
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as c:
+            tr = await c.post(f"{P1_AUTH}/{P1_ENV}/as/token",
+                              auth=(SIGNUP_CLIENT_ID, SIGNUP_CLIENT_SECRET),
+                              data={"grant_type": "authorization_code", "code": code,
+                                    "redirect_uri": APP_BASE_URL + "/signup/callback"})
+            tr.raise_for_status()
+            p1_tokens = tr.json()
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse(status_code=502,
+                            content={"error": f"PingOne token exchange failed: {exc}"})
+    id_token = p1_tokens.get("id_token", "")
+    id_claims = jwt.decode(id_token, options={"verify_signature": False}) if id_token else {}
+    username = (id_claims.get("preferred_username") or id_claims.get("sub") or "").lower()
+
+    # Broker into PF: the PingOne ID token is the RFC 8693 subject token; PF validates
+    # iss/signature/audience (signupTE) and mints a userJwtATM token, sub = username.
+    try:
+        async with httpx.AsyncClient(timeout=20.0, verify=False) as c:
+            xr = await c.post(PF_TOKEN, data={
+                "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+                "subject_token": id_token,
+                "subject_token_type": "urn:ietf:params:oauth:token-type:id_token",
+                "client_id": OIDC_CLIENT_ID, "client_secret": OIDC_CLIENT_SECRET,
+                "scope": DEFAULT_SCOPES})
+            if xr.status_code != 200:
+                return JSONResponse(status_code=502, content={
+                    "error": "PF brokering failed", "detail": xr.text[:300]})
+            pf_access = xr.json().get("access_token", "")
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse(status_code=502,
+                            content={"error": f"PF brokering failed: {exc}"})
+    at_claims = jwt.decode(pf_access, options={"verify_signature": False}) \
+        if pf_access.count(".") == 2 else {}
+    sub = at_claims.get("sub") or username
+
+    # Provision the new customer in the bank's SCIM directory (idempotent).
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as c:
+            sr = await c.get(f"{PROOFING_DIRECTORY_URL}/scim/v2/Users",
+                             params={"filter": f'userName eq "{sub}"'})
+            if not sr.json().get("Resources"):
+                await c.post(f"{PROOFING_DIRECTORY_URL}/scim/v2/Users",
+                             json={"userName": sub, "displayName": sub.title(),
+                                   "active": True})
+    except Exception:  # noqa: BLE001 — directory provisioning is best-effort
+        pass
+
+    session = {"sub": sub, "name": id_claims.get("name") or sub.title(),
+               "acr": at_claims.get("acr"), "pf_at": pf_access}
+    resp = RedirectResponse("/?signedup=1", status_code=302)
+    resp.set_cookie(SESSION_COOKIE, _sign(session, SESSION_TTL),
+                    httponly=True, secure=True, samesite="lax", max_age=SESSION_TTL)
+    resp.delete_cookie(SIGNUP_TX_COOKIE)
+    return resp
+
+
+@app.get("/onboarding/qr")
+async def onboarding_qr(request: Request):
+    """Onboard the customer's PHONE: mint a pairing key for the signed-in user and render
+    it as a QR encoding idpapprover://enroll?... — scanning it with the iPhone camera opens
+    the approver app, which pairs automatically. That enables the identity-proofing and
+    payment-approval pushes for this user."""
+    s = _session(request)
+    if not s:
+        return JSONResponse(status_code=401, content={"error": "login_required"})
+    user = (s.get("sub") or "").lower()
+    try:
+        pk = await _pingone_pairing_key(user)
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse(status_code=502, content={"error": str(exc)})
+    key = pk.get("code")
+    if not key:
+        return JSONResponse(status_code=502, content={"error": "no_pairing_key",
+                                                      "detail": json.dumps(pk)[:200]})
+    uri = f"idpapprover://enroll?user={urllib.parse.quote(user)}&key={urllib.parse.quote(key)}"
+    try:
+        import io
+        import qrcode
+        import qrcode.image.svg
+        img = qrcode.make(uri, image_factory=qrcode.image.svg.SvgPathImage,
+                          box_size=14, border=2)
+        buf = io.BytesIO()
+        img.save(buf)
+        svg = buf.getvalue().decode()
+    except Exception as exc:  # noqa: BLE001
+        svg = ""
+    return {"user": user, "uri": uri, "svg": svg, "expiresAt": pk.get("expiresAt", "")}
+
+
 @app.get("/session/token")
 def session_token(request: Request):
     """Return the decoded details of Alice's PingFederate token held in her
