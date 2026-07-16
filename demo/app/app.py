@@ -562,16 +562,60 @@ SIGNUP_CLIENT_SECRET = os.environ.get("SIGNUP_CLIENT_SECRET", "")
 SIGNUP_TX_COOKIE = "nw_signup_tx"
 
 
+_SIGNUP_HTML = """<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Sign up — ID Partners Bank</title>
+<style>body{font-family:-apple-system,system-ui,sans-serif;background:#101418;color:#e8e8e8;
+display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}
+.card{background:#1a2027;border:1px solid #2a323c;border-radius:14px;padding:34px;width:340px}
+h1{font-size:19px;margin:0 0 6px}p{color:#9aa5b1;font-size:13px;line-height:1.5}
+input{width:100%;box-sizing:border-box;padding:11px;border-radius:8px;border:1px solid #2a323c;
+background:#101418;color:#e8e8e8;font-size:15px;margin:12px 0}
+button{width:100%;padding:12px;border:0;border-radius:8px;background:#2d7a4f;color:#fff;
+font-size:15px;font-weight:600;cursor:pointer}</style></head><body>
+<div class="card"><h1>🔑 Create your account</h1>
+<p>Choose a username. No password — you'll secure your account with a <b>passkey</b>
+(Face&nbsp;ID) on the next screen.</p>
+<form method="get" action="/signup">
+<input name="user" placeholder="username (e.g. carol)" pattern="[a-z0-9._-]{2,30}"
+ title="lowercase letters, digits, . _ -" required autofocus>
+<button type="submit">Continue → passkey</button></form></div></body></html>"""
+
+
 @app.get("/signup")
-async def signup():
-    """Send the new customer to PingOne's hosted sign-on (register + passkey)."""
+async def signup(user: str = ""):
+    """Passkey-only sign-up: the BFF creates the PingOne user (worker API — NO password
+    credential ever exists), then sends the customer to PingOne where the passkey-only
+    sign-on policy enrols a passkey on first sign-on. login_hint identifies the user."""
     if not (P1_ENV and SIGNUP_CLIENT_ID and SIGNUP_CLIENT_SECRET):
         return HTMLResponse("Sign-up not configured — set SIGNUP_CLIENT_ID / "
                             "SIGNUP_CLIENT_SECRET.", status_code=503)
+    user = (user or "").strip().lower()
+    if not user:
+        return HTMLResponse(_SIGNUP_HTML)
+    # Create the user passwordless (find-or-create + MFA-enable), provision SCIM + link.
+    try:
+        async with httpx.AsyncClient(timeout=25.0) as c:
+            tok = await _p1_token(c)
+            uid = await _p1_ensure_user(c, tok, user)
+    except Exception as exc:  # noqa: BLE001
+        return HTMLResponse(f"Could not create your account: {exc}", status_code=502)
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as c:
+            sr = await c.get(f"{PROOFING_DIRECTORY_URL}/scim/v2/Users",
+                             params={"filter": f'userName eq "{user}"'})
+            if not sr.json().get("Resources"):
+                await c.post(f"{PROOFING_DIRECTORY_URL}/scim/v2/Users",
+                             json={"userName": user, "displayName": user.title(),
+                                   "active": True})
+        await _scim_set_p1id(user, uid)
+    except Exception:  # noqa: BLE001
+        pass
     state = secrets.token_urlsafe(16)
     params = {"client_id": SIGNUP_CLIENT_ID, "response_type": "code",
               "redirect_uri": APP_BASE_URL + "/signup/callback",
-              "scope": "openid profile", "state": state}
+              "scope": "openid profile", "state": state,
+              "login_hint": user}
     resp = RedirectResponse(f"{P1_AUTH}/{P1_ENV}/as/authorize?"
                             + urllib.parse.urlencode(params), status_code=302)
     resp.set_cookie(SIGNUP_TX_COOKIE, _sign({"state": state}, 900),
