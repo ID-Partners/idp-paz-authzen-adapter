@@ -63,6 +63,70 @@ struct RootView: View {
             .fullScreenCover(item: $mfa.pending) { payment in
                 ApprovalView(payment: payment, onApprove: mfa.approve, onDecline: mfa.deny)
             }
+            .fullScreenCover(item: $mfa.pendingProofing) { proofing in
+                ProofingView(proofing: proofing,
+                             onPresent: mfa.openWalletForProofing,
+                             onDecline: mfa.dismissProofing)
+            }
+    }
+}
+
+/// mDL identity-proofing request: the bank needs a verified mobile Driver's Licence
+/// before opening an account. "Present" hands off app2app to the wallet (openid4vp://).
+struct ProofingView: View {
+    let proofing: PendingProofing
+    let onPresent: () -> Void
+    let onDecline: () -> Void
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 6) {
+                IDPWordmark(size: 20)
+                Text("Bank").font(.system(size: 15, weight: .semibold)).foregroundColor(Brand.muted)
+                Spacer()
+            }
+            .padding(.horizontal, 22).padding(.top, 16).padding(.bottom, 12)
+            Divider().overlay(Brand.hair)
+
+            Spacer()
+            Image(systemName: "person.text.rectangle")
+                .font(.system(size: 56)).foregroundColor(Brand.orange)
+            Text("Verify your identity").font(.title2.bold())
+                .foregroundColor(Brand.ink).padding(.top, 18)
+            Text("Opening your account needs a verified mobile Driver's Licence. "
+                 + "Present it from your wallet — only your name and licence number are shared.")
+                .font(.callout).foregroundColor(Brand.muted)
+                .multilineTextAlignment(.center).padding(.horizontal, 36).padding(.top, 6)
+
+            VStack(spacing: 8) {
+                HStack { Text("Document").foregroundColor(Brand.muted); Spacer()
+                         Text(proofing.doctype).font(.footnote.monospaced()).foregroundColor(Brand.ink) }
+                HStack { Text("Reference").foregroundColor(Brand.muted); Spacer()
+                         Text(proofing.code).font(.footnote.monospaced()).foregroundColor(Brand.ink) }
+                if !proofing.subject.isEmpty {
+                    HStack { Text("For").foregroundColor(Brand.muted); Spacer()
+                             Text(proofing.subject.capitalized).foregroundColor(Brand.ink) }
+                }
+            }
+            .font(.subheadline)
+            .padding(16)
+            .background(RoundedRectangle(cornerRadius: 12).stroke(Brand.hair))
+            .padding(.horizontal, 28).padding(.top, 22)
+
+            Spacer()
+            Button(action: onPresent) {
+                Label("Present my licence", systemImage: "wallet.pass")
+                    .font(.headline).foregroundColor(.white)
+                    .frame(maxWidth: .infinity).padding(.vertical, 15)
+                    .background(Brand.orange).clipShape(RoundedRectangle(cornerRadius: 12))
+            }
+            .padding(.horizontal, 28)
+            Button(action: onDecline) {
+                Text("Not now").font(.subheadline).foregroundColor(Brand.muted)
+            }
+            .padding(.top, 12).padding(.bottom, 26)
+        }
+        .background(Brand.paper.ignoresSafeArea())
     }
 }
 
@@ -120,9 +184,50 @@ struct ProfileView: View {
         NavigationView {
             List {
                 Section("Account") {
-                    row("Signed in as", "Bob")
-                    row("Role", "Bank staff")
+                    row("Signed in as", mfa.identities.first(where: { $0.userName == mfa.activeUser })?
+                        .displayName ?? mfa.activeUser.capitalized)
+                    row("Role", mfa.activeUser == "bob" ? "Bank staff" : "Customer")
                     row("Bank", Brand.bankName)
+                }
+                // Identity switcher: the SCIM directory's identities. Signing in pairs THIS
+                // device for that user (the SDK supports multiple concurrent pairings, so
+                // switching never tears the other identity down).
+                Section("Identities") {
+                    if mfa.identities.isEmpty {
+                        Text("Loading identities…").font(.footnote).foregroundColor(Brand.muted)
+                    }
+                    ForEach(mfa.identities) { ident in
+                        HStack(spacing: 10) {
+                            Image(systemName: ident.userName == mfa.activeUser
+                                  ? "person.crop.circle.badge.checkmark" : "person.crop.circle")
+                                .foregroundColor(ident.userName == mfa.activeUser ? Brand.orange : Brand.muted)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(ident.displayName).foregroundColor(Brand.ink)
+                                Text(ident.paired ? "Paired" : "Not paired on this device")
+                                    .font(.caption).foregroundColor(Brand.muted)
+                            }
+                            Spacer()
+                            if ident.userName == mfa.activeUser {
+                                Text("Active").font(.caption.bold()).foregroundColor(Brand.orange)
+                            } else if ident.paired {
+                                Button("Switch") { mfa.activeUser = ident.userName }
+                                    .font(.caption.bold()).foregroundColor(Brand.orange)
+                                    .buttonStyle(.borderless)
+                            } else {
+                                Button(mfa.signingIn ? "Signing in…" : "Sign in") {
+                                    mfa.signIn(user: ident.userName)
+                                }
+                                .font(.caption.bold()).foregroundColor(Brand.orange)
+                                .buttonStyle(.borderless)
+                                .disabled(mfa.signingIn)
+                            }
+                        }
+                    }
+                    if let active = mfa.identities.first(where: { $0.userName == mfa.activeUser }),
+                       active.paired {
+                        Button("Sign out \(active.displayName)") { mfa.signOut(user: active.userName) }
+                            .font(.footnote).foregroundColor(.red)
+                    }
                 }
                 Section("Device") {
                     if mfa.isPaired && !repairing {

@@ -95,6 +95,274 @@ def health():
 PF_PAR = os.environ.get("PF_PAR_URL", PF_BASE + "/as/par.oauth2")
 RAR_TYPE = os.environ.get("PAYMENT_RAR_TYPE", "payment_initiation")
 
+# The OID4VP verifier that runs the mDL identity-proofing presentation (idp-pf-vcs — a
+# different Railway project, so reached over its PUBLIC URL) and the proofing directory
+# (internal) where a verified presentation is recorded for the PDP origination gate to read.
+VERIFIER_URL = os.environ.get(
+    "VERIFIER_URL", "https://verifier-production-9118.up.railway.app").rstrip("/")
+PROOFING_DIRECTORY_URL = os.environ.get(
+    "PROOFING_DIRECTORY_URL", "http://proofing-directory.railway.internal:8075").rstrip("/")
+PROOFING_DOCTYPE = os.environ.get("PROOFING_DOCTYPE", "org.iso.18013.5.1.mDL")
+# The AuthZEN adapter, which owns the mDL identity-proofing gate SWITCH (/admin/proofing-gate).
+AUTHZEN_ADAPTER_URL = os.environ.get(
+    "AUTHZEN_ADAPTER_URL", "http://authzen-adapter.railway.internal:8080").rstrip("/")
+
+
+@app.get("/proofing/gate")
+async def proofing_gate_get():
+    """Read the mDL identity-proofing gate switch state (proxies the adapter)."""
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as c:
+            r = await c.get(f"{AUTHZEN_ADAPTER_URL}/admin/proofing-gate")
+            return r.json()
+    except Exception as e:
+        return JSONResponse(status_code=502,
+                            content={"error": "adapter_unreachable", "detail": str(e)})
+
+
+@app.post("/proofing/gate")
+async def proofing_gate_set(request: Request):
+    """Flip the mDL identity-proofing gate on/off (proxies the adapter). Demo control plane."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as c:
+            r = await c.post(f"{AUTHZEN_ADAPTER_URL}/admin/proofing-gate",
+                             json={"enabled": bool(body.get("enabled"))})
+            return r.json()
+    except Exception as e:
+        return JSONResponse(status_code=502,
+                            content={"error": "adapter_unreachable", "detail": str(e)})
+
+
+@app.post("/proofing/start")
+async def proofing_start(request: Request):
+    """Begin an mDL identity-proofing presentation: ask the OID4VP verifier for a request
+    and hand the browser the openid4vp:// request + QR so the customer presents from their
+    wallet (app2app). Requires a signed-in principal — that's the subject we proof."""
+    s = _session(request)
+    if not s:
+        return JSONResponse(status_code=401, content={"error": "login_required"})
+    try:
+        async with httpx.AsyncClient(timeout=15.0, verify=False) as c:
+            r = await c.post(f"{VERIFIER_URL}/verify/start", json={"credential": "mdl"})
+            r.raise_for_status()
+            d = r.json()
+    except Exception as e:
+        return JSONResponse(status_code=502,
+                            content={"error": "verifier_unreachable", "detail": str(e)})
+    return {"session_id": d.get("session_id"), "request_uri": d.get("request_uri"),
+            "wallet_link": d.get("wallet_link"), "qr_svg": d.get("qr_svg")}
+
+
+@app.get("/proofing/status/{session_id}")
+async def proofing_status(session_id: str, request: Request):
+    """Poll the verifier for the presentation result. On 'verified', record the
+    identity-proofing activity in the directory keyed by the signed-in principal —
+    SERVER-SIDE, so the browser can't forge a proofing — so the origination retry then
+    passes the PDP gate (the adapter reads identity_proofing_present for this subject)."""
+    s = _session(request)
+    if not s:
+        return JSONResponse(status_code=401, content={"error": "login_required"})
+    subject = s.get("sub") or "alice"
+    try:
+        async with httpx.AsyncClient(timeout=15.0, verify=False) as c:
+            r = await c.get(f"{VERIFIER_URL}/verify/status/{session_id}")
+            r.raise_for_status()
+            d = r.json()
+    except Exception as e:
+        return JSONResponse(status_code=502,
+                            content={"error": "verifier_unreachable", "detail": str(e)})
+    recorded = False
+    if d.get("status") == "verified":
+        try:
+            async with httpx.AsyncClient(timeout=8.0) as c:
+                pr = await c.post(f"{PROOFING_DIRECTORY_URL}/proofing", json={
+                    "subject": subject, "doctype": PROOFING_DOCTYPE, "method": "oid4vp",
+                    "claims": d.get("claims") or {}, "session_id": session_id})
+                recorded = pr.status_code < 300
+        except Exception:
+            recorded = False
+    return {"status": d.get("status"), "claims": d.get("claims"),
+            "error": d.get("error"), "recorded": recorded, "subject": subject}
+
+
+# ── mDL proofing via CIBA push (the corrected flow: push to the customer's phone, the
+# approver opens the wallet app2app, the wallet presents to the verifier, we record it) ──
+CIBA_CLIENT_ID = os.environ.get("CIBA_CLIENT_ID", "urn:agent:northwind-autonomous:v1")
+CIBA_ENDPOINT = os.environ.get("CIBA_ENDPOINT", PF_BASE + "/as/bc-auth.ciba")
+CIBA_ISSUER = os.environ.get("CIBA_ISSUER", "https://localhost:9031")
+CIBA_KID = os.environ.get("CIBA_KID", "d4c67a35a199")
+
+# In-flight proofings keyed by the ≤20-char reference code that rides the CIBA
+# binding_message: the push shows only the code; the approver app fetches the full
+# request (the openid4vp:// URI) from GET /proofing/code/{code}. Mirrors the
+# autonomous-agent's consent-by-code store.
+_PROOFINGS: dict[str, dict] = {}
+
+
+def _ciba_assertion(endpoint: str) -> str:
+    pem = os.environ.get("CIBA_CLIENT_KEY_PEM", "")
+    now = int(time.time())
+    # PF validates the private_key_jwt audience against its ISSUER / token endpoint, which
+    # in this deployment is the INTERNAL https://localhost:9031 (not the public Railway host).
+    # Send the same audience array the working autonomous-agent uses, or PF 400s invalid_client.
+    return jwt.encode({"iss": CIBA_CLIENT_ID, "sub": CIBA_CLIENT_ID,
+                       "aud": [endpoint, "https://localhost:9031/as/token.oauth2",
+                               "https://localhost:9031"],
+                       "jti": secrets.token_hex(8), "iat": now, "exp": now + 120},
+                      pem, algorithm="ES256", headers={"kid": CIBA_KID})
+
+
+async def _ciba_push(login_hint: str, binding: str) -> tuple[bool, str]:
+    """Fire a FAPI-CIBA backchannel request purely as the PUSH + approval channel — we
+    never redeem the token (proofing completion is signalled by the verifier, and the PF
+    CIBA DEFAULT token mapping is staff-specific). Signed request object, private_key_jwt."""
+    pem = os.environ.get("CIBA_CLIENT_KEY_PEM", "")
+    if not pem:
+        return False, "CIBA_CLIENT_KEY_PEM not configured"
+    now = int(time.time())
+    req = {"iss": CIBA_CLIENT_ID, "aud": CIBA_ISSUER, "jti": secrets.token_hex(8),
+           "iat": now, "exp": now + 300, "nbf": now,
+           "scope": "openid", "login_hint": login_hint, "binding_message": binding}
+    form = {"request": jwt.encode(req, pem, algorithm="ES256", headers={"kid": CIBA_KID}),
+            "client_assertion_type": "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+            "client_assertion": _ciba_assertion(CIBA_ENDPOINT)}
+    async with httpx.AsyncClient(timeout=30.0, verify=False) as c:
+        r = await c.post(CIBA_ENDPOINT, data=form)
+        if r.status_code != 200:
+            return False, f"bc-auth {r.status_code}: {r.text[:200]}"
+        return True, r.json().get("auth_req_id", "")
+
+
+@app.post("/proofing/begin")
+async def proofing_begin(request: Request, user: str = ""):
+    """Kick off the CIBA-push mDL proofing for the signed-in customer: create the OID4VP
+    verifier session, register the reference code, and push to the customer's phone. The
+    browser then polls /proofing/status/{session_id} and resumes origination on verified.
+    Demo convenience: without a browser session, an explicit ?user= may trigger it — the
+    real authorization is the push approval + mDL presentation on that user's phone."""
+    s = _session(request)
+    if not s and not user:
+        return JSONResponse(status_code=401, content={"error": "login_required"})
+    subject = (s.get("sub") if s else None) or user.strip().lower() or "alice"
+    try:
+        async with httpx.AsyncClient(timeout=15.0, verify=False) as c:
+            r = await c.post(f"{VERIFIER_URL}/verify/start", json={"credential": "mdl"})
+            r.raise_for_status()
+            v = r.json()
+    except Exception as e:
+        return JSONResponse(status_code=502,
+                            content={"error": "verifier_unreachable", "detail": str(e)})
+    code = "MDL-" + secrets.token_hex(3)  # ≤20 chars, CIBA binding_message charset-safe
+    _PROOFINGS[code] = {"code": code, "session_id": v.get("session_id"),
+                        "request_uri": v.get("request_uri"), "subject": subject,
+                        "doctype": PROOFING_DOCTYPE, "created": int(time.time())}
+    pushed, detail = await _ciba_push(subject, code)
+    return {"code": code, "session_id": v.get("session_id"),
+            "push": "sent" if pushed else "failed", "push_detail": detail if not pushed else "",
+            "subject": subject}
+
+
+@app.get("/proofing/code/{code}")
+async def proofing_by_code(code: str):
+    """The approver app resolves the push's reference code to the full proofing request —
+    most importantly the openid4vp:// request_uri it opens app2app into the wallet."""
+    p = _PROOFINGS.get(code)
+    if not p:
+        return JSONResponse(status_code=404, content={"error": "unknown_code"})
+    return p
+
+
+@app.get("/proofing/latest")
+async def proofing_latest():
+    """The approver's no-code fallback: the pi.flow push can't reliably deliver even the
+    20-char reference code to the app (clientContext is dropped; the alert text is
+    template-dependent), so on any push the app asks for the most recent FRESH proofing
+    request and opens its openid4vp:// link app2app. Mirrors the payment flow's
+    latest-pending-consent fallback."""
+    now = int(time.time())
+    fresh = [p for p in _PROOFINGS.values() if now - p.get("created", 0) < 300]
+    if not fresh:
+        return JSONResponse(status_code=404, content={"error": "no_pending_proofing"})
+    return sorted(fresh, key=lambda p: p["created"])[-1]
+
+
+# ── Identity roster for the approver app (proxies the SCIM directory; the app can't
+# reach the internal network) ──
+@app.get("/identities")
+async def identities():
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as c:
+            r = await c.get(f"{PROOFING_DIRECTORY_URL}/scim/v2/Users")
+            users = r.json().get("Resources", [])
+    except Exception as e:
+        return JSONResponse(status_code=502, content={"error": "directory_unreachable",
+                                                      "detail": str(e)})
+    ext = "urn:idpartners:scim:1.0:BankUser"
+    return {"identities": [{"userName": u.get("userName"),
+                            "displayName": u.get("displayName"),
+                            "paired": (u.get(ext) or {}).get("devicePaired", False),
+                            "pingOneUserId": (u.get(ext) or {}).get("pingOneUserId")}
+                           for u in users]}
+
+
+@app.post("/identities/{user_name}/reconcile")
+async def identities_reconcile(user_name: str):
+    """Sync the directory's pairing state from PingOne (source of truth). Recovers the
+    approver-app case where pair() reported an error but the device actually enrolled
+    (e.g. racing pairing keys)."""
+    user = (user_name or "").strip().lower()
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as c:
+            tok = await _p1_token(c)
+            uid = await _p1_ensure_user(c, tok, user)
+            r = await c.get(f"{P1_API}/v1/environments/{P1_ENV}/users/{uid}/devices",
+                            headers={"Authorization": f"Bearer {tok}"})
+            devices = (r.json().get("_embedded") or {}).get("devices") or []
+            paired = any(d.get("status") == "ACTIVE" for d in devices)
+    except Exception as e:  # noqa: BLE001
+        return JSONResponse(status_code=502, content={"error": "pingone_unreachable",
+                                                      "detail": str(e)})
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as c:
+            sr = await c.get(f"{PROOFING_DIRECTORY_URL}/scim/v2/Users",
+                             params={"filter": f'userName eq "{user}"'})
+            users = sr.json().get("Resources", [])
+            if users:
+                await c.patch(f"{PROOFING_DIRECTORY_URL}/scim/v2/Users/{users[0]['id']}",
+                              json={"Operations": [{"op": "replace", "path": "devicePaired",
+                                                    "value": paired}]})
+    except Exception:  # noqa: BLE001 — directory sync is best-effort
+        pass
+    return {"user": user, "paired": paired, "devices": len(devices)}
+
+
+@app.post("/identities/{user_name}/pairing")
+async def identities_pairing(user_name: str, request: Request):
+    """The approver app reports pairing state changes (sign-in/sign-out) → SCIM PATCH."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    paired = bool(body.get("paired"))
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as c:
+            r = await c.get(f"{PROOFING_DIRECTORY_URL}/scim/v2/Users",
+                            params={"filter": f'userName eq "{user_name}"'})
+            users = r.json().get("Resources", [])
+            if not users:
+                return JSONResponse(status_code=404, content={"error": "unknown_user"})
+            pr = await c.patch(f"{PROOFING_DIRECTORY_URL}/scim/v2/Users/{users[0]['id']}",
+                               json={"Operations": [{"op": "replace", "path": "devicePaired",
+                                                     "value": paired}]})
+            return pr.json()
+    except Exception as e:
+        return JSONResponse(status_code=502, content={"error": "directory_unreachable",
+                                                      "detail": str(e)})
+
 
 def _payment_rar(request: Request) -> list | None:
     """Build an RFC 9396 authorization_details entry from the step-up payment
@@ -322,32 +590,94 @@ P1_BOB = os.environ.get("PINGONE_BOB_ID", "")
 P1_APP = os.environ.get("PINGONE_NATIVE_APP_ID", "")
 
 
-async def _pingone_pairing_key() -> dict:
-    """Mint a one-time MFA pairing key for Bob via the PingOne Management API."""
-    async with httpx.AsyncClient(timeout=20.0) as c:
-        tr = await c.post(f"{P1_AUTH}/{P1_ENV}/as/token",
-                          data={"grant_type": "client_credentials"}, auth=(P1_CLIENT, P1_SECRET))
-        tok = tr.json().get("access_token")
-        r = await c.post(f"{P1_API}/v1/environments/{P1_ENV}/users/{P1_BOB}/pairingKeys",
+async def _p1_token(c: httpx.AsyncClient) -> str:
+    tr = await c.post(f"{P1_AUTH}/{P1_ENV}/as/token",
+                      data={"grant_type": "client_credentials"}, auth=(P1_CLIENT, P1_SECRET))
+    return tr.json().get("access_token", "")
+
+
+async def _p1_ensure_user(c: httpx.AsyncClient, tok: str, username: str) -> str:
+    """Find-or-create the PingOne user for a bank identity and make sure MFA is enabled.
+    Returns the PingOne user id. bob short-circuits to P1_BOB when configured."""
+    h = {"Authorization": f"Bearer {tok}"}
+    if username == "bob" and P1_BOB:
+        return P1_BOB
+    r = await c.get(f"{P1_API}/v1/environments/{P1_ENV}/users",
+                    params={"filter": f'username eq "{username}"'}, headers=h)
+    found = (r.json().get("_embedded") or {}).get("users") or []
+    if found:
+        uid = found[0]["id"]
+    else:
+        pr = await c.get(f"{P1_API}/v1/environments/{P1_ENV}/populations", headers=h)
+        pops = (pr.json().get("_embedded") or {}).get("populations") or []
+        if not pops:
+            raise RuntimeError("no PingOne population to create the user in")
+        pop = next((p for p in pops if p.get("default")), pops[0])
+        cr = await c.post(f"{P1_API}/v1/environments/{P1_ENV}/users", headers=h,
+                          json={"username": username, "email": f"{username}@idpartners.example",
+                                "name": {"given": username.title()},
+                                "population": {"id": pop["id"]}})
+        if cr.status_code not in (200, 201):
+            raise RuntimeError(f"PingOne user create failed: {cr.status_code} {cr.text[:200]}")
+        uid = cr.json()["id"]
+    # MFA must be enabled or the CIBA push can't target the user's device.
+    await c.put(f"{P1_API}/v1/environments/{P1_ENV}/users/{uid}/mfaEnabled",
+                headers=h, json={"mfaEnabled": True})
+    return uid
+
+
+async def _scim_set_p1id(user_name: str, p1id: str) -> None:
+    """Record the PingOne linkage on the SCIM identity (best-effort)."""
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as c:
+            r = await c.get(f"{PROOFING_DIRECTORY_URL}/scim/v2/Users",
+                            params={"filter": f'userName eq "{user_name}"'})
+            users = r.json().get("Resources", [])
+            if users:
+                await c.patch(f"{PROOFING_DIRECTORY_URL}/scim/v2/Users/{users[0]['id']}",
+                              json={"Operations": [{"op": "replace", "path": "pingOneUserId",
+                                                    "value": p1id}]})
+    except Exception:  # noqa: BLE001 — SCIM linkage is advisory for the demo
+        pass
+
+
+async def _pingone_pairing_key(user: str) -> dict:
+    """Mint a one-time MFA pairing key for a bank identity via the PingOne Management API."""
+    async with httpx.AsyncClient(timeout=25.0) as c:
+        tok = await _p1_token(c)
+        uid = await _p1_ensure_user(c, tok, user)
+        await _scim_set_p1id(user, uid)
+        r = await c.post(f"{P1_API}/v1/environments/{P1_ENV}/users/{uid}/pairingKeys",
                          headers={"Authorization": f"Bearer {tok}"},
                          json={"applications": [{"id": P1_APP}]})
         return r.json()
 
 
 @app.get("/enroll")
-async def enroll():
-    """Branded page that mints + displays a pairing key for Bob's iOS approver app."""
-    if not (P1_ENV and P1_CLIENT and P1_BOB and P1_APP):
+async def enroll(user: str = "bob", format: str = "html"):
+    """Mint + show a pairing key for an identity's approver app (?user=alice|bob).
+    format=json returns {user, code, expiresAt} for the app's in-app sign-in flow."""
+    if not (P1_ENV and P1_CLIENT and P1_APP):
         return HTMLResponse("Enrolment not configured — set PINGONE_ENV / PINGONE_CLIENT_ID / "
-                            "PINGONE_SECRET / PINGONE_BOB_ID / PINGONE_NATIVE_APP_ID.", status_code=503)
+                            "PINGONE_SECRET / PINGONE_NATIVE_APP_ID.", status_code=503)
+    user = (user or "bob").strip().lower()
     try:
-        pk = await _pingone_pairing_key()
+        pk = await _pingone_pairing_key(user)
     except Exception as exc:  # noqa: BLE001
+        if format == "json":
+            return JSONResponse(status_code=502, content={"error": str(exc)})
         return HTMLResponse(f"Enrolment error: {exc}", status_code=502)
     code = pk.get("code")
     if not code:
+        if format == "json":
+            return JSONResponse(status_code=502, content={"error": "no_pairing_key",
+                                                          "detail": json.dumps(pk)[:300]})
         return HTMLResponse(f"Could not mint pairing key: {json.dumps(pk)[:400]}", status_code=502)
-    return HTMLResponse(_ENROLL_HTML.replace("__CODE__", code).replace("__EXP__", pk.get("expiresAt", "")))
+    if format == "json":
+        return {"user": user, "code": code, "expiresAt": pk.get("expiresAt", "")}
+    return HTMLResponse(_ENROLL_HTML.replace("__CODE__", code)
+                        .replace("__EXP__", pk.get("expiresAt", ""))
+                        .replace("__USER__", user.title()))
 
 
 _ENROLL_HTML = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
@@ -372,7 +702,7 @@ ol b{color:var(--text)}
 </style></head><body><div class="card">
 <div><span class="idp-mark"><span class="sq"></span>ID<span class="pa">PARTNERS</span></span><span class="bank">Bank</span></div>
 <h1>Enrol this device for approvals</h1>
-<p class="sub">Bob's phone pairs once, then approves payments with Face&nbsp;ID.</p>
+<p class="sub">__USER__'s phone pairs once, then approves with Face&nbsp;ID.</p>
 <div class="code" id="code">__CODE__</div>
 <p class="exp" id="exp">Pairing key · one-time · expires <span id="cd">soon</span></p>
 <ol>
