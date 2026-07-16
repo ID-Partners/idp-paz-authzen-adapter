@@ -105,9 +105,14 @@ class PostgresStore:
                     claims        JSONB NOT NULL DEFAULT '{}'::jsonb,
                     verified_at   TIMESTAMPTZ NOT NULL,
                     expires_at    TIMESTAMPTZ NOT NULL,
-                    session_id    TEXT
+                    session_id    TEXT,
+                    account       TEXT
                 )
                 """
+            )
+            # Migration for tables created before account-scoped proofing.
+            conn.execute(
+                "ALTER TABLE proofing_activities ADD COLUMN IF NOT EXISTS account TEXT"
             )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS ix_proofing_subject "
@@ -124,12 +129,13 @@ class PostgresStore:
                 """
                 INSERT INTO proofing_activities
                     (id, subject, activity_type, doctype, method, claims,
-                     verified_at, expires_at, session_id)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                     verified_at, expires_at, session_id, account)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (row["id"], row["subject"], row["activity_type"], row["doctype"],
                  row["method"], self._Jsonb(row["claims"]),
-                 row["verified_at"], row["expires_at"], row["session_id"]),
+                 row["verified_at"], row["expires_at"], row["session_id"],
+                 row.get("account")),
             )
             conn.commit()
 
@@ -138,7 +144,7 @@ class PostgresStore:
             cur = conn.execute(
                 """
                 SELECT id, subject, activity_type, doctype, method, claims,
-                       verified_at, expires_at, session_id
+                       verified_at, expires_at, session_id, account
                 FROM proofing_activities WHERE subject = %s
                 """,
                 (subject,),
@@ -151,7 +157,7 @@ class PostgresStore:
             cur = conn.execute(
                 """
                 SELECT id, subject, activity_type, doctype, method, claims,
-                       verified_at, expires_at, session_id
+                       verified_at, expires_at, session_id, account
                 FROM proofing_activities WHERE id = %s
                 """,
                 (rid,),
@@ -308,6 +314,7 @@ def _to_resource(row: dict) -> dict:
         "verifiedAt": _iso(verified_at),
         "expiresAt": _iso(expires_at),
         "sessionId": row["session_id"],
+        "account": row.get("account"),
         "active": active,
     }
 
@@ -324,6 +331,9 @@ class ProofingBody(BaseModel):
     claims: dict = Field(default_factory=dict)
     session_id: str | None = None
     ttl_seconds: int | None = None
+    # The specific account the proofing was performed FOR (e.g. the account type being
+    # originated, "savings") — account-scoped proofing rather than a subject-wide pass.
+    account: str | None = None
 
 
 @app.post("/proofing")
@@ -341,6 +351,7 @@ def record_proofing(body: ProofingBody):
         "verified_at": now,
         "expires_at": now + timedelta(seconds=ttl),
         "session_id": body.session_id,
+        "account": (body.account or "").strip().lower() or None,
     }
     store.insert(row)
     logger.info("recorded identity_proofing subject=%s doctype=%s method=%s (expires %s)",
@@ -351,7 +362,8 @@ def record_proofing(body: ProofingBody):
 @app.get("/proofing")
 def list_proofing(subject: str | None = Query(default=None),
                   filter: str | None = Query(default=None),
-                  active: bool = Query(default=True)):
+                  active: bool = Query(default=True),
+                  account: str | None = Query(default=None)):
     """List proofing activities for a subject. Accepts either `?subject=…` or a
     minimal SCIM `?filter=subject eq "…"`. By default returns only active
     (non-expired) activities — this is what the PDP gate cares about."""
@@ -369,6 +381,11 @@ def list_proofing(subject: str | None = Query(default=None),
     resources = [_to_resource(r) for r in store.list_by_subject(subj)]
     if active:
         resources = [r for r in resources if r["active"]]
+    if account:
+        # Account-scoped gate: only proofings performed FOR this account count — a
+        # proofing for a different account (or an unscoped legacy record) does not.
+        acc = account.strip().lower()
+        resources = [r for r in resources if (r.get("account") or "") == acc]
     # SCIM ListResponse shape
     return {
         "schemas": ["urn:ietf:params:scim:api:messages:2.0:ListResponse"],

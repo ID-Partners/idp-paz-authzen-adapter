@@ -177,11 +177,16 @@ async def proofing_status(session_id: str, request: Request):
                             content={"error": "verifier_unreachable", "detail": str(e)})
     recorded = False
     if d.get("status") == "verified":
+        # Scope the record to the account this proofing was FOR (from the in-flight
+        # proofing registered by /proofing/begin, matched by verifier session).
+        account = next((p.get("account") or "" for p in _PROOFINGS.values()
+                        if p.get("session_id") == session_id), "")
         try:
             async with httpx.AsyncClient(timeout=8.0) as c:
                 pr = await c.post(f"{PROOFING_DIRECTORY_URL}/proofing", json={
                     "subject": subject, "doctype": PROOFING_DOCTYPE, "method": "oid4vp",
-                    "claims": d.get("claims") or {}, "session_id": session_id})
+                    "claims": d.get("claims") or {}, "session_id": session_id,
+                    "account": account})
                 recorded = pr.status_code < 300
         except Exception:
             recorded = False
@@ -248,6 +253,16 @@ async def proofing_begin(request: Request, user: str = ""):
     if not s and not user:
         return JSONResponse(status_code=401, content={"error": "login_required"})
     subject = (s.get("sub") if s else None) or user.strip().lower() or "alice"
+    # The proofing is scoped to the SPECIFIC account being originated (its type, e.g.
+    # "savings") — carried from the identity challenge's open_account arguments. A
+    # proofing for one account does not satisfy the gate for another.
+    account = ""
+    try:
+        body = await request.json()
+        account = str(body.get("account_type") or body.get("account") or "")
+    except Exception:  # noqa: BLE001 — body is optional
+        pass
+    account = (account or request.query_params.get("account", "")).strip().lower()
     try:
         async with httpx.AsyncClient(timeout=15.0, verify=False) as c:
             r = await c.post(f"{VERIFIER_URL}/verify/start", json={"credential": "mdl"})
@@ -259,11 +274,12 @@ async def proofing_begin(request: Request, user: str = ""):
     code = "MDL-" + secrets.token_hex(3)  # ≤20 chars, CIBA binding_message charset-safe
     _PROOFINGS[code] = {"code": code, "session_id": v.get("session_id"),
                         "request_uri": v.get("request_uri"), "subject": subject,
-                        "doctype": PROOFING_DOCTYPE, "created": int(time.time())}
+                        "doctype": PROOFING_DOCTYPE, "account": account,
+                        "created": int(time.time())}
     pushed, detail = await _ciba_push(subject, code)
     return {"code": code, "session_id": v.get("session_id"),
             "push": "sent" if pushed else "failed", "push_detail": detail if not pushed else "",
-            "subject": subject}
+            "subject": subject, "account": account}
 
 
 @app.get("/proofing/code/{code}")

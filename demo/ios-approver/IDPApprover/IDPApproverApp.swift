@@ -107,6 +107,10 @@ struct ProofingView: View {
                     HStack { Text("For").foregroundColor(Brand.muted); Spacer()
                              Text(proofing.subject.capitalized).foregroundColor(Brand.ink) }
                 }
+                if !proofing.account.isEmpty {
+                    HStack { Text("Account").foregroundColor(Brand.muted); Spacer()
+                             Text("New \(proofing.account) account").foregroundColor(Brand.ink) }
+                }
             }
             .font(.subheadline)
             .padding(16)

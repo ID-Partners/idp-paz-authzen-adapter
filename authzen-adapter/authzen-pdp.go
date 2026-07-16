@@ -8,9 +8,11 @@ import (
 	"io/ioutil"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/joho/godotenv"
@@ -362,6 +364,49 @@ func buildResourceSearchQueryRequest(resourceSearchRequest ResourceSearchRequest
 	return &queryRequest, nil
 }
 
+// proofingGate is the runtime ON/OFF switch for the mDL identity-proofing gate on account
+// origination. OFF (default) → the adapter reports identity_proofing_present=true for
+// open_account, so the PDP origination deny-rule is a no-op and origination flows normally.
+// ON → the adapter does the real proofing-directory lookup, so origination is gated on a
+// verified mDL. Flipped live at /admin/proofing-gate; initial value from PROOFING_GATE_ENABLED.
+var proofingGate atomic.Bool
+
+func proofingGateEnabled() bool { return proofingGate.Load() }
+
+// proofingPresent asks the proofing directory whether the given subject (the customer
+// being onboarded) has an ACTIVE identity-proofing activity — a verified mDL presentation
+// — FOR the specific account being originated. Account-scoped: a proofing performed for a
+// savings origination does not satisfy a cheque origination. Used only for account
+// origination. Fails CLOSED (returns false) when the directory is unset or unreachable:
+// an un-proofed origination must never slip through the gate.
+func proofingPresent(subject, account string) bool {
+	base := strings.TrimRight(os.Getenv("PROOFING_DIRECTORY_URL"), "/")
+	if base == "" || subject == "" {
+		return false
+	}
+	u := fmt.Sprintf("%s/proofing?active=true&subject=%s", base, url.QueryEscape(subject))
+	if account != "" {
+		u += "&account=" + url.QueryEscape(account)
+	}
+	client := &http.Client{Timeout: 4 * time.Second}
+	resp, err := client.Get(u)
+	if err != nil {
+		log.Printf("proofing directory lookup failed for %q: %v", subject, err)
+		return false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return false
+	}
+	var out struct {
+		TotalResults int `json:"totalResults"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return false
+	}
+	return out.TotalResults > 0
+}
+
 // Build PDP decision payload for single evaluation
 func buildPdpDecisionPayload(evalRequest EvaluationRequest) (*PdpPayload, error) {
 	log.Println("Starting buildPdpDecisionPayload")
@@ -528,6 +573,35 @@ func buildPdpDecisionPayload(evalRequest EvaluationRequest) (*PdpPayload, error)
 	pdpPayload.Attributes["rar_amount_ok"] = strconv.FormatBool(amtOK)
 	pdpPayload.Attributes["rar_creditor_ok"] = strconv.FormatBool(credOK)
 
+	// mDL identity-proofing gate for account origination: an account may only be opened
+	// once the customer (the delegated principal) has a verified identity-proofing activity
+	// — an mDL presentation — recorded in the proofing directory. We resolve it to a plain
+	// boolean here (the embedded PDP can't call out to the directory), mirroring the
+	// rar_*_ok precompute above. Always set (false when not an origination) so the policy
+	// never sees a missing attribute. No directory call is made unless this is open_account.
+	// Default true: for non-origination actions, and whenever the gate SWITCH is OFF, we
+	// report identity_proofing_present=true so the PDP origination deny-rule is a no-op.
+	// Only when the switch is ON do we do the real directory lookup for open_account — so a
+	// customer without a verified mDL is denied and challenged to present one.
+	proofed := true
+	actLower := strings.ToLower(attrStr("actionName"))
+	resLower := strings.ToLower(attrStr("resourceId"))
+	if proofingGateEnabled() &&
+		(strings.Contains(actLower, "open_account") || strings.Contains(resLower, "open_account")) {
+		subj := attrStr("onBehalfOf")
+		if subj == "" {
+			subj = evalRequest.Subject.ID
+		}
+		// The account being originated: the COAZ mapping carries it both as the
+		// account_type resource property and encoded in the resource id ("new:<type>").
+		account := strings.ToLower(attrStr("account_type"))
+		if account == "" && strings.HasPrefix(resLower, "new:") {
+			account = strings.TrimPrefix(resLower, "new:")
+		}
+		proofed = proofingPresent(subj, account)
+	}
+	pdpPayload.Attributes["identity_proofing_present"] = strconv.FormatBool(proofed)
+
 	log.Println("Successfully built PdpPayload")
 	log.Printf("PdpPayload: %+v\n", pdpPayload)
 
@@ -690,6 +764,22 @@ func makeAuthorizationDecisionRequest(pdpPayload *PdpPayload) ([]EvaluationRespo
 				if payload, _ := st["payload"].(string); json.Unmarshal([]byte(payload), &pj) == nil {
 					if sc, ok := pj["scope"].(string); ok {
 						ctx["step_up_scope"] = sc
+					}
+					if msg, ok := pj["message"].(string); ok {
+						ctx["reason"] = msg
+					}
+				}
+			}
+			// Account origination requires an mDL identity-proofing activity that isn't
+			// present yet (code "identity-proofing-required"): surface identity_proofing_required
+			// (+ doctype) so the gateway/BFF drives an OID4VP mDL presentation and then resumes,
+			// mirroring the step-up-required challenge above.
+			if code, _ := st["code"].(string); code == "identity-proofing-required" {
+				ctx["identity_proofing_required"] = true
+				var pj map[string]interface{}
+				if payload, _ := st["payload"].(string); json.Unmarshal([]byte(payload), &pj) == nil {
+					if dt, ok := pj["doctype"].(string); ok {
+						ctx["identity_proofing_doctype"] = dt
 					}
 					if msg, ok := pj["message"].(string); ok {
 						ctx["reason"] = msg
@@ -919,8 +1009,30 @@ func handleEvaluationBatchRequests(evalRequests []EvaluationRequest) ([]Evaluati
 	return results, nil
 }
 
+// handleProofingGate exposes the mDL identity-proofing SWITCH. GET returns the current
+// state; POST {"enabled":true|false} flips it live (no redeploy) so the demo can toggle
+// whether account origination requires a verified mDL. Open (no auth) — demo control plane.
+func handleProofingGate(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodPost {
+		var body struct {
+			Enabled bool `json:"enabled"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			http.Error(w, "invalid body", http.StatusBadRequest)
+			return
+		}
+		proofingGate.Store(body.Enabled)
+		log.Printf("mDL proofing gate switched enabled=%v", body.Enabled)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]bool{"enabled": proofingGate.Load()})
+}
+
 func main() {
 	godotenv.Load()
+	if strings.EqualFold(os.Getenv("PROOFING_GATE_ENABLED"), "true") {
+		proofingGate.Store(true)
+	}
 	http.HandleFunc("/access/v1/evaluation", handleEvaluationRequest)
 	http.HandleFunc("/access/v1/evaluations", handleEvaluationRequest)
 	http.HandleFunc("/access/v1/subjectsearch", handleSubjectSearchRequest)
@@ -932,6 +1044,8 @@ func main() {
 	// Live decision feed for the demo UI's PDP sidebar.
 	http.HandleFunc("/pdp/events", handlePdpEvents)
 	http.HandleFunc("/pdp/recent", handlePdpRecent)
+	// The mDL identity-proofing gate switch (GET state, POST {enabled} to flip live).
+	http.HandleFunc("/admin/proofing-gate", handleProofingGate)
 
 	port := os.Getenv("PORT")
 	if port == "" {

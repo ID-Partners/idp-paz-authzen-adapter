@@ -64,6 +64,13 @@
                      font-size:11px; cursor:pointer; font-family:inherit; }
   #gwtoggle button + button { border-left:1px solid var(--border); }
   #gwtoggle button.on { background:var(--accent); color:#1a0f00; font-weight:700; }
+  /* mDL identity-proofing gate switch */
+  #mdlgate { display:inline-flex; align-items:center; gap:6px; margin-left:8px; vertical-align:middle;
+    background:var(--panel); color:var(--muted); border:1px solid var(--border); border-radius:999px;
+    padding:3px 11px; font-size:11.5px; cursor:pointer; user-select:none; }
+  #mdlgate input { accent-color:var(--accent); cursor:pointer; margin:0; }
+  #mdlgate.on { border-color:var(--accent); color:var(--accent); }
+  #mdlgate.on #mdlgateLbl b { color:var(--accent); }
   /* COAZ popup chip + modal internals */
   #coazbtn { display:inline-flex; align-items:center; gap:5px; margin-left:8px; vertical-align:middle;
     background:var(--panel); color:var(--muted); border:1px solid var(--border); border-radius:999px;
@@ -396,10 +403,10 @@
  <div class="layout">
   <div class="col-left">
   <h2 class="section">How the agents &amp; services interact
-    <span id="gwtoggle" title="Swap the gateway — same architecture (AuthZEN adapter + Ping Authorize), either PEP"><button data-gw="Kong">Kong</button><button data-gw="agentgateway">agentgateway</button></span><button id="coazbtn" title="How MCP tool calls are authorized per the OpenID AuthZEN MCP profile">🧩 MCP·COAZ</button></h2>
+    <span id="gwtoggle" title="Swap the gateway — same architecture (AuthZEN adapter + Ping Authorize), either PEP"><button data-gw="Kong">Kong</button><button data-gw="agentgateway">agentgateway</button></span><button id="coazbtn" title="How MCP tool calls are authorized per the OpenID AuthZEN MCP profile">🧩 MCP·COAZ</button><label id="mdlgate" title="Toggle the mDL identity-proofing gate on account origination — when on, Ping Authorize requires a verified mobile Driver's Licence before an account can be opened"><input type="checkbox" id="mdlgateChk"><span id="mdlgateLbl">🪪 mDL gate: <b>off</b></span></label></h2>
   <div class="graphwrap">
-    <svg id="graph" viewBox="0 0 520 624" preserveAspectRatio="xMinYMin meet" role="img"
-         aria-label="Interaction graph: Alice delegates to a principal agent, which delegates to a task agent; agents are attested and exchange tokens at the AS, then call the bank through two __GATEWAY__ policy enforcement points backed by Ping Authorize."></svg>
+    <svg id="graph" viewBox="0 0 700 624" preserveAspectRatio="xMinYMin meet" role="img"
+         aria-label="Interaction graph: Alice delegates to a principal agent, which delegates to an account agent and a payments agent. Each domain has its OWN vertical stack — a separate MCP server, __GATEWAY__ gateway with two policy enforcement points, and REST service — both backed by Ping Authorize. A payment is authorized at the payments gateway and then debits the accounts system-of-record."></svg>
   </div>
   <div id="gtip" role="tooltip"></div>
   <p class="pdp-note">Alice authorises a <b class="c-a">principal agent</b>, which <b class="c-a">delegates</b> to a task agent.
@@ -817,11 +824,17 @@ const GN = {
   payments:  {x:186, y:214, ic:'🤖', t:'Payments Agent',  s:'make_payment'},
   attester:  {x:99,  y:320, ic:'📜', t:'Attester',        s:'signs each agent\'s attestation'},
   as:        {x:30,  y:432, ic:'🎫', t:'PingFederate AS', s:'issues audience-scoped tokens'},
-  pep1:      {x:360, y:214, ic:'🛡️', t:'PEP #1',          s:'__GATEWAY__ · MCP edge'},
-  mcp:       {x:360, y:330, ic:'🧰', t:'MCP',             s:'bank tools · API client'},
-  pep2:      {x:360, y:446, ic:'🛡️', t:'PEP #2',          s:'__GATEWAY__ · API edge'},
+  // Accounts vertical stack — its OWN MCP + gateway/PEPs + API (split from payments)
+  apep1:     {x:352, y:196, ic:'🛡️', t:'Accounts PEP #1', s:'__GATEWAY__ · MCP edge'},
+  amcp:      {x:352, y:300, ic:'🧰', t:'Accounts MCP',    s:'list · balance · open'},
+  apep2:     {x:352, y:404, ic:'🛡️', t:'Accounts PEP #2', s:'__GATEWAY__ · API edge'},
+  aapi:      {x:352, y:520, ic:'🏦', t:'Accounts API',    s:'accounts system-of-record'},
+  // Payments vertical stack — its OWN MCP + gateway/PEPs + API (split from accounts)
+  ppep1:     {x:520, y:196, ic:'🛡️', t:'Payments PEP #1', s:'__GATEWAY__ · MCP edge'},
+  pmcp:      {x:520, y:300, ic:'🧰', t:'Payments MCP',    s:'make_payment'},
+  ppep2:     {x:520, y:404, ic:'🛡️', t:'Payments PEP #2', s:'__GATEWAY__ · API edge'},
+  papi:      {x:520, y:520, ic:'💸', t:'Payments API',    s:'debits accounts (direct)'},
   adapter:   {x:188, y:486, ic:'🔌', t:'AuthZEN adapter',  s:'ext_authz → AuthZEN'},
-  bankapi:   {x:360, y:562, ic:'🏦', t:'Bank API',        s:'resource server'},
   pdp:       {x:30,  y:562, ic:'⚖️', t:'Ping Authorize',  s:'policy decision point'},
   eventsink: {x:186, y:562, ic:'📮', t:'Event sink',      s:'flattened token · aud=events'},
 };
@@ -868,21 +881,34 @@ const GMETA = {
   as:        {sw:'PingFederate 13.0.3', img:'pingidentity/pingfederate:13.0.3-alpine_3.23.4-al21-latest',
               cfg:'RFC 8693 token exchange · PAR (RFC 9126) · pf-oidf-modules (client attestation) · pf-rar-paz-plugin (RAR → Ping Authorize) · JWT ATMs RS256, per-agent act',
               links:[['Docker Hub · pingfederate','https://hub.docker.com/r/pingidentity/pingfederate'], ['pf-oidf-modules (source)','https://github.com/dphhyland/pf-oidf-modules']]},
-  pep1:      {sw:'__GW__ · Policy Enforcement Point (MCP edge)',
-              cfg:'validates JWT + DPoP cnf.jkt · AuthZEN eval → Ping Authorize · access_mcp + per-tool authorization · RFC 9470 login/scope challenges'},
-  mcp:       {sw:'Python · MCP server (JSON-RPC over streamable HTTP)', img:'python:3.12-slim',
-              cfg:'tools list_accounts · get_balance · open_account · make_payment · forwards the delegated token to the Bank API through PEP #2',
+  apep1:     {sw:'__GW__ · Accounts Policy Enforcement Point (MCP edge)',
+              cfg:'the ACCOUNTS gateway · validates JWT + DPoP cnf.jkt · AuthZEN eval → Ping Authorize · access_mcp + per-tool authorization · RFC 9470 login/scope challenges'},
+  amcp:      {sw:'Python · Accounts MCP server (JSON-RPC over streamable HTTP)', img:'python:3.12-slim',
+              cfg:'tools list_accounts · get_balance · open_account · forwards the delegated token to the Accounts API through the accounts PEP #2',
               sdks:['<code>mcp</code> — MCP server SDK (streamable HTTP transport)',
-                    '<code>httpx</code> — calls the Bank API through PEP #2'],
-              links:[HUB_PY, ['source · demo/mcp-server', REPO+'/mcp-server'], ['Model Context Protocol','https://modelcontextprotocol.io']]},
-  pep2:      {sw:'__GW__ · Policy Enforcement Point (API edge)',
-              cfg:'AuthZEN eval → Ping Authorize for the bank call · governs the payment amount (≤ AUD 500 permit · > AUD 500 to 2,000 requires step-up · > 2,000 deny)'},
+                    '<code>httpx</code> — calls the Accounts API through PEP #2'],
+              links:[HUB_PY, ['source · demo/accounts-mcp', REPO+'/accounts-mcp'], ['Model Context Protocol','https://modelcontextprotocol.io']]},
+  apep2:     {sw:'__GW__ · Accounts Policy Enforcement Point (API edge)',
+              cfg:'the ACCOUNTS gateway · AuthZEN eval → Ping Authorize for the accounts call · governs open_account (identity-proofing gate) and the account-domain rules'},
+  aapi:      {sw:'Python · FastAPI · Accounts Resource Server', img:'python:3.12-slim',
+              cfg:'the accounts system-of-record · list/balance/open + the atomic /transfers primitive · records the sub/act delegation chain for audit',
+              sdks:['<code>fastapi</code> + <code>uvicorn</code>', '<code>pydantic</code> — request/response models'],
+              links:[HUB_PY, ['source · demo/accounts-api', REPO+'/accounts-api']]},
+  ppep1:     {sw:'__GW__ · Payments Policy Enforcement Point (MCP edge)',
+              cfg:'the PAYMENTS gateway · validates JWT + DPoP cnf.jkt · AuthZEN eval → Ping Authorize · access_mcp + per-tool authorization · RFC 9470 login/scope challenges'},
+  pmcp:      {sw:'Python · Payments MCP server (JSON-RPC over streamable HTTP)', img:'python:3.12-slim',
+              cfg:'tool make_payment · forwards the delegated token to the Payments API through the payments PEP #2',
+              sdks:['<code>mcp</code> — MCP server SDK (streamable HTTP transport)',
+                    '<code>httpx</code> — calls the Payments API through PEP #2'],
+              links:[HUB_PY, ['source · demo/payments-mcp', REPO+'/payments-mcp'], ['Model Context Protocol','https://modelcontextprotocol.io']]},
+  ppep2:     {sw:'__GW__ · Payments Policy Enforcement Point (API edge)',
+              cfg:'the PAYMENTS gateway · AuthZEN eval → Ping Authorize · carries a COPY of the account rules + governs the payment amount (≤ AUD 500 permit · > AUD 500 to 2,000 requires step-up · > 2,000 deny)'},
+  papi:      {sw:'Python · FastAPI · Payments Resource Server', img:'python:3.12-slim',
+              cfg:'owns make_payment · holds no account state · debits the accounts system-of-record directly (the payment was already authorized at the payments gateway)',
+              sdks:['<code>fastapi</code> + <code>uvicorn</code>', '<code>httpx</code> — calls the Accounts API /transfers'],
+              links:[HUB_PY, ['source · demo/payments-api', REPO+'/payments-api']]},
   adapter:   {sw:'AuthZEN adapter — ext_authz → PingAuthorize',
               cfg:'translates the AuthZEN Authorization API → PingAuthorize governance-engine · maps subject/action/resource/context · fails closed if the PDP is unreachable'},
-  bankapi:   {sw:'Python · FastAPI · Resource Server', img:'python:3.12-slim',
-              cfg:'executes the banking operation · consumes the delegated DPoP-bound token · records the sub/act delegation chain for audit',
-              sdks:['<code>fastapi</code> + <code>uvicorn</code>', '<code>pydantic</code> — request/response models'],
-              links:[HUB_PY, ['source · demo/bank-api', REPO+'/bank-api']]},
   pdp:       {sw:'PingAuthorize 11.0.0.2 (Symphonic)', img:'pingidentity/pingauthorize:11.0.0.2-latest',
               cfg:'Policy Decision Point · Trust Framework policy · make_payment: ≤ AUD 500 permit · > AUD 500 to 2,000 requires step-up (banking:payments:transfer, RFC 9470) · > 2,000 deny · governs BOTH token issuance (RAR) and the gateway calls (AuthZEN)',
               links:[['Docker Hub · pingauthorize','https://hub.docker.com/r/pingidentity/pingauthorize'], ['policy repo · idp-paz-simplifid-policy','https://github.com/dphhyland/idp-paz-simplifid-policy']]},
@@ -914,14 +940,22 @@ const GE = [
   ['principal','as','exchange · concierge','tx'],
   ['account','as','exchange · aud MCP','tx'],
   ['payments','as','exchange · aud MCP','tx'],
-  ['account','pep1','present token'],
-  ['payments','pep1','present token'],
-  ['pep1','mcp','MCP session'],
-  ['mcp','as','exchange · aud API','plan'],
-  ['mcp','pep2','present token'],
-  ['pep2','bankapi','bank call'],
-  ['pep1','adapter','AuthZEN','dash'],
-  ['pep2','adapter','AuthZEN','dash'],
+  // Accounts stack
+  ['account','apep1','present token'],
+  ['apep1','amcp','MCP session'],
+  ['amcp','apep2','present token'],
+  ['apep2','aapi','bank call'],
+  ['apep1','adapter','AuthZEN','dash'],
+  ['apep2','adapter','AuthZEN','dash'],
+  // Payments stack
+  ['payments','ppep1','present token'],
+  ['ppep1','pmcp','MCP session'],
+  ['pmcp','ppep2','present token'],
+  ['ppep2','papi','bank call'],
+  ['ppep1','adapter','AuthZEN','dash'],
+  ['ppep2','adapter','AuthZEN','dash'],
+  // The payment's debit executes directly against the accounts system-of-record
+  ['papi','aapi','debit','thin'],
   ['adapter','pdp','evaluate','dash'],
   ['as','pdp','governs issuance','dash'],
   ['payments','eventsink','flatten act→sub','tx'],
@@ -970,9 +1004,20 @@ function setNode(node, state, flag){
   if(state) n.classList.add(state);
   if(flag!==undefined){ const f=n.querySelector('.flag, .gflag'); if(f) f.textContent = flag; }
 }
-function resetPipeline(){ ['alice','principal','account','payments','attester','as','pep1','mcp','pep2','adapter','bankapi','pdp','eventsink'].forEach(n=>setNode(n,'','')); }
+function resetPipeline(){ ['alice','principal','account','payments','attester','as',
+  'apep1','amcp','apep2','aapi','ppep1','pmcp','ppep2','papi',
+  'adapter','pdp','eventsink'].forEach(n=>setNode(n,'','')); }
 // A transcript step's `role` maps directly to a graph node id (principal/account/payments).
 function agentNode(role){ return (role==='principal'||role==='account'||role==='payments') ? role : null; }
+// Which banking stack a step touches → 'a' (accounts) or 'p' (payments), so the
+// split diagram lights the right vertical stack. Prefer the acting agent role; fall
+// back to the tool name (make_payment → payments, everything else → accounts).
+function stackOf(s){
+  const r = s && s.role;
+  if(r === 'payments') return 'p';
+  if(r === 'account')  return 'a';
+  return (s && s.name === 'make_payment') ? 'p' : 'a';
+}
 
 // ---- gateway toggle (Kong ⇄ agentgateway; same architecture, either PEP) ----
 // The deployed default is injected server-side; the toggle is a presentation aid showing the
@@ -980,8 +1025,8 @@ function agentNode(role){ return (role==='principal'||role==='account'||role==='
 let gateway = "__GATEWAY__";
 function applyGateway(g){
   gateway = g;
-  GN.pep1.s = g + ' · MCP edge';
-  GN.pep2.s = g + ' · API edge';
+  GN.apep1.s = g + ' · MCP edge'; GN.apep2.s = g + ' · API edge';
+  GN.ppep1.s = g + ' · MCP edge'; GN.ppep2.s = g + ' · API edge';
   GN.adapter.s = (g === 'Kong') ? 'Lua plugin → AuthZEN' : 'ext_authz → AuthZEN';
   document.querySelectorAll('.gw-name').forEach(e => e.textContent = g);
   document.querySelectorAll('#gwtoggle button').forEach(b => b.classList.toggle('on', b.dataset.gw === g));
@@ -989,6 +1034,27 @@ function applyGateway(g){
 }
 document.querySelectorAll('#gwtoggle button').forEach(b => b.addEventListener('click', () => applyGateway(b.dataset.gw)));
 applyGateway(gateway);
+
+// mDL identity-proofing gate switch — reads/flips the adapter's gate via the BFF proxy.
+// When ON, Ping Authorize requires a verified mDL before an account can be opened.
+(function(){
+  const el = document.getElementById('mdlgate');
+  const chk = document.getElementById('mdlgateChk');
+  const lbl = document.getElementById('mdlgateLbl');
+  if(!el || !chk || !lbl) return;
+  const paint = on => { chk.checked = !!on; el.classList.toggle('on', !!on);
+    lbl.innerHTML = '🪪 mDL gate: <b>' + (on ? 'on' : 'off') + '</b>'; };
+  async function load(){ try { const r = await fetch('/proofing/gate');
+    if(r.ok) paint((await r.json()).enabled); } catch(e){} }
+  chk.addEventListener('change', async () => {
+    const want = chk.checked;
+    try { const r = await fetch('/proofing/gate', { method:'POST',
+        headers:{'content-type':'application/json'}, body: JSON.stringify({ enabled: want }) });
+      paint(r.ok ? (await r.json()).enabled : !want);
+    } catch(e){ paint(!want); }
+  });
+  load();
+})();
 
 // Hover a component to reveal its software, image/runtime, config + source/registry links.
 // Delegated on the graphwrap (which persists across buildGraph re-renders); __GW__ and the
@@ -1014,7 +1080,7 @@ applyGateway(gateway);
   function metaFor(id){
     let m = Object.assign({}, GMETA[id]);
     // PEPs and the adapter carry gateway-dependent image + links.
-    if(id === 'pep1' || id === 'pep2') Object.assign(m, GW_META[gateway] ? GW_META[gateway].pep : {});
+    if(id.endsWith('pep1') || id.endsWith('pep2')) Object.assign(m, GW_META[gateway] ? GW_META[gateway].pep : {});
     if(id === 'adapter') Object.assign(m, GW_META[gateway] ? GW_META[gateway].adapter : {});
     return m;
   }
@@ -1215,7 +1281,7 @@ function render(steps) {
          <div class="explain">Delegation, not impersonation: each hop <b>nests</b> the <code>act</code> claim, so the token records the whole chain — every downstream action is attributable to the human <i>and</i> every agent that delegated.${hopBadge}</div>${curlBlock}${wire}`));
     } else if (s.type === 'connect') {
       { const n = agentNode(s.role); if (n) setNode(n,'done'); }
-      setNode('pep1','permit','permit'); setNode('mcp','done'); setNode('pdp','permit','PERMIT');
+      { const d = stackOf(s); setNode(d+'pep1','permit','permit'); setNode(d+'mcp','done'); setNode('pdp','permit','PERMIT'); }
       const p = s.presented || {};
       const url = s.mcp_url || '/mcp';
       const wire = wireDetails('wire detail — real MCP handshake + PEP #1 decision', [
@@ -1234,7 +1300,7 @@ function render(steps) {
          ${presentedChip(p)}
          <div class="explain">${gateway} authenticated the real DPoP-bound token and (via the AuthZEN adapter) asked the PDP to permit MCP access before the session opened.</div>${wire}`));
     } else if (s.type === 'connect_error') {
-      setNode('pep1','deny','deny'); setNode('pdp','deny','DENY');
+      { const d = stackOf(s); setNode(d+'pep1','deny','deny'); } setNode('pdp','deny','DENY');
       out.appendChild(el('step tool_result',
         `<div class="label">🛡️ Gateway connect · PEP #1 (MCP edge)</div>
          <span class="decision deny">✘ DENY</span>
@@ -1258,10 +1324,19 @@ function render(steps) {
         `<div class="label">🧰 Tool call → ${esc(s.name)}${byAgent}</div><pre>${pretty(s.input)}</pre>
          ${presentedChip(p)}
          <div class="hops"><span class="hop">${esc(s.agent_label||'Agent')}</span><span class="hop">PEP #1</span><span class="hop">MCP</span><span class="hop">PEP #2</span><span class="hop">Bank API</span></div>${wire}`));
+    } else if (s.type === 'identity_stepup') {
+      // Display-only: the task agent reporting the gateway's identity-proofing
+      // requirement. The push/poll itself is driven by the concierge's
+      // 'identity_challenge' event.
+      setNode(stackOf(s)+'pep1','deny','identity proofing');
+      out.appendChild(el('step tool_result',
+        `<div class="label">🪪 Identity proofing ← ${esc(s.agent_label||'agent')}</div>
+         <span class="decision deny">✘ identity_verification_required</span>${s.pep?`<span class="pep">at ${esc(s.pep)}</span>`:''}
+         <div class="reason">${esc(s.detail||('Present '+(s.doctype||'your mDL')))}</div>`));
     } else if (s.type === 'scope_stepup') {
       // Display-only: the task agent reporting PEP #2's insufficient_scope. The
       // redirect itself is driven by the concierge's 'scope_challenge' event.
-      setNode('pep2','deny','insufficient_scope');
+      setNode(stackOf(s)+'pep2','deny','insufficient_scope');
       out.appendChild(el('step tool_result',
         `<div class="label">🔒 Scope step-up ← ${esc(s.agent_label||'agent')}</div>
          <span class="decision deny">✘ insufficient_scope</span>${s.pep?`<span class="pep">at ${esc(s.pep)}</span>`:''}
@@ -1270,8 +1345,9 @@ function render(steps) {
       const allowed = s.authorized;
       const pep = s.pep ? `<span class="pep">at ${esc(s.pep)}${s.pep_action ? ' · action=' + esc(s.pep_action) : ''}</span>` : '';
       let badge = '';
-      if (allowed === true) { badge = `<span class="decision allow">✔ PERMIT</span>${pep}`; setNode('pep2','permit','permit'); setNode('bankapi','done'); setNode('pdp','permit','PERMIT'); }
-      else if (allowed === false) { badge = `<span class="decision deny">✘ DENY</span>${pep}`; setNode('pep2','deny','deny'); setNode('pdp','deny','DENY'); }
+      const _d = stackOf(s);
+      if (allowed === true) { badge = `<span class="decision allow">✔ PERMIT</span>${pep}`; setNode(_d+'pep2','permit','permit'); setNode(_d+'api','done'); setNode('pdp','permit','PERMIT'); }
+      else if (allowed === false) { badge = `<span class="decision deny">✘ DENY</span>${pep}`; setNode(_d+'pep2','deny','deny'); setNode('pdp','deny','DENY'); }
       const reason = s.policy_reason ? `<div class="reason">Policy reason: ${esc(s.policy_reason)}</div>` : '';
       const wire = (allowed === true || allowed === false) ? wireDetails('wire detail — PDP decision', [
         { label:'AuthZEN decision response', desc:'from Ping Authorize via the AuthZEN adapter; '+gateway+' enforces it',
@@ -1431,12 +1507,67 @@ async function streamRun(prompt, spin){
         sessionStorage.setItem('pending_prompt', prompt);
         setNode('alice','done'); setNode('principal','done');
         if(ev.stage === 'token_exchange') setNode('as','deny','login required');
-        else setNode('pep1','deny','login required');
+        else setNode(stackOf(ev)+'pep1','deny','login required');
         const title = ev.stage === 'token_exchange' ? '🔒 Sign-in required for token exchange' : '🔒 Sign-in required';
         out.appendChild(el('step tool_result convo', `<div class="label">${title}</div><div>${esc(ev.detail||'Policy requires an authenticated user.')} Redirecting you to PingFederate…</div>`));
         // Persist the log so it survives the full-page redirect to PingFederate.
         sessionStorage.setItem('pending_transcript', out.innerHTML);
         setTimeout(()=>{ location.href = ev.login_url || '/login'; }, 1800);
+        return;
+      }
+      if(ev.type === 'identity_challenge'){
+        // Account opening needs a verified mDL. NO redirect and NO in-browser QR:
+        // the BFF fires a CIBA push to the customer's phone; the approver app opens
+        // the wallet app2app (openid4vp://), the mDL is presented to the verifier,
+        // the proofing is recorded, and we resume the original request here.
+        setNode(stackOf(ev)+'pep1','deny','identity proofing');
+        out.appendChild(el('step tool_result convo',
+          `<div class="label">🪪 Identity verification required — <code>${esc(ev.doctype||'org.iso.18013.5.1.mDL')}</code></div>
+           <div>${esc(ev.detail||'')}</div>`));
+        (async () => {
+          let begin;
+          // Scope the proofing to the SPECIFIC account being originated — the challenge
+          // carries the open_account arguments. The record written on verification is
+          // account-scoped, and the PDP gate only honours a proofing for THIS account.
+          const acct = (ev.account && (ev.account.account_type||ev.account.type)) || 'savings';
+          try { begin = await fetch('/proofing/begin', {method:'POST',
+                  headers:{'content-type':'application/json'},
+                  body: JSON.stringify({account_type: acct})}).then(r=>r.json()); }
+          catch(e){ begin = {push:'failed', push_detail:String(e)}; }
+          if(begin.push !== 'sent'){
+            out.appendChild(el('step tool_result',
+              `<div class="label">🪪 Identity proofing</div><span class="decision deny">✘ push failed</span>
+               <div class="reason">${esc(begin.push_detail||'Could not reach your phone.')}</div>`));
+            return;
+          }
+          out.appendChild(el('step tool_result convo',
+            `<div class="label">📲 Check your phone</div>
+             <div>A verification request (<code>${esc(begin.code)}</code>) for your new
+             <b>${esc(acct)}</b> account was pushed to your device.
+             Tap it, then present your mobile Driver's Licence from your wallet.</div>`));
+          const deadline = Date.now() + 4*60*1000;
+          while(Date.now() < deadline){
+            await new Promise(r=>setTimeout(r, 4000));
+            let st; try { st = await fetch('/proofing/status/'+encodeURIComponent(begin.session_id)).then(r=>r.json()); } catch(e){ continue; }
+            if(st.status === 'verified'){
+              out.appendChild(el('step tool_result',
+                `<div class="label">🪪 Identity verified</div><span class="decision allow">✔ mDL presented</span>
+                 <div class="reason">Verified claims recorded as an identity-proofing activity for ${esc(st.subject||'you')}. Resuming…</div>`));
+              setNode(stackOf(ev)+'pep1','','');
+              setTimeout(()=>runPrompt(prompt), 600);
+              return;
+            }
+            if(st.status && st.status !== 'pending'){
+              out.appendChild(el('step tool_result',
+                `<div class="label">🪪 Identity proofing</div><span class="decision deny">✘ ${esc(st.status)}</span>
+                 <div class="reason">${esc(st.error||'The presentation did not complete.')}</div>`));
+              return;
+            }
+          }
+          out.appendChild(el('step tool_result',
+            `<div class="label">🪪 Identity proofing</div><span class="decision deny">✘ timed out</span>
+             <div class="reason">No presentation arrived. Ask me to open the account again to retry.</div>`));
+        })();
         return;
       }
       if(ev.type === 'scope_challenge'){
@@ -1445,7 +1576,7 @@ async function streamRun(prompt, spin){
         // also carry the specific operation so the app requests it as an RFC 9396
         // authorization_details (RAR) that Alice consents to at PingFederate.
         sessionStorage.setItem('pending_prompt', prompt);
-        setNode('pep2','deny','insufficient_scope');
+        setNode(stackOf(ev)+'pep2','deny','insufficient_scope');
         out.appendChild(el('step tool_result convo', `<div class="label">🔐 Step-up required — scope <code>${esc(ev.scope||'')}</code></div><div>${esc(ev.detail||'')} You'll re-authenticate at PingFederate and approve this specific payment, then it continues.</div>`));
         let url = '/login?stepup=' + encodeURIComponent(ev.scope||'banking:payments:transfer');
         const p = ev.payment;

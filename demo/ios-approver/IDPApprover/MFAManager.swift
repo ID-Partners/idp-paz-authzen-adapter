@@ -344,7 +344,8 @@ final class MFAManager: ObservableObject {
                 id: code, code: code,
                 requestURI: (j["request_uri"] as? String) ?? "",
                 subject: (j["subject"] as? String) ?? "",
-                doctype: (j["doctype"] as? String) ?? "org.iso.18013.5.1.mDL")
+                doctype: (j["doctype"] as? String) ?? "org.iso.18013.5.1.mDL",
+                account: (j["account"] as? String) ?? "")
         } catch { return nil }
     }
 
@@ -361,7 +362,8 @@ final class MFAManager: ObservableObject {
                 id: code, code: code,
                 requestURI: (j["request_uri"] as? String) ?? "",
                 subject: (j["subject"] as? String) ?? "",
-                doctype: (j["doctype"] as? String) ?? "org.iso.18013.5.1.mDL")
+                doctype: (j["doctype"] as? String) ?? "org.iso.18013.5.1.mDL",
+                account: (j["account"] as? String) ?? "")
         } catch { return nil }
     }
 
@@ -538,4 +540,6 @@ struct PendingProofing: Identifiable, Equatable {
     let requestURI: String
     let subject: String
     let doctype: String
+    /// The specific account the proofing is FOR (e.g. "savings") — account-scoped.
+    var account: String = ""
 }
