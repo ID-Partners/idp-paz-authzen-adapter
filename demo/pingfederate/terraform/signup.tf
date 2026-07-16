@@ -32,20 +32,28 @@ locals {
   pingone_issuer = "https://auth.pingone.asia/${var.pingone_env_id}/as"
 }
 
-# 1) Token processor validating PingOne ID tokens: signature via PingOne's JWKS, issuer pinned,
-#    audience pinned to the signup application (an ID token minted for any OTHER PingOne app is
-#    refused). preferred_username carries the human-readable username used as the PF subject.
+# 1) Token processor validating the BFF's PASSKEY assertion JWT. The BFF is the WebAuthn RP:
+#    after it verifies the customer's passkey it self-signs a short-lived JWT (ES256) which PF
+#    exchanges (signupTE) for a PF user token — so a passkey sign-in federates into the site.
+#    Signature via the BFF's JWKS, issuer pinned to the BFF, audience pinned to the signup app.
+#    preferred_username carries the human-readable username used as the PF subject.
+variable "bff_issuer" {
+  description = "The BFF's issuer/base URL (signs passkey assertion JWTs; hosts /passkey/jwks)"
+  type        = string
+  default     = "https://northwind-app-staging.up.railway.app"
+}
+
 resource "pingfederate_idp_token_processor" "pingone_id_jwt" {
   processor_id = "pingOneIdJwtProc"
-  name         = "PingOne Signup ID Token Processor"
+  name         = "BFF Passkey Assertion Token Processor"
   plugin_descriptor_ref = {
     id = "org.sourceid.wstrust.processor.jwt.JWTTokenProcessor"
   }
   configuration = {
     fields = [
-      { name = "JWKS Endpoint URI", value = "${local.pingone_issuer}/jwks" },
-      { name = "Issuer", value = local.pingone_issuer },
-      { name = "Expiry Tolerance", value = "0" },
+      { name = "JWKS Endpoint URI", value = "${var.bff_issuer}/passkey/jwks" },
+      { name = "Issuer", value = var.bff_issuer },
+      { name = "Expiry Tolerance", value = "10" },
     ]
   }
   attribute_contract = {

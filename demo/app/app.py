@@ -823,12 +823,63 @@ async def passkey_finish(request: Request):
     except Exception as exc:  # noqa: BLE001
         return JSONResponse(status_code=502, content={"error": "could not save passkey",
                                                       "detail": str(exc)[:200]})
-    return _passkey_session_response(user)
+    pf_at = await _broker_passkey_to_pf(user)
+    return _passkey_session_response(user, pf_at)
 
 
-def _passkey_session_response(user: str) -> JSONResponse:
+# ── Federation: after the BFF verifies the passkey it mints a short-lived JWT signed with
+# its own key; PingFederate's signupTE token-exchange trusts the BFF JWKS + issuer and mints a
+# PF user token (same shape as alice's login). So a passkey sign-in ends as a real PF session —
+# the user is logged into the website with full agent/gateway access. ────────────────────────
+BFF_PASSKEY_KID = os.environ.get("BFF_PASSKEY_KID", "")
+BFF_ISSUER = os.environ.get("BFF_ISSUER", APP_BASE_URL)
+
+
+@app.get("/passkey/jwks")
+def passkey_jwks():
+    """JWKS PingFederate fetches to validate the BFF-signed passkey assertion JWT."""
+    return {"keys": [{"kty": "EC", "crv": "P-256", "use": "sig", "alg": "ES256",
+                      "kid": BFF_PASSKEY_KID,
+                      "x": os.environ.get("BFF_PASSKEY_X", ""),
+                      "y": os.environ.get("BFF_PASSKEY_Y", "")}]}
+
+
+def _mint_passkey_jwt(user: str) -> str:
+    pem = os.environ.get("BFF_PASSKEY_KEY_PEM", "")
+    now = int(time.time())
+    return jwt.encode(
+        {"iss": BFF_ISSUER, "sub": user, "preferred_username": user,
+         "aud": SIGNUP_CLIENT_ID or "0ce9dbdf-7d86-461a-b531-0a4afcb508d0",
+         "iat": now, "exp": now + 120, "acr": "urn:northwind:loa:passkey"},
+        pem, algorithm="ES256", headers={"kid": BFF_PASSKEY_KID})
+
+
+async def _broker_passkey_to_pf(user: str) -> str:
+    """Exchange the BFF-signed passkey JWT at PF (signupTE) for a PF user access token."""
+    if not (BFF_PASSKEY_KID and os.environ.get("BFF_PASSKEY_KEY_PEM")):
+        return ""
+    assertion = _mint_passkey_jwt(user)
+    try:
+        async with httpx.AsyncClient(timeout=20.0, verify=False) as c:
+            r = await c.post(PF_TOKEN, data={
+                "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+                "subject_token": assertion,
+                "subject_token_type": "urn:ietf:params:oauth:token-type:id_token",
+                "client_id": OIDC_CLIENT_ID, "client_secret": OIDC_CLIENT_SECRET,
+                "scope": DEFAULT_SCOPES})
+            if r.status_code == 200:
+                return r.json().get("access_token", "")
+            logger.warning("passkey PF broker failed %s: %s", r.status_code, r.text[:200])
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("passkey PF broker error: %s", exc)
+    return ""
+
+
+def _passkey_session_response(user: str, pf_at: str = "") -> JSONResponse:
     session = {"sub": user, "name": user.title(), "acr": "urn:northwind:loa:passkey"}
-    resp = JSONResponse({"ok": True, "sub": user})
+    if pf_at:
+        session["pf_at"] = pf_at   # real PF token → full website/agent access
+    resp = JSONResponse({"ok": True, "sub": user, "federated": bool(pf_at)})
     resp.set_cookie(SESSION_COOKIE, _sign(session, SESSION_TTL),
                     httponly=True, secure=True, samesite="lax", max_age=SESSION_TTL)
     return resp
@@ -911,7 +962,8 @@ async def signin_finish(request: Request):
     except Exception as exc:  # noqa: BLE001
         return JSONResponse(status_code=401, content={"error": "verification failed",
                                                       "detail": str(exc)[:200]})
-    return _passkey_session_response(u)
+    pf_at = await _broker_passkey_to_pf(u)
+    return _passkey_session_response(u, pf_at)
 
 
 @app.get("/signup/callback")
