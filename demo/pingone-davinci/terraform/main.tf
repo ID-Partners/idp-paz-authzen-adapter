@@ -30,6 +30,7 @@ variable "pingone_env_id" {
 }
 
 output "connections" {
-  description = "DaVinci connections available to flows (name → connector id)"
-  value = { for c in data.davinci_connections.all.connections : c.name => c.connector_id }
+  description = "DaVinci connections available to flows (name → {id, connector})"
+  value = { for c in data.davinci_connections.all.connections :
+            c.name => { id = c.id, connector = c.connector_id } }
 }
