@@ -611,7 +611,7 @@ async function doCreate(user){
     body: JSON.stringify({userId: beg.userId, deviceId: beg.deviceId, user, challenge,
                           origin: location.origin, attestation: JSON.stringify(att)})}).then(r=>r.json());
   if(fin.ok){ msg('✓ Passkey created — signing you in…', 'ok');
-    setTimeout(()=>location.href='/?signedup=1', 700); }
+    setTimeout(()=>location.href=(fin.next||'/?signedup=1'), 500); }
   else msg(fin.error+(fin.detail?': '+fin.detail:''), 'err');
 }
 
@@ -632,7 +632,7 @@ async function doSignin(user){
   const fin = await fetch('/signin/passkey/finish', {method:'POST',
     headers:{'content-type':'application/json'},
     body: JSON.stringify({origin: location.origin, assertion: JSON.stringify(asr)})}).then(r=>r.json());
-  if(fin.ok){ msg('✓ Signed in — welcome back…', 'ok'); setTimeout(()=>location.href='/', 600); }
+  if(fin.ok){ msg('✓ Signed in — welcome back…', 'ok'); setTimeout(()=>location.href=(fin.next||'/'), 500); }
   else msg(fin.error+(fin.detail?': '+fin.detail:''), 'err');
 }
 
@@ -824,7 +824,7 @@ async def passkey_finish(request: Request):
         return JSONResponse(status_code=502, content={"error": "could not save passkey",
                                                       "detail": str(exc)[:200]})
     pf_at = await _broker_passkey_to_pf(user)
-    return _passkey_session_response(user, pf_at)
+    return _passkey_session_response(user, pf_at, new_signup=True)
 
 
 # ── Federation: after the BFF verifies the passkey it mints a short-lived JWT signed with
@@ -875,11 +875,37 @@ async def _broker_passkey_to_pf(user: str) -> str:
     return ""
 
 
-def _passkey_session_response(user: str, pf_at: str = "") -> JSONResponse:
+# Pending passkey sessions keyed by a one-time code. The finish endpoint runs as a fetch
+# (it must POST the assertion), and Safari's ITP does NOT reliably persist a Set-Cookie on a
+# fetch/XHR response. Alice's login works because /callback sets the cookie on a top-level 302
+# navigation — so we mirror that: finish stashes the session under a code and returns a URL the
+# browser navigates to top-level (/passkey/complete), which sets the cookie on a 302 to the app.
+_PENDING_SESSIONS: dict[str, tuple[dict, float, bool]] = {}
+
+
+def _passkey_session_response(user: str, pf_at: str = "", new_signup: bool = False) -> JSONResponse:
     session = {"sub": user, "name": user.title(), "acr": "urn:northwind:loa:passkey"}
     if pf_at:
         session["pf_at"] = pf_at   # real PF token → full website/agent access
-    resp = JSONResponse({"ok": True, "sub": user, "federated": bool(pf_at)})
+    code = secrets.token_urlsafe(24)
+    now = time.time()
+    for k in [k for k, v in _PENDING_SESSIONS.items() if now - v[1] > 120]:
+        _PENDING_SESSIONS.pop(k, None)
+    _PENDING_SESSIONS[code] = (session, now, new_signup)
+    return JSONResponse({"ok": True, "sub": user, "federated": bool(pf_at),
+                         "next": f"/passkey/complete?t={code}"})
+
+
+@app.get("/passkey/complete")
+async def passkey_complete(t: str = ""):
+    """Top-level navigation that sets the session cookie on a 302 (Safari-reliable), then
+    lands the user in the app signed-in."""
+    entry = _PENDING_SESSIONS.pop(t, None)
+    if not entry or time.time() - entry[1] > 120:
+        return RedirectResponse("/?passkey=expired", status_code=302)
+    session, _, new_signup = entry
+    dest = "/?signedup=1" if new_signup else "/"
+    resp = RedirectResponse(dest, status_code=302)
     resp.set_cookie(SESSION_COOKIE, _sign(session, SESSION_TTL),
                     httponly=True, secure=True, samesite="lax", max_age=SESSION_TTL)
     return resp
