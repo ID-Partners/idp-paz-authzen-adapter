@@ -1183,8 +1183,10 @@ async def _p1_ensure_user(c: httpx.AsyncClient, tok: str, username: str) -> str:
         if not pops:
             raise RuntimeError("no PingOne population to create the user in")
         pop = next((p for p in pops if p.get("default")), pops[0])
+        # No placeholder email — the passkey/user display would otherwise show the fake
+        # "<username>@idpartners.example". A username-only account is fine for the demo.
         cr = await c.post(f"{P1_API}/v1/environments/{P1_ENV}/users", headers=h,
-                          json={"username": username, "email": f"{username}@idpartners.example",
+                          json={"username": username,
                                 "name": {"given": username.title()},
                                 "population": {"id": pop["id"]}})
         if cr.status_code not in (200, 201):
