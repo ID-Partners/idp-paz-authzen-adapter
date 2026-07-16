@@ -165,8 +165,10 @@ def _register_consent(pid: str, payment: dict, owner: str = "alice") -> str:
     for k in [k for k, v in _CONSENTS.items() if now - v.get("ts", 0) > _CONSENT_TTL]:
         _CONSENTS.pop(k, None)
     code = _consent_code(payment)
+    txn = "txn_" + uuid.uuid4().hex[:12]
     _CONSENTS[code] = {
         "code": code, "paymentId": pid, "status": "pending", "ts": now,
+        "transactionId": txn,
         "amount": float(payment.get("amount", 0) or 0),
         "currency": payment.get("currency", "AUD"),
         "debtorAccount": payment.get("from", ""),
@@ -176,13 +178,52 @@ def _register_consent(pid: str, payment: dict, owner: str = "alice") -> str:
         "requestedBy": "Autonomous Agent (staff-authorized)",
         "approver": BOB_USERNAME,
     }
+    _persist_consent(_CONSENTS[code], "requested")
     return code
+
+
+CONSENT_DIRECTORY_URL = os.environ.get(
+    "CONSENT_DIRECTORY_URL",
+    os.environ.get("PROOFING_DIRECTORY_URL",
+                   "http://proofing-directory.railway.internal:8075")).rstrip("/")
+
+
+def _persist_consent(c: dict, status: str) -> None:
+    """Persist Bob's staff-approval consent to the consent directory (best-effort,
+    fire-and-forget): same store + transaction-id scheme as Alice's RAR step-up
+    consents, channel ciba-staff."""
+    async def _post() -> None:
+        try:
+            async with httpx.AsyncClient(timeout=6.0) as hc:
+                if status == "requested":
+                    await hc.post(f"{CONSENT_DIRECTORY_URL}/consents", json={
+                        "transaction_id": c.get("transactionId"),
+                        "subject": c.get("accountOwner") or "alice",
+                        "actor": c.get("approver") or "bob",
+                        "channel": "ciba-staff", "status": "requested",
+                        "amount": c.get("amount"), "currency": c.get("currency"),
+                        "debtor_account": c.get("debtorAccount"),
+                        "creditor_account": c.get("creditorAccount"),
+                        "code": c.get("code"),
+                        "authorization_details": c.get("authorization_details") or []})
+                else:
+                    await hc.patch(
+                        f"{CONSENT_DIRECTORY_URL}/consents/{c.get('transactionId')}",
+                        json={"status": status})
+        except Exception:  # noqa: BLE001 — persistence never blocks the approval flow
+            pass
+    try:
+        asyncio.get_running_loop().create_task(_post())
+    except RuntimeError:  # no running loop (sync caller at import/startup)
+        pass
 
 
 def _resolve_consent(code: str, status: str) -> None:
     c = _CONSENTS.get(code)
     if c:
         c["status"] = status
+        # approved/declined from the phone → advance the directory record too.
+        _persist_consent(c, "authorized" if status == "approved" else status)
 
 
 def _latest_pending_consent() -> dict | None:

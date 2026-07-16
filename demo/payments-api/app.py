@@ -44,10 +44,49 @@ ACCOUNTS_API_BASE = os.environ.get(
 
 STAFF_PRINCIPALS = set((os.environ.get("STAFF_PRINCIPALS", "bob")).split(","))
 
+# The consent directory: payment authorization consents live here, keyed by the
+# transaction id that rides in the token's authorization_details.
+CONSENT_DIRECTORY_URL = os.environ.get(
+    "CONSENT_DIRECTORY_URL",
+    os.environ.get("PROOFING_DIRECTORY_URL",
+                   "http://proofing-directory.railway.internal:8075")).rstrip("/")
+
 
 def _audit(action: str, principal: str | None, agent: str | None, detail: str) -> None:
     logger.info("AUDIT action=%s principal=%s agent=%s :: %s",
                 action, principal or "?", agent or "?", detail)
+
+
+def _token_transaction_id(request: Request) -> str | None:
+    """Pull the consent's transaction id from the bearer token's RFC 9396
+    authorization_details (payment_initiation). The gateway (PEP) has already
+    verified the token — this is claim EXTRACTION, not validation."""
+    auth = request.headers.get("authorization", "")
+    tok = auth[7:] if auth.lower().startswith("bearer ") else ""
+    if tok.count(".") != 2:
+        return None
+    try:
+        import base64
+        import json as _json
+        payload = tok.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        claims = _json.loads(base64.urlsafe_b64decode(payload))
+        for d in claims.get("authorization_details") or []:
+            if isinstance(d, dict) and d.get("transactionId"):
+                return str(d["transactionId"])
+    except Exception:  # noqa: BLE001 — absence of a txn id is not an error
+        return None
+    return None
+
+
+async def _consent_executed(txn: str, result: dict) -> None:
+    """Advance the consent record to 'executed' with the payment outcome (best-effort)."""
+    try:
+        async with httpx.AsyncClient(timeout=6.0) as c:
+            await c.patch(f"{CONSENT_DIRECTORY_URL}/consents/{txn}",
+                          json={"status": "executed", "payment_result": result})
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _forbid_foreign_customer(customer_id: str, principal: str | None) -> JSONResponse | None:
@@ -129,9 +168,26 @@ async def make_payment(body: PaymentBody, request: Request,
         upstream = resp.json()
     except ValueError:
         upstream = {"success": False, "message": resp.text}
+
+    # Stamp the executed payment with the consent's transaction id (carried in the
+    # token's authorization_details) and advance the consent record to 'executed' —
+    # closing the consent → grant → token → action audit chain.
+    txn = _token_transaction_id(request)
+    if txn:
+        if isinstance(upstream, dict):
+            upstream["transactionId"] = txn
+        await _consent_executed(txn, {
+            "status_code": resp.status_code,
+            "success": bool(isinstance(upstream, dict) and upstream.get("success")),
+            "amount": body.amount, "currency": body.currency,
+            "from_account": body.from_account, "to_account": body.to_account,
+            "payment_id": (upstream or {}).get("payment_id")
+            if isinstance(upstream, dict) else None,
+        })
+
     _audit("make_payment", x_auth_principal, x_auth_agent,
            f"{body.amount:.2f} {body.currency} {body.from_account} -> {body.to_account} "
-           f"(accounts-domain status={resp.status_code})")
+           f"txn={txn or '-'} (accounts-domain status={resp.status_code})")
     return JSONResponse(status_code=resp.status_code, content=upstream)
 
 

@@ -268,14 +268,133 @@ class UserPostgresStore:
             return rows[0] if rows else None
 
 
+
+# ---------------------------------------------------------------------------
+# Payment authorization consents. Every payment authorization — Alice's RFC 9396
+# RAR step-up at PingFederate, or Bob's CIBA staff approval — is recorded here,
+# keyed by a minted TRANSACTION ID that rides inside the authorization_details of
+# the issued token, so the executed payment links back to the consent that
+# authorized it (consent -> grant -> token -> action, the audit/dispute chain).
+# ---------------------------------------------------------------------------
+class ConsentMemoryStore:
+    def __init__(self) -> None:
+        self._rows: dict[str, dict] = {}
+
+    def upsert(self, row: dict) -> None:
+        self._rows[row["transaction_id"]] = row
+
+    def get(self, txn: str) -> dict | None:
+        return self._rows.get(txn)
+
+    def list(self, subject: str | None = None, status: str | None = None) -> list[dict]:
+        rows = list(self._rows.values())
+        if subject:
+            rows = [r for r in rows if r.get("subject") == subject]
+        if status:
+            rows = [r for r in rows if r.get("status") == status]
+        return sorted(rows, key=lambda r: r.get("created_at") or "", reverse=True)
+
+
+class ConsentPostgresStore:
+    def __init__(self, dsn: str) -> None:
+        import psycopg
+        from psycopg.types.json import Jsonb
+
+        self._psycopg = psycopg
+        self._Jsonb = Jsonb
+        self._dsn = dsn
+        with self._conn() as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS payment_consents (
+                    transaction_id        TEXT PRIMARY KEY,
+                    subject               TEXT NOT NULL,
+                    actor                 TEXT,
+                    channel               TEXT NOT NULL,
+                    status                TEXT NOT NULL,
+                    amount                NUMERIC,
+                    currency              TEXT,
+                    debtor_account        TEXT,
+                    creditor_account      TEXT,
+                    code                  TEXT,
+                    authorization_details JSONB NOT NULL DEFAULT '[]'::jsonb,
+                    payment_result        JSONB,
+                    created_at            TIMESTAMPTZ NOT NULL,
+                    updated_at            TIMESTAMPTZ NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS ix_consents_subject "
+                "ON payment_consents (subject)"
+            )
+            conn.commit()
+
+    def _conn(self):
+        return self._psycopg.connect(self._dsn, autocommit=False)
+
+    _COLS = ("transaction_id, subject, actor, channel, status, amount, currency, "
+             "debtor_account, creditor_account, code, authorization_details, "
+             "payment_result, created_at, updated_at")
+
+    def upsert(self, row: dict) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                f"""
+                INSERT INTO payment_consents ({self._COLS})
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (transaction_id) DO UPDATE SET
+                    status = EXCLUDED.status,
+                    authorization_details = EXCLUDED.authorization_details,
+                    payment_result = EXCLUDED.payment_result,
+                    updated_at = EXCLUDED.updated_at
+                """,
+                (row["transaction_id"], row["subject"], row.get("actor"),
+                 row["channel"], row["status"], row.get("amount"), row.get("currency"),
+                 row.get("debtor_account"), row.get("creditor_account"), row.get("code"),
+                 self._Jsonb(row.get("authorization_details") or []),
+                 self._Jsonb(row["payment_result"]) if row.get("payment_result") is not None else None,
+                 row["created_at"], row["updated_at"]),
+            )
+            conn.commit()
+
+    def get(self, txn: str) -> dict | None:
+        with self._conn() as conn:
+            cur = conn.execute(
+                f"SELECT {self._COLS} FROM payment_consents WHERE transaction_id = %s",
+                (txn,))
+            row = cur.fetchone()
+            if row is None:
+                return None
+            cols = [d.name for d in cur.description]
+            return dict(zip(cols, row))
+
+    def list(self, subject: str | None = None, status: str | None = None) -> list[dict]:
+        q = f"SELECT {self._COLS} FROM payment_consents"
+        conds, params = [], []
+        if subject:
+            conds.append("subject = %s"); params.append(subject)
+        if status:
+            conds.append("status = %s"); params.append(status)
+        if conds:
+            q += " WHERE " + " AND ".join(conds)
+        q += " ORDER BY created_at DESC LIMIT 200"
+        with self._conn() as conn:
+            cur = conn.execute(q, tuple(params))
+            cols = [d.name for d in cur.description]
+            return [dict(zip(cols, r)) for r in cur.fetchall()]
+
+
 if DATABASE_URL:
     logger.info("Proofing directory using Postgres backend")
     store = PostgresStore(DATABASE_URL)
     user_store = UserPostgresStore(DATABASE_URL)
+    consent_store = ConsentPostgresStore(DATABASE_URL)
 else:
     logger.info("Proofing directory using in-memory backend (no DATABASE_URL)")
     store = MemoryStore()
     user_store = UserMemoryStore()
+    consent_store = ConsentMemoryStore()
 
 
 # Seed the demo identities so the approver/BFF can list them from day one.
@@ -534,6 +653,123 @@ def scim_patch_user(uid: str, body: dict):
                 row = _apply_user_payload(row, {BANK_EXT: {key: value}})
     user_store.upsert(row)
     return _user_resource(row)
+
+
+# ---------------------------------------------------------------------------
+# Payment authorization consents REST
+# ---------------------------------------------------------------------------
+CONSENT_SCHEMA_URN = "urn:idpartners:consent:1.0:PaymentAuthorizationConsent"
+
+
+class ConsentBody(BaseModel):
+    subject: str                          # the principal whose money moves (alice)
+    channel: str                          # rar-stepup | ciba-staff
+    actor: str | None = None              # who authorized (alice, bob)
+    amount: float | None = None
+    currency: str | None = None
+    debtor_account: str | None = None
+    creditor_account: str | None = None
+    code: str | None = None               # CIBA binding code, when applicable
+    authorization_details: list = Field(default_factory=list)
+    transaction_id: str | None = None     # caller-minted; generated if absent
+    status: str = "requested"
+
+
+class ConsentPatch(BaseModel):
+    status: str | None = None
+    authorization_details: list | None = None
+    payment_result: dict | None = None
+
+
+def _consent_resource(row: dict) -> dict:
+    created = row["created_at"]; updated = row["updated_at"]
+    if isinstance(created, str):
+        created = datetime.fromisoformat(created)
+    if isinstance(updated, str):
+        updated = datetime.fromisoformat(updated)
+    return {
+        "schemas": [CONSENT_SCHEMA_URN],
+        "transactionId": row["transaction_id"],
+        "subject": row["subject"],
+        "actor": row.get("actor"),
+        "channel": row["channel"],
+        "status": row["status"],
+        "amount": float(row["amount"]) if row.get("amount") is not None else None,
+        "currency": row.get("currency"),
+        "debtorAccount": row.get("debtor_account"),
+        "creditorAccount": row.get("creditor_account"),
+        "code": row.get("code"),
+        "authorizationDetails": row.get("authorization_details") or [],
+        "paymentResult": row.get("payment_result"),
+        "createdAt": _iso(created),
+        "updatedAt": _iso(updated),
+    }
+
+
+@app.post("/consents")
+def record_consent(body: ConsentBody):
+    """Record a payment authorization consent, minting the transaction id that rides in
+    the token's authorization_details so the executed payment links back to it."""
+    now = _now()
+    txn = (body.transaction_id or "").strip() or f"txn_{uuid.uuid4().hex[:12]}"
+    row = {
+        "transaction_id": txn,
+        "subject": body.subject,
+        "actor": body.actor,
+        "channel": body.channel,
+        "status": body.status,
+        "amount": body.amount,
+        "currency": body.currency,
+        "debtor_account": body.debtor_account,
+        "creditor_account": body.creditor_account,
+        "code": body.code,
+        "authorization_details": body.authorization_details,
+        "payment_result": None,
+        "created_at": now,
+        "updated_at": now,
+    }
+    consent_store.upsert(row)
+    logger.info("recorded payment consent txn=%s subject=%s channel=%s status=%s amount=%s",
+                txn, body.subject, body.channel, body.status, body.amount)
+    return _consent_resource(row)
+
+
+@app.get("/consents")
+def list_consents(subject: str | None = Query(default=None),
+                  status: str | None = Query(default=None)):
+    rows = consent_store.list(subject=subject, status=status)
+    return {
+        "schemas": ["urn:ietf:params:scim:api:messages:2.0:ListResponse"],
+        "totalResults": len(rows),
+        "Resources": [_consent_resource(r) for r in rows],
+    }
+
+
+@app.get("/consents/{txn}")
+def get_consent(txn: str):
+    row = consent_store.get(txn)
+    if row is None:
+        return JSONResponse(status_code=404, content={"error": "not_found"})
+    return _consent_resource(row)
+
+
+@app.patch("/consents/{txn}")
+def patch_consent(txn: str, body: ConsentPatch):
+    """Advance a consent through its lifecycle: requested → authorized (token issued)
+    → executed (payment performed) / declined / failed."""
+    row = consent_store.get(txn)
+    if row is None:
+        return JSONResponse(status_code=404, content={"error": "not_found"})
+    if body.status:
+        row["status"] = body.status
+    if body.authorization_details is not None:
+        row["authorization_details"] = body.authorization_details
+    if body.payment_result is not None:
+        row["payment_result"] = body.payment_result
+    row["updated_at"] = _now()
+    consent_store.upsert(row)
+    logger.info("consent txn=%s -> status=%s", txn, row["status"])
+    return _consent_resource(row)
 
 
 if __name__ == "__main__":

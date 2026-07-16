@@ -398,7 +398,32 @@ def _payment_rar(request: Request) -> list | None:
         "currency": (request.query_params.get("cur") or "AUD").strip(),
         "debtorAccount": (request.query_params.get("from") or "").strip(),
         "creditorAccount": (request.query_params.get("to") or "").strip(),
+        # The consent's TRANSACTION ID: minted here, recorded in the consent directory,
+        # and carried inside the authorization_details through PAR → PF → the issued
+        # token → the gateways → the payments RS, which stamps the executed payment
+        # with it. This is the consent→grant→token→action audit link.
+        "transactionId": "txn_" + secrets.token_hex(6),
     }]
+
+
+async def _record_consent(rar: list, subject: str, status: str = "requested") -> None:
+    """Persist the payment authorization consent to the directory (best-effort)."""
+    if not rar:
+        return
+    e = rar[0]
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as c:
+            await c.post(f"{PROOFING_DIRECTORY_URL}/consents", json={
+                "transaction_id": e.get("transactionId"),
+                "subject": subject, "actor": subject, "channel": "rar-stepup",
+                "amount": e.get("amount"), "currency": e.get("currency"),
+                "debtor_account": e.get("debtorAccount"),
+                "creditor_account": e.get("creditorAccount"),
+                "authorization_details": [
+                    {k: v for k, v in d.items() if k != "_principal_sub"} for d in rar],
+                "status": status})
+    except Exception:  # noqa: BLE001 — consent persistence must never block the login
+        pass
 
 
 @app.get("/login")
@@ -441,6 +466,8 @@ async def login(request: Request):
             for entry in rar:
                 entry["_principal_sub"] = principal_sub
         params["authorization_details"] = json.dumps(rar)
+        # Record the consent (status=requested) keyed by the minted transaction id.
+        await _record_consent(rar, principal_sub or "alice")
 
     authz = None
     if rar:
@@ -495,6 +522,21 @@ async def callback(request: Request):
         at_claims = jwt.decode(pf_access, options={"verify_signature": False})
     session = {"sub": sub, "name": id_claims.get("name") or sub,
                "acr": at_claims.get("acr"), "pf_at": pf_access}
+
+    # The issued token carrying our authorization_details = Alice consented at PF and
+    # the RAR passed governance. Advance the consent record(s) to 'authorized' by the
+    # transaction id riding in the details (best-effort; never blocks the login).
+    for d in (at_claims.get("authorization_details") or []):
+        txn = isinstance(d, dict) and d.get("transactionId")
+        if txn:
+            try:
+                async with httpx.AsyncClient(timeout=8.0) as c:
+                    await c.patch(f"{PROOFING_DIRECTORY_URL}/consents/{txn}", json={
+                        "status": "authorized",
+                        "authorization_details": at_claims["authorization_details"]})
+            except Exception:  # noqa: BLE001
+                pass
+
     resp = RedirectResponse("/", status_code=302)
     resp.set_cookie(SESSION_COOKIE, _sign(session, SESSION_TTL),
                     httponly=True, secure=True, samesite="lax", max_age=SESSION_TTL)
