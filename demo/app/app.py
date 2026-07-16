@@ -567,21 +567,52 @@ _SIGNUP_HTML = """<!doctype html><html><head><meta charset="utf-8">
 <title>Sign up — ID Partners Bank</title>
 <style>body{font-family:-apple-system,system-ui,sans-serif;background:#101418;color:#e8e8e8;
 display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}
-.card{background:#1a2027;border:1px solid #2a323c;border-radius:14px;padding:34px;width:360px}
-h1{font-size:19px;margin:0 0 6px}p{color:#9aa5b1;font-size:13px;line-height:1.5}
+.card{background:#1a2027;border:1px solid #2a323c;border-radius:14px;padding:32px;width:370px}
+.brand{font-size:20px;font-weight:700;margin:0 0 2px}.brand .o{color:#f26a1b}
+h1{font-size:17px;margin:14px 0 6px}p{color:#9aa5b1;font-size:13px;line-height:1.5;margin:6px 0}
 input{width:100%;box-sizing:border-box;padding:11px;border-radius:8px;border:1px solid #2a323c;
-background:#101418;color:#e8e8e8;font-size:15px;margin:12px 0}
-button{width:100%;padding:12px;border:0;border-radius:8px;background:#2d7a4f;color:#fff;
-font-size:15px;font-weight:600;cursor:pointer}button:disabled{opacity:.5}
-#msg{font-size:13px;margin-top:12px;min-height:18px}.err{color:#ff8b7b}.ok{color:#5fd08a}</style>
+background:#101418;color:#e8e8e8;font-size:15px;margin:10px 0 4px}
+button{width:100%;padding:12px;border:0;border-radius:8px;color:#fff;font-size:15px;
+font-weight:600;cursor:pointer;margin-top:8px}button:disabled{opacity:.45;cursor:default}
+.primary{background:#2d7a4f}.secondary{background:#2a3340}.ghost{background:transparent;
+color:#7fb0ff;font-weight:500;margin-top:14px;padding:4px}
+#msg{font-size:13px;margin-top:12px;min-height:18px}.err{color:#ff8b7b}.ok{color:#5fd08a}
+.hint{font-size:12px;margin:2px 0 0}.avail{color:#5fd08a}.taken{color:#ffcf6a}
+.hidden{display:none}</style>
 </head><body>
-<div class="card"><h1>🔑 Bank passkey</h1>
-<p>Enter your username. New here? We'll create a <b>passkey</b> (Face&nbsp;ID, or scan the QR to
-save it to your iPhone). Already registered? Sign in with your passkey.</p>
-<input id="u" placeholder="username (e.g. carol)" pattern="[a-z0-9._-]{2,30}" autofocus>
-<button id="go">Continue</button>
-<button id="signin" style="background:#2a3340;margin-top:8px;display:none">Sign in with passkey</button>
-<div id="msg"></div></div>
+<div class="card">
+  <div class="brand"><span class="o">■</span> ID <span class="o">PARTNERS</span> Bank</div>
+
+  <!-- CHOOSE -->
+  <div id="choose">
+    <h1>Welcome</h1>
+    <p>Bank with a passkey — Face&nbsp;ID, a security key, or your phone. No passwords.</p>
+    <button class="primary" id="toCreate">🔑 Create a new account</button>
+    <button class="secondary" id="toSignin">Sign in to an existing account</button>
+  </div>
+
+  <!-- CREATE -->
+  <div id="create" class="hidden">
+    <h1>Create your account</h1>
+    <p>Pick a username. We'll check it's free, then create your passkey.</p>
+    <input id="cu" placeholder="username (e.g. carol)" autocomplete="off" autocapitalize="none">
+    <div id="chint" class="hint"></div>
+    <button class="primary" id="createBtn" disabled>Create passkey</button>
+    <button class="ghost" data-to="choose">← Back</button>
+  </div>
+
+  <!-- SIGN IN -->
+  <div id="signin" class="hidden">
+    <h1>Sign in</h1>
+    <p>Use your passkey. Leave the username blank to let your device pick a saved one.</p>
+    <input id="su" placeholder="username (optional)" autocomplete="username webauthn"
+           autocapitalize="none">
+    <button class="primary" id="signinBtn">Sign in with passkey</button>
+    <button class="ghost" data-to="choose">← Back</button>
+  </div>
+
+  <div id="msg"></div>
+</div>
 <script>
 const b64uToBuf = s => { s = s.replace(/-/g,'+').replace(/_/g,'/'); s += '='.repeat((4-s.length%4)%4);
   const bin = atob(s); const b = new Uint8Array(bin.length);
@@ -589,8 +620,35 @@ const b64uToBuf = s => { s = s.replace(/-/g,'+').replace(/_/g,'/'); s += '='.rep
 const bufToB64u = buf => { const b = new Uint8Array(buf); let s='';
   for (let i=0;i<b.length;i++) s+=String.fromCharCode(b[i]);
   return btoa(s).replace(/\\+/g,'-').replace(/\\//g,'_').replace(/=+$/,''); };
-const msg = (t,c) => { const m=document.getElementById('msg'); m.textContent=t; m.className=c||''; };
-const uname = () => document.getElementById('u').value.trim().toLowerCase();
+const $ = id => document.getElementById(id);
+const msg = (t,c) => { const m=$('msg'); m.textContent=t; m.className=c||''; };
+const valid = u => /^[a-z0-9._-]{2,30}$/.test(u);
+function show(which){
+  ['choose','create','signin'].forEach(s => $(s).classList.toggle('hidden', s!==which));
+  msg('');
+}
+$('toCreate').onclick = () => { show('create'); $('cu').focus(); };
+$('toSignin').onclick = () => { show('signin'); $('su').focus(); };
+document.querySelectorAll('[data-to]').forEach(b => b.onclick = () => show(b.dataset.to));
+
+// live username uniqueness check (debounced)
+let chkTimer, lastFree = false;
+$('cu').addEventListener('input', () => {
+  const u = $('cu').value.trim().toLowerCase();
+  $('createBtn').disabled = true; lastFree = false;
+  clearTimeout(chkTimer);
+  const h = $('chint');
+  if(!valid(u)){ h.textContent = u ? 'Lowercase letters, digits, . _ - (2–30).' : ''; h.className='hint'; return; }
+  h.textContent = 'Checking…'; h.className='hint';
+  chkTimer = setTimeout(async () => {
+    try {
+      const c = await fetch('/signup/check?user='+encodeURIComponent(u)).then(r=>r.json());
+      if(c.hasPasskey){ h.textContent='✗ Taken — that account already has a passkey. Sign in instead.'; h.className='hint taken'; }
+      else if(c.exists){ h.textContent='✗ Taken — this username already exists.'; h.className='hint taken'; }
+      else { h.textContent='✓ Available'; h.className='hint avail'; lastFree=true; $('createBtn').disabled=false; }
+    } catch(e){ h.textContent=''; }
+  }, 350);
+});
 
 async function doCreate(user){
   msg('Setting up your account…');
@@ -633,27 +691,24 @@ async function doSignin(user){
     headers:{'content-type':'application/json'},
     body: JSON.stringify({origin: location.origin, assertion: JSON.stringify(asr)})}).then(r=>r.json());
   if(fin.ok){ msg('✓ Signed in — welcome back…', 'ok'); setTimeout(()=>location.href=(fin.next||'/'), 500); }
+  else if(fin.error==='unknown passkey' || fin.error==='no_passkey'){
+    msg('No passkey found for that account on this device. Create an account instead?', 'err'); }
   else msg(fin.error+(fin.detail?': '+fin.detail:''), 'err');
 }
 
-document.getElementById('go').onclick = async () => {
-  const user = uname();
-  if(!/^[a-z0-9._-]{2,30}$/.test(user)){ msg('Pick a valid username.', 'err'); return; }
-  const btn = document.getElementById('go'); btn.disabled = true;
-  try {
-    const chk = await fetch('/signup/check?user='+encodeURIComponent(user)).then(r=>r.json());
-    if(chk.hasPasskey){ msg('That account has a passkey — signing you in…'); await doSignin(user); }
-    else if(chk.exists){ msg('Account exists — adding a passkey…'); await doCreate(user); }
-    else { await doCreate(user); }
-  } catch(e){ msg('Passkey cancelled or failed: '+e.message, 'err'); }
-  btn.disabled = false;
+$('createBtn').onclick = async () => {
+  const u = $('cu').value.trim().toLowerCase();
+  if(!valid(u) || !lastFree){ msg('Pick an available username first.', 'err'); return; }
+  $('createBtn').disabled = true;
+  try { await doCreate(u); } catch(e){ msg('Passkey cancelled or failed: '+e.message, 'err'); }
+  $('createBtn').disabled = false;
 };
-// usernameless sign-in (discoverable credential) — let Safari offer any saved passkey
-document.getElementById('signin').style.display='block';
-document.getElementById('signin').onclick = async () => {
-  const btn = document.getElementById('signin'); btn.disabled = true;
-  try { await doSignin(''); } catch(e){ msg('Sign-in failed: '+e.message,'err'); }
-  btn.disabled = false;
+$('signinBtn').onclick = async () => {
+  const u = $('su').value.trim().toLowerCase();
+  if(u && !valid(u)){ msg('Enter a valid username, or leave it blank.', 'err'); return; }
+  $('signinBtn').disabled = true;
+  try { await doSignin(u); } catch(e){ msg('Sign-in cancelled or failed: '+e.message, 'err'); }
+  $('signinBtn').disabled = false;
 };
 </script></body></html>"""
 

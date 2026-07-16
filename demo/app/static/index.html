@@ -678,13 +678,14 @@ async function showOnboardingQr(auto){
     return;
   }
   out.appendChild(el('step tool_result convo',
-    `<div class="label">${auto ? '🎉 Welcome! One more step — pair your phone' : '📱 Pair your phone'}</div>
-     <div>Scan this with your iPhone <b>camera</b>. It opens the ID Partners approver app and
-     pairs it to <b>${esc(q.user)}</b> — that's how you'll approve payments and present your
-     licence when opening accounts.</div>
+    `<div class="label">${auto ? '🎉 Account ready — now enrol your approval device' : '📱 Enrol your approval device'}</div>
+     <div>Your passkey signs you in on this browser. To <b>approve payments and account
+     opening from your phone</b> (a secure push you tap — the CIBA back-channel), enrol the
+     ID&nbsp;Partners approver app: scan this with your iPhone <b>camera</b>. It opens the app
+     and pairs it to <b>${esc(q.user)}</b> automatically.</div>
      <div style="background:#fff;border-radius:10px;padding:14px;margin:10px 0;max-width:260px">${q.svg}</div>
-     <div style="font-size:11px;color:var(--muted)">Key expires ${esc(q.expiresAt||'soon')} —
-     press 📱 Pair phone up top to mint a fresh one.</div>`));
+     <div style="font-size:11px;color:var(--muted)">No phone handy? You can enrol later — press
+     <b>📱 Pair phone</b> up top for a fresh code. Key expires ${esc(q.expiresAt||'soon')}.</div>`));
   autoScroll();
 }
 function resumePending(){
