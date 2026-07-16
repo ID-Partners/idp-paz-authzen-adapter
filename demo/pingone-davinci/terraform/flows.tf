@@ -44,16 +44,32 @@ resource "davinci_application_flow_policy" "bank_signup_registration" {
   name           = "Bank Signup Passkey Registration"
   status         = "enabled"
   policy_flow {
-    # BISECT/STOPGAP: the bundled sign-on+registration flow (works via authorize).
-    # Swap back to davinci_flow.passkey_registration.id once the launch 500 is solved.
-    flow_id    = "37f470fa4c953d131420cf229faba5ec"
+    flow_id    = davinci_flow.passkey_registration.id
     version_id = -1
     weight     = 100
   }
 }
 
+# THE FIX for the authorize 500: assign the DaVinci flow policy to the PingOne signup
+# application via the PINGONE-NATIVE resource (not the davinci provider's assignment).
+# This is the exact call the console's Application → Policies tab makes — it registers
+# the policy with PingOne and stamps the trigger=AUTHENTICATION that the authorize
+# endpoint requires. The davinci provider's own davinci_application_flow_policy leaves
+# the PingOne-side trigger null → UNEXPECTED_ERROR at authorize.
+variable "pingone_signup_app_id" {
+  description = "PingOne application 'PF Bank Signup Federation' (the OIDC app the BFF drives)"
+  type        = string
+  default     = "0ce9dbdf-7d86-461a-b531-0a4afcb508d0"
+}
+
+resource "pingone_application_flow_policy_assignment" "bank_signup" {
+  environment_id = var.pingone_env_id
+  application_id = var.pingone_signup_app_id
+  flow_policy_id = davinci_application_flow_policy.bank_signup_registration.id
+  priority       = 1
+}
+
 output "signup_flow_policy_id" {
-  description = "Assign this to the PingOne signup application via flowPolicyAssignments"
-  value       = davinci_application_flow_policy.bank_signup_registration.id
+  value = davinci_application_flow_policy.bank_signup_registration.id
 }
 
