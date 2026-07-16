@@ -575,11 +575,12 @@ button{width:100%;padding:12px;border:0;border-radius:8px;background:#2d7a4f;col
 font-size:15px;font-weight:600;cursor:pointer}button:disabled{opacity:.5}
 #msg{font-size:13px;margin-top:12px;min-height:18px}.err{color:#ff8b7b}.ok{color:#5fd08a}</style>
 </head><body>
-<div class="card"><h1>🔑 Create your account</h1>
-<p>Choose a username, then create a <b>passkey</b> — Face&nbsp;ID on this device, or scan the
-QR to save it to your iPhone. No password, ever.</p>
+<div class="card"><h1>🔑 Bank passkey</h1>
+<p>Enter your username. New here? We'll create a <b>passkey</b> (Face&nbsp;ID, or scan the QR to
+save it to your iPhone). Already registered? Sign in with your passkey.</p>
 <input id="u" placeholder="username (e.g. carol)" pattern="[a-z0-9._-]{2,30}" autofocus>
-<button id="go">Create passkey</button>
+<button id="go">Continue</button>
+<button id="signin" style="background:#2a3340;margin-top:8px;display:none">Sign in with passkey</button>
 <div id="msg"></div></div>
 <script>
 const b64uToBuf = s => { s = s.replace(/-/g,'+').replace(/_/g,'/'); s += '='.repeat((4-s.length%4)%4);
@@ -589,38 +590,69 @@ const bufToB64u = buf => { const b = new Uint8Array(buf); let s='';
   for (let i=0;i<b.length;i++) s+=String.fromCharCode(b[i]);
   return btoa(s).replace(/\\+/g,'-').replace(/\\//g,'_').replace(/=+$/,''); };
 const msg = (t,c) => { const m=document.getElementById('msg'); m.textContent=t; m.className=c||''; };
+const uname = () => document.getElementById('u').value.trim().toLowerCase();
+
+async function doCreate(user){
+  msg('Setting up your account…');
+  const beg = await fetch('/signup/passkey/begin', {method:'POST',
+    headers:{'content-type':'application/json'}, body: JSON.stringify({user})}).then(r=>r.json());
+  if(beg.error){ msg(beg.error+(beg.detail?': '+beg.detail:''), 'err'); return; }
+  const o = beg.creationOptions; const challenge = o.challenge;
+  o.challenge = b64uToBuf(o.challenge); o.user.id = b64uToBuf(o.user.id);
+  (o.excludeCredentials||[]).forEach(c => c.id = b64uToBuf(c.id));
+  msg('Follow your device prompt to create the passkey…');
+  const cred = await navigator.credentials.create({publicKey: o});
+  const att = { id: cred.id, type: cred.type, rawId: bufToB64u(cred.rawId),
+    response: { clientDataJSON: bufToB64u(cred.response.clientDataJSON),
+                attestationObject: bufToB64u(cred.response.attestationObject) } };
+  msg('Finishing…');
+  const fin = await fetch('/signup/passkey/finish', {method:'POST',
+    headers:{'content-type':'application/json'},
+    body: JSON.stringify({userId: beg.userId, deviceId: beg.deviceId, user, challenge,
+                          origin: location.origin, attestation: JSON.stringify(att)})}).then(r=>r.json());
+  if(fin.ok){ msg('✓ Passkey created — signing you in…', 'ok');
+    setTimeout(()=>location.href='/?signedup=1', 700); }
+  else msg(fin.error+(fin.detail?': '+fin.detail:''), 'err');
+}
+
+async function doSignin(user){
+  msg('Requesting your passkey…');
+  const beg = await fetch('/signin/passkey/begin', {method:'POST',
+    headers:{'content-type':'application/json'}, body: JSON.stringify({user})}).then(r=>r.json());
+  if(beg.error){ msg(beg.error+(beg.detail?': '+beg.detail:''), 'err'); return; }
+  const o = beg.requestOptions; o.challenge = b64uToBuf(o.challenge);
+  (o.allowCredentials||[]).forEach(c => c.id = b64uToBuf(c.id));
+  msg('Use Face ID / your passkey…');
+  const cred = await navigator.credentials.get({publicKey: o});
+  const asr = { id: cred.id, type: cred.type, rawId: bufToB64u(cred.rawId),
+    response: { clientDataJSON: bufToB64u(cred.response.clientDataJSON),
+                authenticatorData: bufToB64u(cred.response.authenticatorData),
+                signature: bufToB64u(cred.response.signature),
+                userHandle: cred.response.userHandle ? bufToB64u(cred.response.userHandle) : null } };
+  const fin = await fetch('/signin/passkey/finish', {method:'POST',
+    headers:{'content-type':'application/json'},
+    body: JSON.stringify({origin: location.origin, assertion: JSON.stringify(asr)})}).then(r=>r.json());
+  if(fin.ok){ msg('✓ Signed in — welcome back…', 'ok'); setTimeout(()=>location.href='/', 600); }
+  else msg(fin.error+(fin.detail?': '+fin.detail:''), 'err');
+}
+
 document.getElementById('go').onclick = async () => {
-  const user = document.getElementById('u').value.trim().toLowerCase();
+  const user = uname();
   if(!/^[a-z0-9._-]{2,30}$/.test(user)){ msg('Pick a valid username.', 'err'); return; }
   const btn = document.getElementById('go'); btn.disabled = true;
   try {
-    msg('Setting up your account…');
-    const beg = await fetch('/signup/passkey/begin', {method:'POST',
-      headers:{'content-type':'application/json'}, body: JSON.stringify({user})}).then(r=>r.json());
-    if(beg.error){ msg(beg.error+(beg.detail?': '+beg.detail:''), 'err'); btn.disabled=false; return; }
-    const o = beg.creationOptions;
-    o.challenge = b64uToBuf(o.challenge);
-    o.user.id = b64uToBuf(o.user.id);
-    (o.excludeCredentials||[]).forEach(c => c.id = b64uToBuf(c.id));
-    msg('Follow your device prompt to create the passkey…');
-    const cred = await navigator.credentials.create({publicKey: o});
-    const att = {
-      id: cred.id, type: cred.type,
-      rawId: bufToB64u(cred.rawId),
-      response: {
-        clientDataJSON: bufToB64u(cred.response.clientDataJSON),
-        attestationObject: bufToB64u(cred.response.attestationObject),
-      }
-    };
-    msg('Finishing…');
-    const fin = await fetch('/signup/passkey/finish', {method:'POST',
-      headers:{'content-type':'application/json'},
-      body: JSON.stringify({userId: beg.userId, deviceId: beg.deviceId, user,
-                            origin: location.origin, attestation: JSON.stringify(att)})}).then(r=>r.json());
-    if(fin.ok){ msg('✓ Passkey created — signing you in…', 'ok');
-      setTimeout(()=>location.href='/?signedup=1', 700); }
-    else msg(fin.error+(fin.detail?': '+fin.detail:''), 'err');
+    const chk = await fetch('/signup/check?user='+encodeURIComponent(user)).then(r=>r.json());
+    if(chk.hasPasskey){ msg('That account has a passkey — signing you in…'); await doSignin(user); }
+    else if(chk.exists){ msg('Account exists — adding a passkey…'); await doCreate(user); }
+    else { await doCreate(user); }
   } catch(e){ msg('Passkey cancelled or failed: '+e.message, 'err'); }
+  btn.disabled = false;
+};
+// usernameless sign-in (discoverable credential) — let Safari offer any saved passkey
+document.getElementById('signin').style.display='block';
+document.getElementById('signin').onclick = async () => {
+  const btn = document.getElementById('signin'); btn.disabled = true;
+  try { await doSignin(''); } catch(e){ msg('Sign-in failed: '+e.message,'err'); }
   btn.disabled = false;
 };
 </script></body></html>"""
@@ -652,6 +684,33 @@ def _bytes_to_b64u(arr: list) -> str:
     return _b64u(bytes((x + 256) if x < 0 else x for x in arr))
 
 
+@app.get("/signup/check")
+async def signup_check(user: str = ""):
+    """Does this username already exist, and does it already have a passkey? Drives the UI:
+    existing+passkey → offer sign-in; existing-no-passkey → add a passkey; new → create."""
+    user = (user or "").strip().lower()
+    if not user:
+        return {"user": "", "exists": False, "hasPasskey": False}
+    exists = False
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as c:
+            tok = await _p1_token(c)
+            r = await c.get(f"{P1_API}/v1/environments/{P1_ENV}/users",
+                            headers={"Authorization": f"Bearer {tok}"},
+                            params={"filter": f'username eq "{user}"'})
+            exists = bool((r.json().get("_embedded") or {}).get("users"))
+    except Exception:  # noqa: BLE001
+        pass
+    has_passkey = False
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as c:
+            pr = await c.get(f"{PROOFING_DIRECTORY_URL}/passkey/{user}")
+            has_passkey = bool(pr.json().get("credentials"))
+    except Exception:  # noqa: BLE001
+        pass
+    return {"user": user, "exists": exists, "hasPasskey": has_passkey}
+
+
 @app.post("/signup/passkey/begin")
 async def passkey_begin(request: Request):
     """Create the PingOne user (passwordless) + a FIDO2 device, and return WebAuthn
@@ -663,6 +722,16 @@ async def passkey_begin(request: Request):
     user = str(body.get("user") or "").strip().lower()
     if not user or not P1_ENV:
         return JSONResponse(status_code=400, content={"error": "username required"})
+    # Guard: if this user already has a passkey, don't silently re-enrol — tell the UI.
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as c:
+            pr = await c.get(f"{PROOFING_DIRECTORY_URL}/passkey/{user}")
+            if pr.json().get("credentials"):
+                return JSONResponse(status_code=409, content={
+                    "error": "already_registered",
+                    "detail": f"{user} already has a passkey — sign in instead."})
+    except Exception:  # noqa: BLE001
+        pass
     try:
         async with httpx.AsyncClient(timeout=25.0) as c:
             tok = await _p1_token(c)
@@ -710,33 +779,139 @@ async def passkey_begin(request: Request):
 
 @app.post("/signup/passkey/finish")
 async def passkey_finish(request: Request):
-    """Activate the FIDO2 device with the browser's attestation, then sign the user in
-    (BFF session). The passkey now lives in PingOne bound to this RP."""
+    """Verify the browser's attestation (the BFF is the WebAuthn RP), store the credential
+    so we can later verify sign-in assertions, register the device in PingOne (registry),
+    and sign the user in."""
+    import webauthn
     body = await request.json()
     uid = body.get("userId"); did = body.get("deviceId")
     attestation = body.get("attestation"); user = str(body.get("user") or "").lower()
     origin = body.get("origin") or APP_BASE_URL
-    if not (uid and did and attestation):
+    challenge = body.get("challenge")
+    if not (uid and attestation and challenge):
         return JSONResponse(status_code=400, content={"error": "missing fields"})
+    # 1. WebAuthn RP verification of the registration (webauthn 3.x takes the JSON string).
+    try:
+        verification = webauthn.verify_registration_response(
+            credential=attestation,
+            expected_challenge=base64.urlsafe_b64decode(challenge + "=" * (-len(challenge) % 4)),
+            expected_origin=origin,
+            expected_rp_id=_rp_id(),
+            require_user_verification=True)
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse(status_code=400, content={"error": "verification failed",
+                                                      "detail": str(exc)[:200]})
+    cred = {"credential_id": _b64u(verification.credential_id),
+            "public_key": _b64u(verification.credential_public_key),
+            "sign_count": verification.sign_count,
+            "pingone_device_id": did}
+    # 2. Register the FIDO2 device in PingOne (best-effort — the credential registry).
     try:
         async with httpx.AsyncClient(timeout=20.0) as c:
             tok = await _p1_token(c)
-            r = await c.post(
+            await c.post(
                 f"{P1_API}/v1/environments/{P1_ENV}/users/{uid}/devices/{did}",
                 headers={"Authorization": f"Bearer {tok}",
                          "Content-Type": "application/vnd.pingidentity.device.activate+json"},
                 json={"origin": origin, "attestation": attestation})
-            if r.status_code >= 300:
-                return JSONResponse(status_code=400, content={
-                    "error": "activation failed", "detail": r.text[:300]})
+    except Exception:  # noqa: BLE001
+        pass
+    # 3. Persist the credential for sign-in.
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as c:
+            await c.put(f"{PROOFING_DIRECTORY_URL}/passkey/{user}", json=cred)
     except Exception as exc:  # noqa: BLE001
-        return JSONResponse(status_code=502, content={"error": str(exc)})
-    # Passkey enrolled + activated → the customer is authenticated. Establish the session.
+        return JSONResponse(status_code=502, content={"error": "could not save passkey",
+                                                      "detail": str(exc)[:200]})
+    return _passkey_session_response(user)
+
+
+def _passkey_session_response(user: str) -> JSONResponse:
     session = {"sub": user, "name": user.title(), "acr": "urn:northwind:loa:passkey"}
     resp = JSONResponse({"ok": True, "sub": user})
     resp.set_cookie(SESSION_COOKIE, _sign(session, SESSION_TTL),
                     httponly=True, secure=True, samesite="lax", max_age=SESSION_TTL)
     return resp
+
+
+# ── Passkey SIGN-IN (returning users). BFF is the WebAuthn RP: it challenges, the browser
+# asserts with the stored passkey, the BFF verifies against the stored public key. ─────────
+@app.post("/signin/passkey/begin")
+async def signin_begin(request: Request):
+    import webauthn
+    from webauthn.helpers.structs import PublicKeyCredentialDescriptor
+    body = await request.json()
+    user = str(body.get("user") or "").strip().lower()
+    creds = []
+    if user:
+        try:
+            async with httpx.AsyncClient(timeout=8.0) as c:
+                pr = await c.get(f"{PROOFING_DIRECTORY_URL}/passkey/{user}")
+                creds = pr.json().get("credentials") or []
+        except Exception:  # noqa: BLE001
+            creds = []
+    if user and not creds:
+        return JSONResponse(status_code=404, content={"error": "no_passkey",
+                            "detail": f"No passkey for {user} — sign up first."})
+    allow = [PublicKeyCredentialDescriptor(
+                id=base64.urlsafe_b64decode(c["credential_id"] + "=" * (-len(c["credential_id"]) % 4)))
+             for c in creds]
+    from webauthn.helpers.structs import UserVerificationRequirement
+    opts = webauthn.generate_authentication_options(
+        rp_id=_rp_id(), allow_credentials=allow or None,
+        user_verification=UserVerificationRequirement.REQUIRED)
+    optsd = json.loads(webauthn.options_to_json(opts))
+    resp = JSONResponse({"user": user, "requestOptions": optsd})
+    # remember the challenge for verification (signed, short-lived)
+    resp.set_cookie("nw_pk_ch", _sign({"c": optsd["challenge"], "u": user}, 300),
+                    httponly=True, secure=True, samesite="lax", max_age=300)
+    return resp
+
+
+@app.post("/signin/passkey/finish")
+async def signin_finish(request: Request):
+    import webauthn
+    body = await request.json()
+    assertion = body.get("assertion")
+    origin = body.get("origin") or APP_BASE_URL
+    tx = _verify(request.cookies.get("nw_pk_ch"))
+    if not tx or not assertion:
+        return JSONResponse(status_code=400, content={"error": "invalid state"})
+    try:
+        asr = json.loads(assertion)
+        cred_id_b64 = asr["rawId"].replace("+", "-").replace("/", "_").rstrip("=")
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse(status_code=400, content={"error": "bad assertion", "detail": str(exc)[:150]})
+    # find the credential that matches this assertion's id (across users if usernameless)
+    user = tx.get("u") or ""
+    match = None
+    async with httpx.AsyncClient(timeout=8.0) as c:
+        candidates = [user] if user else [
+            u.get("userName") for u in (await c.get(f"{PROOFING_DIRECTORY_URL}/scim/v2/Users")).json().get("Resources", [])]
+        for u in candidates:
+            if not u:
+                continue
+            pr = await c.get(f"{PROOFING_DIRECTORY_URL}/passkey/{u}")
+            for cr in pr.json().get("credentials") or []:
+                if cr["credential_id"] == cred_id_b64:
+                    match = (u, cr); break
+            if match:
+                break
+    if not match:
+        return JSONResponse(status_code=404, content={"error": "unknown passkey"})
+    u, cr = match
+    try:
+        webauthn.verify_authentication_response(
+            credential=assertion,
+            expected_challenge=base64.urlsafe_b64decode(tx["c"] + "=" * (-len(tx["c"]) % 4)),
+            expected_origin=origin, expected_rp_id=_rp_id(),
+            credential_public_key=base64.urlsafe_b64decode(cr["public_key"] + "=" * (-len(cr["public_key"]) % 4)),
+            credential_current_sign_count=int(cr.get("sign_count") or 0),
+            require_user_verification=True)
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse(status_code=401, content={"error": "verification failed",
+                                                      "detail": str(exc)[:200]})
+    return _passkey_session_response(u)
 
 
 @app.get("/signup/callback")

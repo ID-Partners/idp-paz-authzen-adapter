@@ -582,6 +582,40 @@ def _apply_user_payload(row: dict, body: dict) -> dict:
     return row
 
 
+@app.put("/passkey/{user_name}")
+def store_passkey(user_name: str, body: dict):
+    """Store a WebAuthn credential (credential_id, public_key, sign_count) for a user, so
+    the BFF (the WebAuthn RP) can verify sign-in assertions later. Kept in the user's
+    attributes JSONB alongside their SCIM record."""
+    row = user_store.by_username(user_name)
+    if row is None:
+        # auto-provision minimal record
+        now = _now()
+        row = {"id": f"usr_{uuid.uuid4().hex[:12]}", "user_name": user_name.lower(),
+               "display_name": user_name.title(), "active": True, "pingone_user_id": None,
+               "device_paired": False, "paired_at": None, "attributes": {},
+               "created_at": now, "updated_at": now}
+    attrs = dict(row.get("attributes") or {})
+    creds = list(attrs.get("passkeys") or [])
+    creds = [c for c in creds if c.get("credential_id") != body.get("credential_id")]
+    creds.append({"credential_id": body.get("credential_id"),
+                  "public_key": body.get("public_key"),
+                  "sign_count": int(body.get("sign_count") or 0),
+                  "pingone_device_id": body.get("pingone_device_id")})
+    attrs["passkeys"] = creds
+    row["attributes"] = attrs
+    row["updated_at"] = _now()
+    user_store.upsert(row)
+    return {"user": user_name, "credentials": len(creds)}
+
+
+@app.get("/passkey/{user_name}")
+def get_passkeys(user_name: str):
+    row = user_store.by_username(user_name)
+    creds = (row.get("attributes") or {}).get("passkeys") or [] if row else []
+    return {"user": user_name, "exists": row is not None, "credentials": creds}
+
+
 @app.get("/scim/v2/Users")
 def scim_list_users(filter: str | None = Query(default=None)):
     rows = user_store.list()
