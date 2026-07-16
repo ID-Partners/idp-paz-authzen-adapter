@@ -1590,9 +1590,27 @@ async function streamRun(prompt, spin){
             await new Promise(r=>setTimeout(r, 4000));
             let st; try { st = await fetch('/proofing/status/'+encodeURIComponent(begin.session_id)).then(r=>r.json()); } catch(e){ continue; }
             if(st.status === 'verified'){
-              out.appendChild(el('step tool_result',
-                `<div class="label">🪪 Identity verified</div><span class="decision allow">✔ mDL presented</span>
-                 <div class="reason">Verified claims recorded as an identity-proofing activity for ${esc(st.subject||'you')}. Resuming…</div>`));
+              // Render the verified mDL itself — the claims disclosed by the holder's
+              // wallet (validated against the issuing authority's IACA root), plus what
+              // was recorded in the identity directory.
+              const m = (st.claims && st.claims.mdl) || {};
+              const holder = [m.given_name, m.family_name].filter(Boolean).join(' ');
+              const row = (k,v)=> v ? `<div style="display:flex;gap:10px;font-size:12px;padding:2px 0">
+                    <span style="color:var(--muted);min-width:130px">${k}</span><span><b>${esc(String(v))}</b></span></div>` : '';
+              out.appendChild(el('step tool_result convo',
+                `<div class="label">🪪 Identity verified — mobile Driver's Licence</div>
+                 <span class="decision allow">✔ mDL presented</span>
+                 <div style="border:1px solid var(--hair,#8884);border-radius:10px;padding:10px 12px;margin:8px 0">
+                   ${row('Holder', holder)}
+                   ${row('Licence number', m.document_number)}
+                   ${row('Document type', m.doctype || ev.doctype || 'org.iso.18013.5.1.mDL')}
+                   ${row('Credential format', m.format)}
+                   ${row('Presented via', 'OpenID4VP · app2app from the holder\\'s wallet')}
+                   ${row('Trust', 'mdoc signature validated against the issuing authority (IACA)')}
+                 </div>
+                 <div class="reason">Recorded as an identity-proofing activity for
+                 <b>${esc(st.subject||'you')}</b>${acct?` · account: <b>${esc(acct)}</b>`:''}
+                 ${st.recorded?'':' <i>(directory write pending)</i>'}. Resuming…</div>`));
               setNode(stackOf(ev)+'pep1','','');
               setTimeout(()=>runPrompt(prompt), 600);
               return;
