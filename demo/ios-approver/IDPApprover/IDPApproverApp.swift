@@ -195,6 +195,7 @@ struct ProfileView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var pairingKey = ""
     @State private var repairing = false
+    @State private var newUser = ""
 
     var body: some View {
         NavigationView {
@@ -244,6 +245,25 @@ struct ProfileView: View {
                         Button("Sign out \(active.displayName)") { mfa.signOut(user: active.userName) }
                             .font(.footnote).foregroundColor(.red)
                     }
+                }
+                // Enrol a NEW customer who just signed up on the web (with a passkey) and
+                // isn't in the list yet — pair this device to their account by username.
+                // (Scanning the web's onboarding QR does the same via the idpapprover:// link.)
+                Section("Enrol a new account") {
+                    Text("Signed up on the web? Enter your username to add this phone for "
+                         + "approvals, or scan the QR the website showed you.")
+                        .font(.footnote).foregroundColor(Brand.muted)
+                    TextField("username", text: $newUser)
+                        .textFieldStyle(.roundedBorder)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled(true)
+                    Button {
+                        let u = newUser.trimmingCharacters(in: .whitespaces).lowercased()
+                        if !u.isEmpty { mfa.signIn(user: u); newUser = ""; dismiss() }
+                    } label: {
+                        Text(mfa.signingIn ? "Enrolling…" : "Enrol this device").fontWeight(.semibold)
+                    }
+                    .disabled(newUser.isEmpty || mfa.signingIn)
                 }
                 Section("Device") {
                     if mfa.isPaired && !repairing {
