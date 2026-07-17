@@ -192,7 +192,7 @@ struct HomeView: View {
                 }
             } else {
                 Text("Sign in").font(.title3.bold()).foregroundColor(Brand.ink).padding(.top, 18)
-                Text("Sign in with the passkey you created on the bank website.")
+                Text("Use the passkey or security key (YubiKey) you set up on the bank website.")
                     .foregroundColor(Brand.muted).multilineTextAlignment(.center).padding(.horizontal, 40)
                 Button { mfa.signInWithPasskey() } label: {
                     Label(mfa.signingIn ? "Signing in…" : "Sign in with a passkey", systemImage: "person.badge.key.fill")
@@ -281,7 +281,7 @@ struct ProfileView: View {
                               systemImage: "person.badge.key.fill").fontWeight(.semibold)
                     }
                     .disabled(mfa.signingIn)
-                    Text("Uses the passkey you created on the bank website — no QR needed.")
+                    Text("Uses the passkey or security key (YubiKey) you set up on the bank website — no QR needed.")
                         .font(.footnote).foregroundColor(Brand.muted)
                     Button { scanError = nil; showScanner = true } label: {
                         Label("Scan QR code instead", systemImage: "qrcode.viewfinder")

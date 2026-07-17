@@ -594,19 +594,30 @@ final class MFAManager: ObservableObject {
                   let challengeToken = j["challengeToken"] as? String else {
                 self.lastError = "Couldn't start passkey sign-in."; return
             }
-            // 2) native assertion (Face ID unlocks the passkey)
-            let provider = ASAuthorizationPlatformPublicKeyCredentialProvider(relyingPartyIdentifier: rpId)
-            let request = provider.createCredentialAssertionRequest(challenge: challenge)
-            if let allow = ro["allowCredentials"] as? [[String: Any]], !allow.isEmpty {
-                request.allowedCredentials = allow.compactMap {
-                    ($0["id"] as? String).flatMap(Self.b64urlDecode)
-                        .map { ASAuthorizationPlatformPublicKeyCredentialDescriptor(credentialID: $0) }
+            // 2) native assertion — offer BOTH a platform passkey (Face ID) AND a security key
+            //    (YubiKey via NFC/Lightning/USB-C) in the same sheet; the user picks.
+            let allowIds: [Data] = ((ro["allowCredentials"] as? [[String: Any]]) ?? [])
+                .compactMap { ($0["id"] as? String).flatMap(Self.b64urlDecode) }
+            let platformProvider = ASAuthorizationPlatformPublicKeyCredentialProvider(relyingPartyIdentifier: rpId)
+            let platformReq = platformProvider.createCredentialAssertionRequest(challenge: challenge)
+            if !allowIds.isEmpty {
+                platformReq.allowedCredentials = allowIds.map {
+                    ASAuthorizationPlatformPublicKeyCredentialDescriptor(credentialID: $0)
+                }
+            }
+            let skProvider = ASAuthorizationSecurityKeyPublicKeyCredentialProvider(relyingPartyIdentifier: rpId)
+            let skReq = skProvider.createCredentialAssertionRequest(challenge: challenge)
+            if !allowIds.isEmpty {
+                skReq.allowedCredentials = allowIds.map {
+                    ASAuthorizationSecurityKeyPublicKeyCredentialDescriptor(
+                        credentialID: $0,
+                        transports: ASAuthorizationSecurityKeyPublicKeyCredentialDescriptor.Transport.allSupported)
                 }
             }
             let coordinator = PasskeyCoordinator()
             self.passkeyCoordinator = coordinator
-            let assertion: ASAuthorizationPlatformPublicKeyCredentialAssertion?
-            do { assertion = try await coordinator.assertion(for: request) }
+            let assertion: ASAuthorizationPublicKeyCredentialAssertion?
+            do { assertion = try await coordinator.assertion(requests: [platformReq, skReq]) }
             catch {
                 self.lastError = "Passkey sign-in cancelled."
                 Self.phoneLog("passkey_signin_cancel", error.localizedDescription)
@@ -764,15 +775,17 @@ struct PendingProofing: Identifiable, Equatable {
 }
 
 /// Bridges the ASAuthorization delegate callbacks to async/await for the passkey sign-in.
+/// Presents platform passkey AND security-key (YubiKey) requests together and returns whichever
+/// assertion the user completed — both conform to ASAuthorizationPublicKeyCredentialAssertion.
 final class PasskeyCoordinator: NSObject, ASAuthorizationControllerDelegate,
                                 ASAuthorizationControllerPresentationContextProviding {
-    private var cont: CheckedContinuation<ASAuthorizationPlatformPublicKeyCredentialAssertion?, Error>?
+    private var cont: CheckedContinuation<ASAuthorizationPublicKeyCredentialAssertion?, Error>?
 
-    func assertion(for request: ASAuthorizationPlatformPublicKeyCredentialAssertionRequest)
-        async throws -> ASAuthorizationPlatformPublicKeyCredentialAssertion? {
+    func assertion(requests: [ASAuthorizationRequest])
+        async throws -> ASAuthorizationPublicKeyCredentialAssertion? {
         try await withCheckedThrowingContinuation { c in
             self.cont = c
-            let controller = ASAuthorizationController(authorizationRequests: [request])
+            let controller = ASAuthorizationController(authorizationRequests: requests)
             controller.delegate = self
             controller.presentationContextProvider = self
             controller.performRequests()
@@ -781,7 +794,7 @@ final class PasskeyCoordinator: NSObject, ASAuthorizationControllerDelegate,
 
     func authorizationController(controller: ASAuthorizationController,
                                  didCompleteWithAuthorization authorization: ASAuthorization) {
-        cont?.resume(returning: authorization.credential as? ASAuthorizationPlatformPublicKeyCredentialAssertion)
+        cont?.resume(returning: authorization.credential as? ASAuthorizationPublicKeyCredentialAssertion)
         cont = nil
     }
 
