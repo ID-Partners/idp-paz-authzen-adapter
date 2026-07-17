@@ -1,6 +1,8 @@
 import Foundation
 import SwiftUI
+import UIKit
 import LocalAuthentication
+import AuthenticationServices   // native passkey (WebAuthn) sign-in
 import PingOneSDK   // github.com/pingidentity/pingone-mobile-sdk-ios (SPM), v2.3.2
 
 /// Wraps the PingOne MFA iOS SDK. Isolates every SDK call so the branded UI (ApprovalView)
@@ -23,8 +25,9 @@ final class MFAManager: ObservableObject {
     /// app2app (openid4vp://) so the customer presents their mobile Driver's Licence.
     @Published var pendingProofing: PendingProofing?
 
-    /// The bank's identities (alice, bob) from the SCIM directory (via the web app),
-    /// so this device can sign in as either and track per-identity pairing.
+    /// The identities THIS device has paired — held ON-DEVICE (UserDefaults), never fetched
+    /// from the directory. The approver app is not entitled to enumerate the bank's roster;
+    /// it only knows accounts it was explicitly paired to (by scanned QR or username enrol).
     @Published var identities: [BankIdentity] = []
 
     /// Which identity this device currently acts for. The PingOne SDK supports multiple
@@ -64,7 +67,7 @@ final class MFAManager: ObservableObject {
 
     init() {
         Self.phoneLog("init", "app launched")
-        Task { await self.loadIdentities() }
+        loadLocalIdentities()
         // AP tenant (console.pingone.asia) → Singapore data center.
         // CONFIRM: .Singapore vs .Australia for this tenant's home region.
         PingOne.configure(geo: .Singapore) { [weak self] error in
@@ -196,7 +199,7 @@ final class MFAManager: ObservableObject {
                 }
                 if code.hasPrefix("MDL-") {
                     Self.phoneLog("proofing_push", "code=\(code)")
-                    let p = await Self.fetchProofing(code: code)
+                    let p = await Self.fetchProofing(code: code, user: self?.activeUser ?? "")
                     self?.pendingProofing = p ?? PendingProofing(
                         id: code, code: code, requestURI: "", subject: "", doctype: "")
                     self?.state = .approving
@@ -207,7 +210,7 @@ final class MFAManager: ObservableObject {
                 // is pending. If so, this push is that request: open the proofing view and
                 // hand off app2app via its openid4vp:// link. Payment consents keep working
                 // because they never register a proofing.
-                if let p = await Self.fetchLatestProofing() {
+                if let p = await Self.fetchLatestProofing(user: self?.activeUser ?? "") {
                     Self.phoneLog("proofing_push", "latest code=\(p.code)")
                     self?.pendingProofing = p
                     self?.state = .approving
@@ -229,8 +232,7 @@ final class MFAManager: ObservableObject {
     /// how far a push got even when nothing else fires. Never blocks the UI.
     static func phoneLog(_ event: String, _ detail: String) {
         Task {
-            var req = URLRequest(url: consentBase.appendingPathComponent("phone-log"))
-            req.httpMethod = "POST"
+            var req = consentAuthed(consentBase.appendingPathComponent("phone-log"), method: "POST")
             req.setValue("application/json", forHTTPHeaderField: "Content-Type")
             req.httpBody = try? JSONSerialization.data(withJSONObject: ["event": event, "detail": detail])
             _ = try? await URLSession.shared.data(for: req)
@@ -247,7 +249,7 @@ final class MFAManager: ObservableObject {
             url.appendPathComponent(code)
         }
         do {
-            let (data, resp) = try await URLSession.shared.data(from: url)
+            let (data, resp) = try await URLSession.shared.data(for: consentAuthed(url))
             guard (resp as? HTTPURLResponse)?.statusCode == 200,
                   let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
             else { return nil }
@@ -319,8 +321,7 @@ final class MFAManager: ObservableObject {
         guard let code, !code.isEmpty else { return }
         let url = consentBase.appendingPathComponent("consent")
             .appendingPathComponent(code).appendingPathComponent("report")
-        var req = URLRequest(url: url)
-        req.httpMethod = "POST"
+        var req = consentAuthed(url, method: "POST")
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         var body: [String: Any] = ["decision": decision]
         if let error { body["error"] = error }
@@ -333,10 +334,10 @@ final class MFAManager: ObservableObject {
 
     /// Resolve the push's reference code to the full proofing request — most importantly
     /// the openid4vp:// request URI to open app2app into the wallet.
-    private static func fetchProofing(code: String) async -> PendingProofing? {
-        let url = bffBase.appendingPathComponent("proofing/code/\(code)")
+    private static func fetchProofing(code: String, user: String) async -> PendingProofing? {
+        let req = deviceRequest("proofing/code/\(code)", user: user)
         do {
-            let (data, resp) = try await URLSession.shared.data(from: url)
+            let (data, resp) = try await URLSession.shared.data(for: req)
             guard (resp as? HTTPURLResponse)?.statusCode == 200,
                   let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
             else { return nil }
@@ -351,10 +352,10 @@ final class MFAManager: ObservableObject {
 
     /// The no-code fallback: the most recent FRESH proofing request pending at the web app
     /// (the push itself can't reliably carry even the reference code — see the routing above).
-    private static func fetchLatestProofing() async -> PendingProofing? {
-        let url = bffBase.appendingPathComponent("proofing/latest")
+    private static func fetchLatestProofing(user: String) async -> PendingProofing? {
+        let req = deviceRequest("proofing/latest", user: user)
         do {
-            let (data, resp) = try await URLSession.shared.data(from: url)
+            let (data, resp) = try await URLSession.shared.data(for: req)
             guard (resp as? HTTPURLResponse)?.statusCode == 200,
                   let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                   let code = j["code"] as? String else { return nil }
@@ -391,94 +392,150 @@ final class MFAManager: ObservableObject {
         pendingProofing = nil; pendingNotification = nil; state = .paired
     }
 
-    // MARK: - identities (SCIM roster via the web app)
+    // MARK: - identities (ON-DEVICE — only the accounts this phone was paired to)
 
-    /// Load the bank's identities (alice, bob) with their pairing state.
-    func loadIdentities() async {
-        let url = Self.bffBase.appendingPathComponent("identities")
-        guard let (data, resp) = try? await URLSession.shared.data(from: url),
-              (resp as? HTTPURLResponse)?.statusCode == 200,
-              let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let list = j["identities"] as? [[String: Any]] else { return }
-        identities = list.map {
+    private static let pairedKey = "pairedIdentities"
+
+    /// A friendly label for a username. The app deliberately has no directory read, so it
+    /// derives the display name locally (special-casing the demo principals).
+    static func displayName(for user: String) -> String {
+        switch user {
+        case "bob": return "Bob"
+        case "alice": return "Alice"
+        default: return user.capitalized
+        }
+    }
+
+    /// Load the identities this device has paired from local storage (no network, no roster).
+    func loadLocalIdentities() {
+        let raw = UserDefaults.standard.array(forKey: Self.pairedKey) as? [[String: Any]] ?? []
+        identities = raw.map {
             BankIdentity(userName: ($0["userName"] as? String) ?? "",
                          displayName: ($0["displayName"] as? String) ?? "",
-                         paired: ($0["paired"] as? Bool) ?? false,
+                         paired: true,
                          pingOneUserId: $0["pingOneUserId"] as? String)
         }
     }
 
-    /// True while a signIn is in flight. A List-row tap can fire the row's button several
-    /// times in quick succession, and concurrent enrols mint COMPETING pairing keys (each
-    /// new key invalidates the last), so the racing pair() calls fail with a generic server
-    /// error even when one of them lands. Gate to exactly one attempt at a time.
+    private func persistLocalIdentities() {
+        let raw = identities.map { ["userName": $0.userName, "displayName": $0.displayName,
+                                    "pingOneUserId": $0.pingOneUserId ?? ""] }
+        UserDefaults.standard.set(raw, forKey: Self.pairedKey)
+    }
+
+    /// Record that this device is now paired for `user` — adds it to the on-device list.
+    func recordPaired(user: String) {
+        let name = Self.displayName(for: user)
+        if let i = identities.firstIndex(where: { $0.userName == user }) {
+            identities[i] = BankIdentity(userName: user, displayName: name, paired: true,
+                                         pingOneUserId: identities[i].pingOneUserId)
+        } else {
+            identities.append(BankIdentity(userName: user, displayName: name,
+                                           paired: true, pingOneUserId: nil))
+        }
+        persistLocalIdentities()
+    }
+
+    /// Forget an identity on THIS device (sign-out).
+    func forgetPaired(user: String) {
+        identities.removeAll { $0.userName == user }
+        persistLocalIdentities()
+    }
+
+    /// True while a pairing is in flight (gate to one attempt at a time — racing pairing keys
+    /// invalidate each other).
     @Published var signingIn = false
 
-    /// Sign in as an identity: mint a pairing key for THAT user via the web app and pair.
-    /// The SDK supports multiple concurrent pairings, so this ADDS the identity to the
-    /// device (bob stays paired) and makes it the active one.
-    func signIn(user: String) {
+    // MARK: - device tokens (this phone's proof it may act for ONE user)
+
+    // The BFF mints a device token when the signed-in web user shows the pairing QR; it rides
+    // in the QR (dt=), is stored here per user, and is sent as a Bearer on EVERY BFF call so the
+    // phone can only ever act for that user. There is no way for the app to mint a pairing key
+    // for an arbitrary user any more — the key + token come only from a user's own web session.
+    private static func storeDeviceToken(_ token: String, for user: String) {
+        guard !token.isEmpty else { return }
+        UserDefaults.standard.set(token, forKey: "deviceToken.\(user.lowercased())")
+    }
+    static func deviceToken(for user: String) -> String? {
+        UserDefaults.standard.string(forKey: "deviceToken.\(user.lowercased())")
+    }
+    private static func forgetDeviceToken(for user: String) {
+        UserDefaults.standard.removeObject(forKey: "deviceToken.\(user.lowercased())")
+    }
+
+    /// A request to the BFF carrying this phone's device token for `user` as a Bearer.
+    private static func deviceRequest(_ path: String, user: String, method: String = "GET") -> URLRequest {
+        var req = URLRequest(url: bffBase.appendingPathComponent(path))
+        req.httpMethod = method
+        if let t = deviceToken(for: user) {
+            req.setValue("Bearer \(t)", forHTTPHeaderField: "Authorization")
+        }
+        return req
+    }
+
+    /// The identity this phone is currently acting as (readable from a static context).
+    private static func activeUserName() -> String {
+        UserDefaults.standard.string(forKey: "activeUser") ?? "bob"
+    }
+
+    /// A request to the AUTONOMOUS-AGENT (consent) service carrying the active user's device
+    /// token — so its consent/report/phone-log endpoints authorize this phone as that user.
+    private static func consentAuthed(_ url: URL, method: String = "GET") -> URLRequest {
+        var req = URLRequest(url: url)
+        req.httpMethod = method
+        if let t = deviceToken(for: activeUserName()) {
+            req.setValue("Bearer \(t)", forHTTPHeaderField: "Authorization")
+        }
+        return req
+    }
+
+    /// Handle a QR string scanned by the in-app scanner. The onboarding QR encodes
+    /// idpapprover://enroll?user=&key=&dt= — the same payload the iPhone camera deep-links.
+    /// Returns false if the string isn't an ID Partners pairing code.
+    @discardableResult
+    func handleScanned(_ raw: String) -> Bool {
+        guard let url = URL(string: raw.trimmingCharacters(in: .whitespacesAndNewlines)),
+              url.scheme == "idpapprover", url.host == "enroll",
+              let q = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems else { return false }
+        let user = q.first(where: { $0.name == "user" })?.value ?? ""
+        let key = q.first(where: { $0.name == "key" })?.value ?? ""
+        let token = q.first(where: { $0.name == "dt" })?.value ?? ""
+        guard !user.isEmpty, !key.isEmpty else { return false }
+        pairFromLink(user: user, key: key, token: token)
+        return true
+    }
+
+    /// Pair from a scanned onboarding QR (idpapprover://enroll?user=&key=&dt=): the web app
+    /// already minted this identity's pairing key AND a device token. Binding is gated by
+    /// DEVICE AUTHENTICATION (Face ID / passcode) first — scanning the QR is not enough; the
+    /// person holding the phone must authenticate to bind the profile, exactly like an approval.
+    /// Only then do we store the token and pair — no enrol fetch, no arbitrary-user key minting.
+    func pairFromLink(user: String, key: String, token: String = "") {
         guard !signingIn else { return }
-        signingIn = true
-        Self.phoneLog("sign_in", user)
-        Task { @MainActor in
-            var comps = URLComponents(url: Self.bffBase.appendingPathComponent("enroll"),
-                                      resolvingAgainstBaseURL: false)!
-            comps.queryItems = [.init(name: "user", value: user), .init(name: "format", value: "json")]
-            guard let (data, resp) = try? await URLSession.shared.data(from: comps.url!),
-                  (resp as? HTTPURLResponse)?.statusCode == 200,
-                  let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let key = j["code"] as? String else {
-                lastError = "Could not get a pairing key for \(user)."
-                Self.phoneLog("sign_in_error", "\(user): pairing-key fetch failed")
-                signingIn = false
+        biometric(reason: "Enrol this device as \(Self.displayName(for: user))") { [weak self] ok in
+            guard let self else { return }
+            guard ok else {
+                self.lastError = "Enrolment needs Face ID — the phone must authenticate to bind an account."
+                Self.phoneLog("enrol_biometric", "failed/cancelled for \(user)")
                 return
             }
-            PingOne.pair(key) { [weak self] _, error in
-                Task { @MainActor in
-                    defer { self?.signingIn = false }
-                    if let error {
-                        // Breadcrumb the real SDK error (the UI only shows a generic string),
-                        // then trust the server: a racing/earlier attempt may have landed —
-                        // PingOne is the source of truth, not this callback.
-                        Self.phoneLog("pair_error", "\(user): code=\(error.code) \(error.localizedDescription)")
-                        await Self.reconcilePairing(user: user)
-                        await self?.loadIdentities()
-                        if self?.identities.first(where: { $0.userName == user })?.paired == true {
-                            self?.activeUser = user
-                            self?.state = .paired
-                            self?.applyDeviceToken()
-                            self?.lastError = nil
-                            return
-                        }
-                        self?.lastError = "Pairing failed: \(error.localizedDescription)"
-                        return
-                    }
-                    Self.phoneLog("pair_ok", user)
-                    self?.activeUser = user
-                    self?.state = .paired
-                    self?.applyDeviceToken()
-                    await Self.reportPairing(user: user, paired: true)
-                    await self?.loadIdentities()
-                }
-            }
+            Self.phoneLog("enrol_biometric", "passed for \(user)")
+            self.startPairing(user: user, key: key, token: token)
         }
     }
 
-    /// Pair from a scanned onboarding QR (idpapprover://enroll?user=&key=): the web chat
-    /// already minted this identity's pairing key, so pair directly — no enrol fetch.
-    func pairFromLink(user: String, key: String) {
+    private func startPairing(user: String, key: String, token: String) {
         guard !signingIn else { return }
         signingIn = true
+        Self.storeDeviceToken(token, for: user)
         Self.phoneLog("qr_pair", user)
         PingOne.pair(key) { [weak self] _, error in
             Task { @MainActor in
                 defer { self?.signingIn = false }
                 if let error {
                     Self.phoneLog("qr_pair_error", "\(user): code=\(error.code) \(error.localizedDescription)")
-                    await Self.reconcilePairing(user: user)
-                    await self?.loadIdentities()
-                    if self?.identities.first(where: { $0.userName == user })?.paired == true {
+                    if await Self.reconcilePairing(user: user) {
+                        self?.recordPaired(user: user)
                         self?.activeUser = user
                         self?.state = .paired
                         self?.applyDeviceToken()
@@ -489,40 +546,169 @@ final class MFAManager: ObservableObject {
                     return
                 }
                 Self.phoneLog("qr_pair_ok", user)
+                self?.recordPaired(user: user)
                 self?.activeUser = user
                 self?.state = .paired
                 self?.applyDeviceToken()
                 await Self.reportPairing(user: user, paired: true)
-                await self?.loadIdentities()
             }
         }
     }
 
-    /// Ask the web app to check PingOne directly for this user's device state and sync the
-    /// directory — recovers the "pair() errored but the device actually paired" case.
-    private static func reconcilePairing(user: String) async {
-        var req = URLRequest(url: bffBase.appendingPathComponent("identities/\(user)/reconcile"))
-        req.httpMethod = "POST"
-        _ = try? await URLSession.shared.data(for: req)
+    // MARK: - passkey sign-in (native WebAuthn — the SAME passkey the user made on the web)
+
+    private var passkeyCoordinator: PasskeyCoordinator?
+
+    static func b64url(_ d: Data) -> String {
+        d.base64EncodedString().replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "=", with: "")
+    }
+    static func b64urlDecode(_ s: String) -> Data? {
+        var t = s.replacingOccurrences(of: "-", with: "+").replacingOccurrences(of: "_", with: "/")
+        while t.count % 4 != 0 { t += "=" }
+        return Data(base64Encoded: t)
     }
 
-    /// Sign out an identity: record it in the directory and stop acting for it. The PingOne
-    /// pairing itself is left in place (SDK multi-user unpair needs the environment id; for
-    /// the demo, the directory + active-identity switch is the source of truth).
+    /// Sign in on THIS device with the user's passkey (Associated Domains → rp.id = the web host,
+    /// so iOS offers the same credential created on the web front door). A verified assertion
+    /// mints a pairing key + device token at the BFF; we then pair and scope the phone to that
+    /// user. The passkey IS the sign-in — no QR, and its own Face ID covers user verification.
+    /// Pass an empty `user` for a usernameless (discoverable-credential) sign-in.
+    func signInWithPasskey(user: String = "") {
+        guard !signingIn else { return }
+        signingIn = true; lastError = nil
+        Self.phoneLog("passkey_signin", user.isEmpty ? "(usernameless)" : user)
+        Task { @MainActor in
+            defer { if self.signingIn { self.signingIn = false } }
+            // 1) begin — get the challenge + allowed credentials
+            var beginReq = URLRequest(url: Self.bffBase.appendingPathComponent("device/passkey/begin"))
+            beginReq.httpMethod = "POST"
+            beginReq.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            beginReq.httpBody = try? JSONSerialization.data(withJSONObject: ["user": user])
+            guard let (bd, br) = try? await URLSession.shared.data(for: beginReq),
+                  (br as? HTTPURLResponse)?.statusCode == 200,
+                  let j = try? JSONSerialization.jsonObject(with: bd) as? [String: Any],
+                  let ro = j["requestOptions"] as? [String: Any],
+                  let rpId = j["rpId"] as? String,
+                  let challenge = (ro["challenge"] as? String).flatMap(Self.b64urlDecode),
+                  let challengeToken = j["challengeToken"] as? String else {
+                self.lastError = "Couldn't start passkey sign-in."; return
+            }
+            // 2) native assertion (Face ID unlocks the passkey)
+            let provider = ASAuthorizationPlatformPublicKeyCredentialProvider(relyingPartyIdentifier: rpId)
+            let request = provider.createCredentialAssertionRequest(challenge: challenge)
+            if let allow = ro["allowCredentials"] as? [[String: Any]], !allow.isEmpty {
+                request.allowedCredentials = allow.compactMap {
+                    ($0["id"] as? String).flatMap(Self.b64urlDecode)
+                        .map { ASAuthorizationPlatformPublicKeyCredentialDescriptor(credentialID: $0) }
+                }
+            }
+            let coordinator = PasskeyCoordinator()
+            self.passkeyCoordinator = coordinator
+            let assertion: ASAuthorizationPlatformPublicKeyCredentialAssertion?
+            do { assertion = try await coordinator.assertion(for: request) }
+            catch {
+                self.lastError = "Passkey sign-in cancelled."
+                Self.phoneLog("passkey_signin_cancel", error.localizedDescription)
+                self.passkeyCoordinator = nil; return
+            }
+            self.passkeyCoordinator = nil
+            guard let a = assertion else { self.lastError = "No passkey assertion."; return }
+            // 3) finish — verify server-side, get {user, pairingKey, deviceToken}
+            let assertionObj: [String: Any] = [
+                "id": Self.b64url(a.credentialID), "rawId": Self.b64url(a.credentialID), "type": "public-key",
+                "response": ["clientDataJSON": Self.b64url(a.rawClientDataJSON),
+                             "authenticatorData": Self.b64url(a.rawAuthenticatorData),
+                             "signature": Self.b64url(a.signature),
+                             "userHandle": Self.b64url(a.userID)],
+                "clientExtensionResults": [:]]
+            guard let assertionData = try? JSONSerialization.data(withJSONObject: assertionObj),
+                  let assertionStr = String(data: assertionData, encoding: .utf8) else {
+                self.lastError = "Couldn't encode the passkey assertion."; return
+            }
+            var finReq = URLRequest(url: Self.bffBase.appendingPathComponent("device/passkey/finish"))
+            finReq.httpMethod = "POST"
+            finReq.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            finReq.httpBody = try? JSONSerialization.data(withJSONObject:
+                ["assertion": assertionStr, "challengeToken": challengeToken])
+            guard let (fd, fr) = try? await URLSession.shared.data(for: finReq),
+                  (fr as? HTTPURLResponse)?.statusCode == 200,
+                  let fj = try? JSONSerialization.jsonObject(with: fd) as? [String: Any],
+                  let signedUser = fj["user"] as? String,
+                  let key = fj["pairingKey"] as? String,
+                  let token = fj["deviceToken"] as? String else {
+                self.lastError = "Passkey verification failed."; return
+            }
+            // 4) pair + store. The passkey ceremony already did user verification, so pair directly
+            //    (startPairing gates on signingIn, so release it first).
+            Self.phoneLog("passkey_signin_ok", signedUser)
+            self.signingIn = false
+            self.startPairing(user: signedUser, key: key, token: token)
+        }
+    }
+
+    /// Ask the web app to check PingOne directly for THIS user's device state (scoped to the
+    /// one user the device is pairing — not a roster read) and sync the directory. Recovers
+    /// the "pair() errored but the device actually paired" case. Returns the paired state.
+    @discardableResult
+    private static func reconcilePairing(user: String) async -> Bool {
+        let req = deviceRequest("identities/\(user)/reconcile", user: user, method: "POST")
+        guard let (data, resp) = try? await URLSession.shared.data(for: req),
+              (resp as? HTTPURLResponse)?.statusCode == 200,
+              let j = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return false }
+        return (j["paired"] as? Bool) ?? false
+    }
+
+    /// Signed in = an active identity that's actually paired on this phone.
+    var isSignedIn: Bool { !activeUser.isEmpty && identities.contains(where: { $0.userName == activeUser }) }
+
+    /// Sign OUT but KEEP the account (and its device token) on the phone, so signing back in is
+    /// a local Face ID away — no re-scan. Clears the active selection; the account stays in the
+    /// list as available. The PingOne pairing is left intact.
     func signOut(user: String) {
         Self.phoneLog("sign_out", user)
         Task { @MainActor in
             await Self.reportPairing(user: user, paired: false)
-            if activeUser == user, let other = identities.first(where: { $0.userName != user }) {
-                activeUser = other.userName
+            if activeUser == user { activeUser = "" }
+        }
+    }
+
+    /// Sign back IN to an account already paired on this phone: Face ID, then make it active.
+    /// No network, no QR — the pairing and device token are already stored on the device.
+    func signInLocal(user: String) {
+        guard identities.contains(where: { $0.userName == user }), Self.deviceToken(for: user) != nil else {
+            lastError = "That account isn't paired on this phone. Scan the QR from the website."
+            return
+        }
+        biometric(reason: "Sign in as \(Self.displayName(for: user))") { [weak self] ok in
+            guard let self else { return }
+            guard ok else {
+                self.lastError = "Sign-in needs Face ID."
+                Self.phoneLog("sign_in_biometric", "failed/cancelled for \(user)")
+                return
             }
-            await loadIdentities()
+            Self.phoneLog("sign_in_local", user)
+            self.activeUser = user
+            self.state = .paired
+            self.applyDeviceToken()
+            Task { @MainActor in await Self.reportPairing(user: user, paired: true) }
+        }
+    }
+
+    /// Remove an account from this phone entirely (forget its device token + local record). Use
+    /// to hand the phone on / unpair; signing back in then needs a fresh QR from the website.
+    func removeAccount(user: String) {
+        Self.phoneLog("remove_account", user)
+        Task { @MainActor in
+            await Self.reportPairing(user: user, paired: false)
+            forgetPaired(user: user)
+            Self.forgetDeviceToken(for: user)
+            if activeUser == user { activeUser = identities.first?.userName ?? "" }
         }
     }
 
     private static func reportPairing(user: String, paired: Bool) async {
-        var req = URLRequest(url: bffBase.appendingPathComponent("identities/\(user)/pairing"))
-        req.httpMethod = "POST"
+        var req = deviceRequest("identities/\(user)/pairing", user: user, method: "POST")
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.httpBody = try? JSONSerialization.data(withJSONObject: ["paired": paired])
         _ = try? await URLSession.shared.data(for: req)
@@ -547,9 +733,9 @@ final class MFAManager: ObservableObject {
                               fromAccount: "", toAccount: "", bindingMessage: ctx)
     }
 
-    private func biometric(_ done: @escaping (Bool) -> Void) {
+    private func biometric(reason: String = "Approve this payment", _ done: @escaping (Bool) -> Void) {
         let c = LAContext()
-        c.evaluatePolicy(.deviceOwnerAuthentication, localizedReason: "Approve this payment") { ok, _ in
+        c.evaluatePolicy(.deviceOwnerAuthentication, localizedReason: reason) { ok, _ in
             Task { @MainActor in done(ok) }
         }
     }
@@ -557,7 +743,7 @@ final class MFAManager: ObservableObject {
     private func reset() { pending = nil; pendingNotification = nil; state = .paired }
 }
 
-/// A bank identity from the SCIM directory (alice, bob) with its device-pairing state.
+/// An identity THIS device has paired to (tracked on-device, not read from the directory).
 struct BankIdentity: Identifiable, Equatable {
     var id: String { userName }
     let userName: String
@@ -575,4 +761,38 @@ struct PendingProofing: Identifiable, Equatable {
     let doctype: String
     /// The specific account the proofing is FOR (e.g. "savings") — account-scoped.
     var account: String = ""
+}
+
+/// Bridges the ASAuthorization delegate callbacks to async/await for the passkey sign-in.
+final class PasskeyCoordinator: NSObject, ASAuthorizationControllerDelegate,
+                                ASAuthorizationControllerPresentationContextProviding {
+    private var cont: CheckedContinuation<ASAuthorizationPlatformPublicKeyCredentialAssertion?, Error>?
+
+    func assertion(for request: ASAuthorizationPlatformPublicKeyCredentialAssertionRequest)
+        async throws -> ASAuthorizationPlatformPublicKeyCredentialAssertion? {
+        try await withCheckedThrowingContinuation { c in
+            self.cont = c
+            let controller = ASAuthorizationController(authorizationRequests: [request])
+            controller.delegate = self
+            controller.presentationContextProvider = self
+            controller.performRequests()
+        }
+    }
+
+    func authorizationController(controller: ASAuthorizationController,
+                                 didCompleteWithAuthorization authorization: ASAuthorization) {
+        cont?.resume(returning: authorization.credential as? ASAuthorizationPlatformPublicKeyCredentialAssertion)
+        cont = nil
+    }
+
+    func authorizationController(controller: ASAuthorizationController, didCompleteWithError error: Error) {
+        cont?.resume(throwing: error); cont = nil
+    }
+
+    func presentationAnchor(for controller: ASAuthorizationController) -> ASPresentationAnchor {
+        UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .flatMap { $0.windows }
+            .first { $0.isKeyWindow } ?? ASPresentationAnchor()
+    }
 }

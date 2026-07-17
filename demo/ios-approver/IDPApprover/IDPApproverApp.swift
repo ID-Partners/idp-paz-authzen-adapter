@@ -1,5 +1,6 @@
 import SwiftUI
 import UserNotifications
+import AVFoundation
 
 @main
 struct IDPApproverApp: App {
@@ -68,16 +69,18 @@ struct RootView: View {
                              onPresent: mfa.openWalletForProofing,
                              onDecline: mfa.dismissProofing)
             }
-            // Onboarding by QR: the web chat shows a QR encoding
-            // idpapprover://enroll?user=<u>&key=<pairingKey>. Scanning it with the iPhone
-            // camera opens the app here, which pairs that identity automatically.
+            // Onboarding by QR: the web app shows a QR encoding
+            // idpapprover://enroll?user=<u>&key=<pairingKey>&dt=<deviceToken>. Scanning it with
+            // the iPhone camera opens the app here, which stores the device token and pairs that
+            // identity. The device token scopes this phone to that one user on every BFF call.
             .onOpenURL { url in
                 guard url.scheme == "idpapprover", url.host == "enroll" else { return }
                 let q = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems
                 let user = q?.first(where: { $0.name == "user" })?.value ?? ""
                 let key = q?.first(where: { $0.name == "key" })?.value ?? ""
+                let token = q?.first(where: { $0.name == "dt" })?.value ?? ""
                 if !user.isEmpty, !key.isEmpty {
-                    mfa.pairFromLink(user: user, key: key)
+                    mfa.pairFromLink(user: user, key: key, token: token)
                 }
             }
     }
@@ -168,18 +171,37 @@ struct HomeView: View {
 
             Spacer()
             IDPMonogram(size: 78)
-            if mfa.isPaired {
+            if mfa.isSignedIn {
                 Text("You're all set").font(.title3.bold()).foregroundColor(Brand.ink).padding(.top, 18)
                 Text("You'll be notified to approve payments.")
                     .foregroundColor(Brand.muted).multilineTextAlignment(.center).padding(.horizontal, 44)
-            } else {
-                Text("Set up this device").font(.title3.bold()).foregroundColor(Brand.ink).padding(.top, 18)
-                Text("Pair to start approving payments.").foregroundColor(Brand.muted)
-                Button { showProfile = true } label: {
-                    Text("Get started").font(.headline).foregroundColor(.white)
+            } else if let last = mfa.identities.first {
+                // Signed out, but the account is still paired on this phone — sign back in with
+                // Face ID, no re-scan needed.
+                Text("Signed out").font(.title3.bold()).foregroundColor(Brand.ink).padding(.top, 18)
+                Text("Sign back in to keep approving payments.")
+                    .foregroundColor(Brand.muted).multilineTextAlignment(.center).padding(.horizontal, 44)
+                Button { mfa.signInLocal(user: last.userName) } label: {
+                    Text("Sign in as \(last.displayName)").font(.headline).foregroundColor(.white)
                         .frame(maxWidth: .infinity).padding(.vertical, 14).background(Brand.orange)
-                        .clipShape(RoundedRectangle(cornerRadius: 10)).padding(.horizontal, 56)
+                        .clipShape(RoundedRectangle(cornerRadius: 10)).padding(.horizontal, 40)
                 }.padding(.top, 16)
+                if mfa.identities.count > 1 {
+                    Button("Choose another account") { showProfile = true }
+                        .font(.subheadline).foregroundColor(Brand.orange).padding(.top, 6)
+                }
+            } else {
+                Text("Sign in").font(.title3.bold()).foregroundColor(Brand.ink).padding(.top, 18)
+                Text("Sign in with the passkey you created on the bank website.")
+                    .foregroundColor(Brand.muted).multilineTextAlignment(.center).padding(.horizontal, 40)
+                Button { mfa.signInWithPasskey() } label: {
+                    Label(mfa.signingIn ? "Signing in…" : "Sign in with a passkey", systemImage: "person.badge.key.fill")
+                        .font(.headline).foregroundColor(.white)
+                        .frame(maxWidth: .infinity).padding(.vertical, 14).background(Brand.orange)
+                        .clipShape(RoundedRectangle(cornerRadius: 10)).padding(.horizontal, 44)
+                }.padding(.top, 16).disabled(mfa.signingIn)
+                Button("Pair with a QR instead") { showProfile = true }
+                    .font(.subheadline).foregroundColor(Brand.orange).padding(.top, 8)
             }
             Spacer(); Spacer()
             Text("Secured by PingFederate · Face ID required")
@@ -195,75 +217,78 @@ struct ProfileView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var pairingKey = ""
     @State private var repairing = false
-    @State private var newUser = ""
+    @State private var showScanner = false
+    @State private var scanError: String?
 
     var body: some View {
         NavigationView {
             List {
                 Section("Account") {
-                    row("Signed in as", mfa.identities.first(where: { $0.userName == mfa.activeUser })?
-                        .displayName ?? mfa.activeUser.capitalized)
-                    row("Role", mfa.activeUser == "bob" ? "Bank staff" : "Customer")
+                    if mfa.identities.contains(where: { $0.userName == mfa.activeUser }) {
+                        row("Signed in as", mfa.identities.first(where: { $0.userName == mfa.activeUser })?
+                            .displayName ?? mfa.activeUser.capitalized)
+                        row("Role", mfa.activeUser == "bob" ? "Bank staff" : "Customer")
+                    }
                     row("Bank", Brand.bankName)
                 }
-                // Identity switcher: the SCIM directory's identities. Signing in pairs THIS
-                // device for that user (the SDK supports multiple concurrent pairings, so
-                // switching never tears the other identity down).
-                Section("Identities") {
+                // Accounts THIS phone has been paired to — held on-device. The app has no
+                // directory read, so it can only ever show accounts it was explicitly paired
+                // to (by scanned QR or username enrol), never the bank's whole roster.
+                Section("Accounts on this device") {
                     if mfa.identities.isEmpty {
-                        Text("Loading identities…").font(.footnote).foregroundColor(Brand.muted)
+                        Text("No accounts paired on this phone yet. Scan the QR the bank website "
+                             + "showed you, or add one below.")
+                            .font(.footnote).foregroundColor(Brand.muted)
                     }
                     ForEach(mfa.identities) { ident in
+                        let isActive = ident.userName == mfa.activeUser
                         HStack(spacing: 10) {
-                            Image(systemName: ident.userName == mfa.activeUser
+                            Image(systemName: isActive
                                   ? "person.crop.circle.badge.checkmark" : "person.crop.circle")
-                                .foregroundColor(ident.userName == mfa.activeUser ? Brand.orange : Brand.muted)
+                                .foregroundColor(isActive ? Brand.orange : Brand.muted)
                             VStack(alignment: .leading, spacing: 2) {
                                 Text(ident.displayName).foregroundColor(Brand.ink)
-                                Text(ident.paired ? "Paired" : "Not paired on this device")
+                                Text(isActive ? "Signed in on this device" : "Signed out — paired on this device")
                                     .font(.caption).foregroundColor(Brand.muted)
                             }
                             Spacer()
-                            if ident.userName == mfa.activeUser {
+                            if isActive {
                                 Text("Active").font(.caption.bold()).foregroundColor(Brand.orange)
-                            } else if ident.paired {
-                                Button("Switch") { mfa.activeUser = ident.userName }
+                            } else {
+                                Button("Sign in") { mfa.signInLocal(user: ident.userName) }
                                     .font(.caption.bold()).foregroundColor(Brand.orange)
                                     .buttonStyle(.borderless)
-                            } else {
-                                Button(mfa.signingIn ? "Signing in…" : "Sign in") {
-                                    mfa.signIn(user: ident.userName)
-                                }
-                                .font(.caption.bold()).foregroundColor(Brand.orange)
-                                .buttonStyle(.borderless)
-                                .disabled(mfa.signingIn)
+                            }
+                        }
+                        .swipeActions(edge: .trailing) {
+                            Button(role: .destructive) { mfa.removeAccount(user: ident.userName) } label: {
+                                Label("Remove", systemImage: "trash")
                             }
                         }
                     }
-                    if let active = mfa.identities.first(where: { $0.userName == mfa.activeUser }),
-                       active.paired {
+                    if let active = mfa.identities.first(where: { $0.userName == mfa.activeUser }) {
                         Button("Sign out \(active.displayName)") { mfa.signOut(user: active.userName) }
                             .font(.footnote).foregroundColor(.red)
                     }
                 }
-                // Enrol a NEW customer who just signed up on the web (with a passkey) and
-                // isn't in the list yet — pair this device to their account by username.
-                // (Scanning the web's onboarding QR does the same via the idpapprover:// link.)
-                Section("Enrol a new account") {
-                    Text("Signed up on the web? Enter your username to add this phone for "
-                         + "approvals, or scan the QR the website showed you.")
-                        .font(.footnote).foregroundColor(Brand.muted)
-                    TextField("username", text: $newUser)
-                        .textFieldStyle(.roundedBorder)
-                        .textInputAutocapitalization(.never)
-                        .autocorrectionDisabled(true)
-                    Button {
-                        let u = newUser.trimmingCharacters(in: .whitespaces).lowercased()
-                        if !u.isEmpty { mfa.signIn(user: u); newUser = ""; dismiss() }
-                    } label: {
-                        Text(mfa.signingIn ? "Enrolling…" : "Enrol this device").fontWeight(.semibold)
+                // Add an account: scan the onboarding QR the website shows. That QR carries the
+                // pairing key AND a device token that scopes this phone to that one user — there
+                // is deliberately no "type a username" path (a phone can't enrol an arbitrary
+                // account; the key + token come only from that user's own signed-in web session).
+                Section("Add an account") {
+                    Button { mfa.signInWithPasskey() } label: {
+                        Label(mfa.signingIn ? "Signing in…" : "Sign in with a passkey",
+                              systemImage: "person.badge.key.fill").fontWeight(.semibold)
                     }
-                    .disabled(newUser.isEmpty || mfa.signingIn)
+                    .disabled(mfa.signingIn)
+                    Text("Uses the passkey you created on the bank website — no QR needed.")
+                        .font(.footnote).foregroundColor(Brand.muted)
+                    Button { scanError = nil; showScanner = true } label: {
+                        Label("Scan QR code instead", systemImage: "qrcode.viewfinder")
+                    }
+                    if let scanError {
+                        Text(scanError).font(.footnote).foregroundColor(.red)
+                    }
                 }
                 Section("Device") {
                     if mfa.isPaired && !repairing {
@@ -290,10 +315,132 @@ struct ProfileView: View {
             .navigationTitle("Profile")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
+            .sheet(isPresented: $showScanner) {
+                ScannerSheet(
+                    onScan: { code in
+                        showScanner = false
+                        if mfa.handleScanned(code) { dismiss() }
+                        else { scanError = "That QR code isn't an ID Partners pairing code." }
+                    },
+                    onCancel: { showScanner = false },
+                    onError: { msg in showScanner = false; scanError = msg })
+            }
         }
     }
 
     private func row(_ k: String, _ v: String) -> some View {
         HStack { Text(k).foregroundColor(Brand.ink); Spacer(); Text(v).foregroundColor(Brand.muted) }
+    }
+}
+
+/// A presented sheet hosting the camera QR scanner with a branded header and a Cancel button.
+struct ScannerSheet: View {
+    let onScan: (String) -> Void
+    let onCancel: () -> Void
+    let onError: (String) -> Void
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                IDPWordmark(size: 18)
+                Spacer()
+                Button("Cancel", action: onCancel).foregroundColor(Brand.orange)
+            }
+            .padding(.horizontal, 20).padding(.vertical, 14)
+            Divider().overlay(Brand.hair)
+            ZStack {
+                QRScannerView(onScan: onScan, onError: onError)
+                RoundedRectangle(cornerRadius: 18)
+                    .strokeBorder(Color.white.opacity(0.9), lineWidth: 3)
+                    .frame(width: 220, height: 220)
+            }
+            Text("Point the camera at the QR code the bank website is showing.")
+                .font(.footnote).foregroundColor(Brand.muted)
+                .multilineTextAlignment(.center).padding(20)
+        }
+        .background(Brand.paper.ignoresSafeArea())
+    }
+}
+
+/// Minimal AVFoundation QR scanner wrapped for SwiftUI. Fires `onScan` once with the decoded
+/// string, then stops the session. Requires NSCameraUsageDescription in Info.plist.
+struct QRScannerView: UIViewControllerRepresentable {
+    let onScan: (String) -> Void
+    let onError: (String) -> Void
+
+    func makeUIViewController(context: Context) -> ScannerViewController {
+        let vc = ScannerViewController()
+        vc.onScan = onScan
+        vc.onError = onError
+        return vc
+    }
+    func updateUIViewController(_ vc: ScannerViewController, context: Context) {}
+}
+
+final class ScannerViewController: UIViewController, AVCaptureMetadataOutputObjectsDelegate {
+    var onScan: ((String) -> Void)?
+    var onError: ((String) -> Void)?
+    private let session = AVCaptureSession()
+    private var preview: AVCaptureVideoPreviewLayer?
+    private var handled = false
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        view.backgroundColor = .black
+        switch AVCaptureDevice.authorizationStatus(for: .video) {
+        case .authorized:
+            configure()
+        case .notDetermined:
+            AVCaptureDevice.requestAccess(for: .video) { [weak self] granted in
+                DispatchQueue.main.async {
+                    granted ? self?.configure()
+                            : self?.onError?("Camera access is needed to scan the QR code.")
+                }
+            }
+        default:
+            onError?("Camera access is off. Enable it for ID Partners in Settings to scan.")
+        }
+    }
+
+    private func configure() {
+        guard let device = AVCaptureDevice.default(for: .video),
+              let input = try? AVCaptureDeviceInput(device: device),
+              session.canAddInput(input) else {
+            onError?("No camera available on this device."); return
+        }
+        session.addInput(input)
+        let output = AVCaptureMetadataOutput()
+        guard session.canAddOutput(output) else { onError?("Scanner unavailable."); return }
+        session.addOutput(output)
+        output.setMetadataObjectsDelegate(self, queue: .main)
+        output.metadataObjectTypes = [.qr]
+
+        let p = AVCaptureVideoPreviewLayer(session: session)
+        p.videoGravity = .resizeAspectFill
+        p.frame = view.layer.bounds
+        view.layer.addSublayer(p)
+        preview = p
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in self?.session.startRunning() }
+    }
+
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        preview?.frame = view.layer.bounds
+    }
+
+    override func viewWillDisappear(_ animated: Bool) {
+        super.viewWillDisappear(animated)
+        if session.isRunning { session.stopRunning() }
+    }
+
+    func metadataOutput(_ output: AVCaptureMetadataOutput,
+                        didOutput metadataObjects: [AVMetadataObject],
+                        from connection: AVCaptureConnection) {
+        guard !handled,
+              let obj = metadataObjects.first as? AVMetadataMachineReadableCodeObject,
+              let str = obj.stringValue else { return }
+        handled = true
+        session.stopRunning()
+        onScan?(str)
     }
 }

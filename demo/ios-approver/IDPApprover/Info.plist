@@ -31,6 +31,8 @@
 	</array>
 	<key>NSFaceIDUsageDescription</key>
 	<string>Approve payments with Face ID</string>
+	<key>NSCameraUsageDescription</key>
+	<string>Scan the QR code shown by the bank website to pair this device</string>
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>remote-notification</string>
