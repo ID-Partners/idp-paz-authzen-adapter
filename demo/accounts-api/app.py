@@ -31,6 +31,7 @@ from __future__ import annotations
 import logging
 import os
 
+import httpx
 from fastapi import FastAPI, Header
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -82,6 +83,37 @@ def _forbid_foreign_customer(customer_id: str, principal: str | None) -> JSONRes
                         f"of customer '{customer_id}'."),
         })
     return None
+
+
+# The identity-proofing directory. An mDL proofing is SINGLE-USE: it authorises ONE origination
+# and is spent by it, so the record becomes the proofing for the account it opened and the next
+# account needs a fresh one. We spend it here — once the account genuinely exists — rather than at
+# the PDP permit, so a permitted-but-failed origination doesn't burn the customer's proofing.
+PROOFING_DIRECTORY_URL = os.environ.get("PROOFING_DIRECTORY_URL", "").rstrip("/")
+
+
+def _consume_proofing(customer_id: str, account_type: str, account_id: str) -> None:
+    """Spend the proofing that authorised this origination. Best-effort: the account is already
+    open and the PDP already authorised it, so a directory blip must not fail the customer's
+    request — but it IS loud, because a proofing that silently isn't spent is reusable."""
+    if not PROOFING_DIRECTORY_URL:
+        return
+    try:
+        r = httpx.post(f"{PROOFING_DIRECTORY_URL}/proofing/consume", timeout=4.0,
+                       json={"subject": customer_id, "account": account_type,
+                             "account_id": account_id})
+        if r.status_code == 404:
+            # Nothing to spend: the gate is off, or this type needs no proofing.
+            logger.info("No proofing to spend for %s/%s (account %s)",
+                        customer_id, account_type, account_id)
+        elif r.status_code >= 300:
+            logger.warning("Proofing NOT spent for %s/%s (account %s): HTTP %s — it stays reusable",
+                           customer_id, account_type, account_id, r.status_code)
+        else:
+            logger.info("Proofing spent by account %s (%s/%s)", account_id, customer_id, account_type)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Proofing NOT spent for %s/%s (account %s): %s — it stays reusable",
+                       customer_id, account_type, account_id, exc)
 
 
 def _customer_or_provision(customer_id: str, principal: str | None):
@@ -173,6 +205,7 @@ def open_account(body: OpenAccountBody,
     if customer is None:
         return JSONResponse(status_code=404, content={"error": f"Unknown customer {body.customer_id}"})
     acct = store.open_account(body.customer_id, body.account_type, body.nickname)
+    _consume_proofing(body.customer_id, body.account_type, acct.id)
     _audit("open_account", x_auth_principal, x_auth_agent,
            f"opened {acct.id} ({body.account_type}) for {body.customer_id}")
     return {

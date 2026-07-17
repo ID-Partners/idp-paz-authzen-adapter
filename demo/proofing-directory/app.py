@@ -79,6 +79,20 @@ class MemoryStore:
     def get(self, rid: str) -> dict | None:
         return self._rows.get(rid)
 
+    def consume(self, subject: str, account: str, account_id: str) -> dict | None:
+        """Spend the newest unconsumed, unexpired proofing for (subject, account)."""
+        cands = [r for r in self._rows.values()
+                 if r["subject"] == subject
+                 and (r.get("account") or "") == account
+                 and not r.get("consumed_at")
+                 and _as_dt(r["expires_at"]) > _now()]
+        if not cands:
+            return None
+        row = max(cands, key=lambda r: _as_dt(r["verified_at"]))
+        row["consumed_at"] = _now()
+        row["consumed_by_account"] = account_id
+        return row
+
     def reset(self) -> None:
         self._rows.clear()
 
@@ -114,6 +128,15 @@ class PostgresStore:
             conn.execute(
                 "ALTER TABLE proofing_activities ADD COLUMN IF NOT EXISTS account TEXT"
             )
+            # Single-use proofing: a proofing is SPENT by the origination it authorises, and
+            # records which account spent it — so the record is the proofing for THAT account,
+            # and a second origination needs a fresh one.
+            conn.execute(
+                "ALTER TABLE proofing_activities ADD COLUMN IF NOT EXISTS consumed_at TIMESTAMPTZ"
+            )
+            conn.execute(
+                "ALTER TABLE proofing_activities ADD COLUMN IF NOT EXISTS consumed_by_account TEXT"
+            )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS ix_proofing_subject "
                 "ON proofing_activities (subject)"
@@ -144,7 +167,8 @@ class PostgresStore:
             cur = conn.execute(
                 """
                 SELECT id, subject, activity_type, doctype, method, claims,
-                       verified_at, expires_at, session_id, account
+                       verified_at, expires_at, session_id, account,
+                       consumed_at, consumed_by_account
                 FROM proofing_activities WHERE subject = %s
                 """,
                 (subject,),
@@ -163,6 +187,36 @@ class PostgresStore:
                 (rid,),
             )
             row = cur.fetchone()
+            if row is None:
+                return None
+            cols = [d.name for d in cur.description]
+            return dict(zip(cols, row))
+
+    def consume(self, subject: str, account: str, account_id: str) -> dict | None:
+        """Atomically spend the newest unconsumed, unexpired proofing for (subject, account).
+
+        Done in ONE statement so two concurrent originations can't spend the same proofing —
+        the sub-select picks the row and the UPDATE only lands if it is still unconsumed."""
+        with self._conn() as conn:
+            cur = conn.execute(
+                """
+                UPDATE proofing_activities SET consumed_at = now(), consumed_by_account = %s
+                WHERE id = (
+                    SELECT id FROM proofing_activities
+                    WHERE subject = %s AND coalesce(account, '') = %s
+                      AND consumed_at IS NULL AND expires_at > now()
+                    ORDER BY verified_at DESC
+                    LIMIT 1
+                    FOR UPDATE SKIP LOCKED
+                )
+                RETURNING id, subject, activity_type, doctype, method, claims,
+                          verified_at, expires_at, session_id, account,
+                          consumed_at, consumed_by_account
+                """,
+                (account_id, subject, account),
+            )
+            row = cur.fetchone()
+            conn.commit()
             if row is None:
                 return None
             cols = [d.name for d in cur.description]
@@ -413,15 +467,20 @@ def _seed_users() -> None:
 _seed_users()
 
 
+def _as_dt(v) -> datetime:
+    """Stored timestamps come back as datetimes from postgres and strings from memory."""
+    return datetime.fromisoformat(v) if isinstance(v, str) else v
+
+
 def _to_resource(row: dict) -> dict:
-    """Render a stored row as a SCIM-flavoured resource, computing `active`."""
-    expires_at = row["expires_at"]
-    if isinstance(expires_at, str):
-        expires_at = datetime.fromisoformat(expires_at)
-    verified_at = row["verified_at"]
-    if isinstance(verified_at, str):
-        verified_at = datetime.fromisoformat(verified_at)
-    active = expires_at > _now()
+    """Render a stored row as a SCIM-flavoured resource, computing `active`.
+
+    A CONSUMED proofing is not active: it was spent by the origination it authorised, so it can
+    never satisfy the gate again (single-use). That is what makes it the proofing for one
+    specific account rather than a standing permit for that account type."""
+    expires_at = _as_dt(row["expires_at"])
+    verified_at = _as_dt(row["verified_at"])
+    active = expires_at > _now() and not row.get("consumed_at")
     return {
         "id": row["id"],
         "schemas": [SCHEMA_URN],
@@ -435,7 +494,36 @@ def _to_resource(row: dict) -> dict:
         "sessionId": row["session_id"],
         "account": row.get("account"),
         "active": active,
+        "consumedAt": _iso(_as_dt(row["consumed_at"])) if row.get("consumed_at") else None,
+        "consumedByAccount": row.get("consumed_by_account"),
     }
+
+
+class ConsumeBody(BaseModel):
+    subject: str
+    account: str = ""
+    account_id: str = ""
+
+
+@app.post("/proofing/consume")
+def consume_proofing(body: ConsumeBody):
+    """Spend the proofing that authorised an origination, binding it to the account it opened.
+
+    Called by the accounts domain once the account actually EXISTS, so the record becomes the
+    proofing for THAT account (`consumedByAccount`) and can never satisfy the gate again — the
+    next origination needs a fresh mDL. Consuming only on a real open (not on the PDP permit)
+    means a permitted-but-failed origination doesn't burn the customer's proofing.
+    404 when there is nothing to spend, so the caller can tell a no-op from a spend."""
+    row = store.consume(body.subject.strip().lower(),
+                        (body.account or "").strip().lower(),
+                        body.account_id)
+    if row is None:
+        return JSONResponse(status_code=404, content={
+            "error": "no_proofing_to_consume",
+            "detail": f"no active unconsumed proofing for {body.subject}/{body.account}"})
+    logger.info("Proofing %s spent by account %s (subject=%s account=%s)",
+                row["id"], body.account_id, body.subject, body.account)
+    return _to_resource(row)
 
 
 @app.get("/health")
