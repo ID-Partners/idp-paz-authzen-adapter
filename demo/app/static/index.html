@@ -351,16 +351,16 @@
   <div class="login-card">
     <div class="login-brand"><span class="idp-mark"><i class="idp-sq"></i><span class="idp-id">ID</span><span class="idp-pa">PARTNERS</span></span> Bank</div>
     <div class="login-sub">Sign in to your AI account assistant</div>
-    <button id="loginbtn" class="login-btn" type="button" onclick="location.href='/login'">
-      🎫 Sign in with PingFederate
+    <button id="loginbtn" class="login-btn" type="button" onclick="location.href='/signup'">
+      🔑 Sign in with a passkey
     </button>
     <button class="login-btn" type="button" style="background:#2d7a4f;margin-top:8px"
             onclick="location.href='/signup'">
-      🔑 New customer? Sign up with a passkey
+      ✨ Create an account
     </button>
-    <div class="login-hint">You'll be redirected to the PingFederate login page.<br>
-      Demo credentials — <b>alice</b> / <b>2Federate</b><br>
-      Sign-up registers you at PingOne with a passkey — no password needed after that.</div>
+    <div class="login-hint"><b>Passwordless</b> — sign in or register with a <b>passkey</b> or
+      <b>security key</b> (YubiKey). No passwords. Your identity lives at PingOne and is brokered
+      into a PingFederate session (RFC&nbsp;8693) so the agent&nbsp;delegation demo works as before.</div>
   </div>
 </div>
 
@@ -379,9 +379,9 @@
   <span id="signedout" class="whoami" hidden>
     <span style="color:var(--muted)">Not signed in</span>
     <button type="button" class="login-btn" style="width:auto;padding:7px 14px;margin:0"
-            onclick="location.href='/login'">🎫 Sign in with PingFederate</button>
+            onclick="location.href='/signup'">🔑 Sign in with a passkey</button>
     <button type="button" class="login-btn" style="width:auto;padding:7px 14px;margin:0;background:#2d7a4f"
-            onclick="location.href='/signup'">🔑 Sign up</button>
+            onclick="location.href='/signup'">✨ Create account</button>
   </span>
 </header>
 
@@ -683,7 +683,7 @@ async function showOnboardingQr(auto){
      opening from your phone</b> (a secure push you tap — the CIBA back-channel), enrol the
      ID&nbsp;Partners approver app: scan this with your iPhone <b>camera</b>. It opens the app
      and pairs it to <b>${esc(q.user)}</b> automatically.</div>
-     <div style="background:#fff;border-radius:10px;padding:14px;margin:10px 0;max-width:260px">${q.svg}</div>
+     <div style="background:#fff;border-radius:10px;padding:14px;margin:10px 0;max-width:320px">${q.svg}</div>
      <div style="font-size:11px;color:var(--muted)">No phone handy? You can enrol later — press
      <b>📱 Pair phone</b> up top for a fresh code. Key expires ${esc(q.expiresAt||'soon')}.</div>`));
   autoScroll();
@@ -1606,7 +1606,7 @@ async function streamRun(prompt, spin){
                    ${row('Licence number', m.document_number)}
                    ${row('Document type', m.doctype || ev.doctype || 'org.iso.18013.5.1.mDL')}
                    ${row('Credential format', m.format)}
-                   ${row('Presented via', 'OpenID4VP · app2app from the holder\\'s wallet')}
+                   ${row('Presented via', 'OpenID4VP · app2app from the wallet')}
                    ${row('Trust', 'mdoc signature validated against the issuing authority (IACA)')}
                  </div>
                  <div class="reason">Recorded as an identity-proofing activity for

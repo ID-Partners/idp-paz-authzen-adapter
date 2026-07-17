@@ -518,12 +518,31 @@ def ping() -> dict:
             "concierge": CONCIERGE_URL, "pf_token_url": PF_TOKEN_URL}
 
 
+# ── device authorization ────────────────────────────────────────────────────────────
+# The approver app is de-privileged: it holds a device token (a BFF-signed JWT scoping it to
+# ONE user), minted when that user's pairing QR was generated and sent as a Bearer on every
+# call. We verify it here with the SHARED DEVICE_TOKEN_SECRET so a phone can only read/report
+# consents whose approver is ITS user — never another principal's.
+DEVICE_TOKEN_SECRET = os.environ.get("DEVICE_TOKEN_SECRET", "")
+
+
+def _device_user(request: Request) -> str | None:
+    auth = request.headers.get("authorization", "")
+    if not auth.lower().startswith("bearer ") or not DEVICE_TOKEN_SECRET:
+        return None
+    try:
+        claims = jwt.decode(auth.split(" ", 1)[1].strip(), DEVICE_TOKEN_SECRET, algorithms=["HS256"])
+    except Exception:  # noqa: BLE001
+        return None
+    if claims.get("typ") != "device":
+        return None
+    return (claims.get("device_sub") or "").lower() or None
+
+
 # ── consent detail (Bob's approver app pulls the full authorization up by code) ──────
 # The CIBA push carries only a short reference code (binding_message). The approver app
-# resolves it to the full consent here. `/consent` (no code) returns the latest pending one
-# — a demo convenience so the app can fetch even if it can't parse the code from the push.
-# NOTE (demo): unauthenticated + code-guarded. The code is short-lived and unguessable
-# enough for a demo; a production build would bind this to the approver's own token.
+# resolves it to the full consent here — device-token scoped: only the consent's own approver's
+# phone may read it. `/consent` (no code) returns that phone's latest pending consent.
 def _consent_view(c: dict) -> dict:
     return {k: c[k] for k in ("code", "paymentId", "status", "amount", "currency",
                               "debtorAccount", "creditorAccount", "accountOwner",
@@ -531,18 +550,26 @@ def _consent_view(c: dict) -> dict:
 
 
 @app.get("/consent")
-def consent_latest() -> dict:
+def consent_latest(request: Request) -> dict:
+    du = _device_user(request)
+    if not du:
+        return JSONResponse({"error": "device_auth_required"}, status_code=401)
     c = _latest_pending_consent()
-    if not c:
+    if not c or (c.get("approver") or "").lower() != du:
         return JSONResponse({"error": "no pending consent"}, status_code=404)
     return _consent_view(c)
 
 
 @app.get("/consent/{code}")
-def consent_by_code(code: str) -> dict:
+def consent_by_code(code: str, request: Request) -> dict:
+    du = _device_user(request)
+    if not du:
+        return JSONResponse({"error": "device_auth_required"}, status_code=401)
     c = _CONSENTS.get(code)
     if not c:
         return JSONResponse({"error": "unknown or expired code"}, status_code=404)
+    if (c.get("approver") or "").lower() != du:
+        return JSONResponse({"error": "forbidden_for_user"}, status_code=403)
     return _consent_view(c)
 
 
@@ -550,7 +577,9 @@ def consent_by_code(code: str) -> dict:
 async def phone_log(request: Request) -> JSONResponse:
     """Lifecycle breadcrumbs from Bob's approver app (push received, SDK ready, screen shown,
     tap, biometric, SDK result) — independent of any consent code, so we can see exactly how far
-    the phone got even when nothing else fires."""
+    the phone got even when nothing else fires. Requires a valid device token."""
+    if not _device_user(request):
+        return JSONResponse({"error": "device_auth_required"}, status_code=401)
     try:
         body = await request.json()
     except Exception:  # noqa: BLE001
@@ -568,12 +597,17 @@ async def phone_log(request: Request) -> JSONResponse:
 async def consent_report(code: str, request: Request) -> JSONResponse:
     """Bob's approver app reports back what happened when he tapped — the SDK decision, any
     error, and PingOne's device-requirements verdict. Gives the dashboard (and us) eyes on the
-    phone side, independent of PF's poll."""
+    phone side, independent of PF's poll. Device-token scoped to the consent's approver."""
+    du = _device_user(request)
+    if not du:
+        return JSONResponse({"error": "device_auth_required"}, status_code=401)
     try:
         body = await request.json()
     except Exception:  # noqa: BLE001
         body = {}
     c = _CONSENTS.get(code)
+    if c and (c.get("approver") or "").lower() != du:
+        return JSONResponse({"error": "forbidden_for_user"}, status_code=403)
     pid = (c or {}).get("paymentId", code)
     decision = str(body.get("decision", "?"))
     err = body.get("error")

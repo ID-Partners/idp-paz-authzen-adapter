@@ -82,6 +82,51 @@ def _session(request: Request) -> dict | None:
     return _verify(request.cookies.get(SESSION_COOKIE))
 
 
+# ── Device authorization ──────────────────────────────────────────────────────────────────
+# The approver app is NOT privileged. It holds a device token — a BFF-signed JWT that authorizes
+# it to act ONLY for one user — minted when THAT signed-in user generates the pairing QR, carried
+# in the QR, stored on the phone, and presented as a Bearer on every device→BFF call. Endpoints
+# below enforce that the token authorizes the user/resource being touched, so a device can never
+# mint keys, reconcile, or read proofing for anyone but its own paired user.
+DEVICE_TOKEN_TTL = int(os.environ.get("DEVICE_TOKEN_TTL", str(90 * 24 * 3600)))  # 90d
+# Device tokens use their OWN secret (not the session APP_SECRET) so it can be SHARED with the
+# autonomous-agent service — which also verifies these tokens on its consent endpoints — without
+# handing that service the power to forge session cookies. Defaults to APP_SECRET for local dev.
+DEVICE_TOKEN_SECRET = os.environ.get("DEVICE_TOKEN_SECRET", APP_SECRET)
+
+
+def _mint_device_token(user: str) -> str:
+    now = int(time.time())
+    return jwt.encode({"device_sub": (user or "").lower(), "typ": "device",
+                       "iat": now, "exp": now + DEVICE_TOKEN_TTL},
+                      DEVICE_TOKEN_SECRET, algorithm="HS256")
+
+
+def _device_user(request: Request) -> str | None:
+    """The user a valid device Bearer token authorizes, else None."""
+    auth = request.headers.get("authorization", "")
+    if not auth.lower().startswith("bearer "):
+        return None
+    try:
+        claims = jwt.decode(auth.split(" ", 1)[1].strip(), DEVICE_TOKEN_SECRET, algorithms=["HS256"])
+    except Exception:  # noqa: BLE001
+        return None
+    if claims.get("typ") != "device":
+        return None
+    return (claims.get("device_sub") or "").lower() or None
+
+
+def _require_device(request: Request, user: str | None = None) -> JSONResponse | None:
+    """Guard: require a valid device token; if `user` is given, require the token authorizes
+    exactly that user. Returns an error JSONResponse to return, or None when authorized."""
+    du = _device_user(request)
+    if not du:
+        return JSONResponse(status_code=401, content={"error": "device_auth_required"})
+    if user is not None and du != (user or "").lower():
+        return JSONResponse(status_code=403, content={"error": "forbidden_for_user"})
+    return None
+
+
 @app.get("/ping")
 def ping():
     return {"status": "healthy"}
@@ -283,24 +328,34 @@ async def proofing_begin(request: Request, user: str = ""):
 
 
 @app.get("/proofing/code/{code}")
-async def proofing_by_code(code: str):
+async def proofing_by_code(code: str, request: Request):
     """The approver app resolves the push's reference code to the full proofing request —
-    most importantly the openid4vp:// request_uri it opens app2app into the wallet."""
+    most importantly the openid4vp:// request_uri it opens app2app into the wallet.
+    Device-token scoped: a phone may only read proofings for ITS user."""
+    du = _device_user(request)
+    if not du:
+        return JSONResponse(status_code=401, content={"error": "device_auth_required"})
     p = _PROOFINGS.get(code)
     if not p:
         return JSONResponse(status_code=404, content={"error": "unknown_code"})
+    if (p.get("subject") or "").lower() != du:
+        return JSONResponse(status_code=403, content={"error": "forbidden_for_user"})
     return p
 
 
 @app.get("/proofing/latest")
-async def proofing_latest():
+async def proofing_latest(request: Request):
     """The approver's no-code fallback: the pi.flow push can't reliably deliver even the
     20-char reference code to the app (clientContext is dropped; the alert text is
     template-dependent), so on any push the app asks for the most recent FRESH proofing
-    request and opens its openid4vp:// link app2app. Mirrors the payment flow's
-    latest-pending-consent fallback."""
+    request and opens its openid4vp:// link app2app. Device-token scoped: only the device's
+    OWN user's pending proofing is returned — never another customer's."""
+    du = _device_user(request)
+    if not du:
+        return JSONResponse(status_code=401, content={"error": "device_auth_required"})
     now = int(time.time())
-    fresh = [p for p in _PROOFINGS.values() if now - p.get("created", 0) < 300]
+    fresh = [p for p in _PROOFINGS.values()
+             if now - p.get("created", 0) < 300 and (p.get("subject") or "").lower() == du]
     if not fresh:
         return JSONResponse(status_code=404, content={"error": "no_pending_proofing"})
     return sorted(fresh, key=lambda p: p["created"])[-1]
@@ -308,28 +363,19 @@ async def proofing_latest():
 
 # ── Identity roster for the approver app (proxies the SCIM directory; the app can't
 # reach the internal network) ──
-@app.get("/identities")
-async def identities():
-    try:
-        async with httpx.AsyncClient(timeout=8.0) as c:
-            r = await c.get(f"{PROOFING_DIRECTORY_URL}/scim/v2/Users")
-            users = r.json().get("Resources", [])
-    except Exception as e:
-        return JSONResponse(status_code=502, content={"error": "directory_unreachable",
-                                                      "detail": str(e)})
-    ext = "urn:idpartners:scim:1.0:BankUser"
-    return {"identities": [{"userName": u.get("userName"),
-                            "displayName": u.get("displayName"),
-                            "paired": (u.get(ext) or {}).get("devicePaired", False),
-                            "pingOneUserId": (u.get(ext) or {}).get("pingOneUserId")}
-                           for u in users]}
+# NOTE: there is deliberately NO GET /identities roster endpoint. The approver app is not
+# entitled to enumerate the bank's directory — it only ever knows accounts it was explicitly
+# paired to (scanned QR / username enrol), tracked on the device. Pairing state for a SINGLE
+# named user is available via /identities/{user}/reconcile below (scoped, not a roster read).
 
 
 @app.post("/identities/{user_name}/reconcile")
-async def identities_reconcile(user_name: str):
+async def identities_reconcile(user_name: str, request: Request):
     """Sync the directory's pairing state from PingOne (source of truth). Recovers the
     approver-app case where pair() reported an error but the device actually enrolled
-    (e.g. racing pairing keys)."""
+    (e.g. racing pairing keys). Device-token scoped: a phone may only reconcile ITS user."""
+    if (err := _require_device(request, user_name)):
+        return err
     user = (user_name or "").strip().lower()
     try:
         async with httpx.AsyncClient(timeout=20.0) as c:
@@ -358,7 +404,10 @@ async def identities_reconcile(user_name: str):
 
 @app.post("/identities/{user_name}/pairing")
 async def identities_pairing(user_name: str, request: Request):
-    """The approver app reports pairing state changes (sign-in/sign-out) → SCIM PATCH."""
+    """The approver app reports pairing state changes (sign-in/sign-out) → SCIM PATCH.
+    Device-token scoped: a phone may only report pairing for ITS user."""
+    if (err := _require_device(request, user_name)):
+        return err
     try:
         body = await request.json()
     except Exception:
@@ -436,11 +485,18 @@ async def login(request: Request):
     For a payment, the specific operation is attached as RFC 9396 authorization_details
     and pushed via PAR (RFC 9126) so Alice consents to THIS payment at the AS.
     """
+    stepup = (request.query_params.get("stepup") or "").strip()
+    # FRONT DOOR (no step-up) is PASSWORDLESS: send the user to the passkey / security-key page
+    # (WebAuthn on this BFF). The PF authorization-code path below is reserved for the PAYMENT
+    # STEP-UP (?stepup=…), where the RAR authorization_details must be governed by Ping Authorize
+    # at PF issuance (RFC 9470 + 9396) — that stays at PingFederate.
+    if not stepup:
+        return RedirectResponse("/signup", status_code=302)
+
     verifier = _b64u(secrets.token_bytes(40))
     challenge = _b64u(hashlib.sha256(verifier.encode()).digest())
     state = secrets.token_urlsafe(16)
     nonce = secrets.token_urlsafe(16)
-    stepup = (request.query_params.get("stepup") or "").strip()
     scope = DEFAULT_SCOPES + ((" " + stepup) if stepup else "")
     params = {"client_id": OIDC_CLIENT_ID, "response_type": "code",
               "redirect_uri": REDIRECT_URI, "scope": scope,
@@ -715,11 +771,13 @@ $('signinBtn').onclick = async () => {
 
 @app.get("/signup")
 async def signup(user: str = ""):
-    """Passkey sign-up (BFF-orchestrated WebAuthn). The whole passkey ceremony runs on THIS
-    origin so the browser's WebAuthn works directly (Safari Face ID + save-to-iPhone QR):
-    the BFF creates the PingOne user, PingOne's FIDO2 device API issues the
-    publicKeyCredentialCreationOptions (rp.id = this host), the browser creates the passkey,
-    and the BFF activates it. No password, no DaVinci, no PingOne hosted redirect."""
+    """Front door = PASSWORDLESS passkey / security-key (WebAuthn on this BFF). Create an
+    account or sign in with a passkey or YubiKey — no password anywhere. The whole ceremony
+    runs on this origin so the browser's WebAuthn works directly (Safari Face ID + save-to-
+    iPhone QR, or a roaming security key): the BFF creates the PingOne user, PingOne's FIDO2
+    device API issues the creationOptions (rp.id = this host), the browser creates the
+    credential, and the BFF activates it. PingOne holds the identity; PF is brokered via
+    signupTE. No DaVinci, no hosted password page."""
     return HTMLResponse(_SIGNUP_HTML)
 
 
@@ -1047,6 +1105,115 @@ async def signin_finish(request: Request):
     return _passkey_session_response(u, pf_at)
 
 
+# ── Native passkey sign-in for the approver app ─────────────────────────────────────────────
+# The iOS app signs in with the SAME passkey the user created on the web front door (rp.id = this
+# host). iOS reaches that credential via Associated Domains — this host serves the AASA below with
+# the app's webcredentials entry. On a verified assertion we mint a pairing key + device token, so
+# the passkey IS the device sign-in and drives pairing (no QR needed).
+IOS_TEAM_ID = os.environ.get("IOS_TEAM_ID", "JH6RX4DRG2")
+IOS_BUNDLE_ID = os.environ.get("IOS_BUNDLE_ID", "com.idpartners.bankapprover")
+_AASA = {"webcredentials": {"apps": [f"{IOS_TEAM_ID}.{IOS_BUNDLE_ID}"]}}
+
+
+@app.get("/.well-known/apple-app-site-association")
+def apple_app_site_association():
+    """Associated Domains manifest: authorizes the approver app to use passkeys whose rp.id is
+    this host (webcredentials), so it signs in with the user's existing web passkey."""
+    return JSONResponse(_AASA)
+
+
+@app.get("/apple-app-site-association")
+def apple_app_site_association_root():
+    return JSONResponse(_AASA)
+
+
+@app.post("/device/passkey/begin")
+async def device_passkey_begin(request: Request):
+    """Native app: start a passkey assertion to sign in on THIS device. Returns the WebAuthn
+    request options + a signed challenge token the app echoes on finish (no cookies)."""
+    import webauthn
+    from webauthn.helpers.structs import PublicKeyCredentialDescriptor, UserVerificationRequirement
+    body = await request.json()
+    user = str(body.get("user") or "").strip().lower()
+    creds = []
+    if user:
+        try:
+            async with httpx.AsyncClient(timeout=8.0) as c:
+                pr = await c.get(f"{PROOFING_DIRECTORY_URL}/passkey/{user}")
+                creds = pr.json().get("credentials") or []
+        except Exception:  # noqa: BLE001
+            creds = []
+    if user and not creds:
+        return JSONResponse(status_code=404, content={"error": "no_passkey",
+                            "detail": f"No passkey for {user} — create an account on the web first."})
+    allow = [PublicKeyCredentialDescriptor(
+                id=base64.urlsafe_b64decode(c["credential_id"] + "=" * (-len(c["credential_id"]) % 4)))
+             for c in creds]
+    opts = webauthn.generate_authentication_options(
+        rp_id=_rp_id(), allow_credentials=allow or None,
+        user_verification=UserVerificationRequirement.REQUIRED)
+    optsd = json.loads(webauthn.options_to_json(opts))
+    return {"requestOptions": optsd, "rpId": _rp_id(),
+            "challengeToken": _sign({"c": optsd["challenge"], "u": user}, 300)}
+
+
+@app.post("/device/passkey/finish")
+async def device_passkey_finish(request: Request):
+    """Verify the native passkey assertion; on success mint a pairing key + device token for the
+    signed-in user so the app pairs (PingOne) and scopes itself to that user."""
+    import webauthn
+    body = await request.json()
+    assertion = body.get("assertion")
+    tx = _verify(body.get("challengeToken"))
+    origin = body.get("origin") or f"https://{_rp_id()}"
+    if not tx or not assertion:
+        return JSONResponse(status_code=400, content={"error": "invalid state"})
+    try:
+        asr = json.loads(assertion) if isinstance(assertion, str) else assertion
+        assertion_json = json.dumps(asr)
+        cred_id_b64 = str(asr["rawId"]).replace("+", "-").replace("/", "_").rstrip("=")
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse(status_code=400, content={"error": "bad assertion", "detail": str(exc)[:150]})
+    user = tx.get("u") or ""
+    match = None
+    async with httpx.AsyncClient(timeout=8.0) as c:
+        candidates = [user] if user else [
+            u.get("userName") for u in (await c.get(f"{PROOFING_DIRECTORY_URL}/scim/v2/Users")).json().get("Resources", [])]
+        for u in candidates:
+            if not u:
+                continue
+            pr = await c.get(f"{PROOFING_DIRECTORY_URL}/passkey/{u}")
+            for cr in pr.json().get("credentials") or []:
+                if cr["credential_id"] == cred_id_b64:
+                    match = (u, cr); break
+            if match:
+                break
+    if not match:
+        return JSONResponse(status_code=404, content={"error": "unknown passkey"})
+    u, cr = match
+    try:
+        webauthn.verify_authentication_response(
+            credential=assertion_json,
+            expected_challenge=base64.urlsafe_b64decode(tx["c"] + "=" * (-len(tx["c"]) % 4)),
+            expected_origin=origin, expected_rp_id=_rp_id(),
+            credential_public_key=base64.urlsafe_b64decode(cr["public_key"] + "=" * (-len(cr["public_key"]) % 4)),
+            credential_current_sign_count=int(cr.get("sign_count") or 0),
+            require_user_verification=True)
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse(status_code=401, content={"error": "verification failed",
+                                                      "detail": str(exc)[:200]})
+    # Passkey verified → provision THIS device for the user: a PingOne pairing key + a device token.
+    try:
+        pk = await _pingone_pairing_key(u)
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse(status_code=502, content={"error": "pairing_key_failed", "detail": str(exc)[:150]})
+    key = pk.get("code")
+    if not key:
+        return JSONResponse(status_code=502, content={"error": "no_pairing_key"})
+    return {"user": u, "pairingKey": key, "deviceToken": _mint_device_token(u),
+            "expiresAt": pk.get("expiresAt", "")}
+
+
 @app.get("/signup/callback")
 async def signup_callback(request: Request):
     """PingOne redirect: exchange the code, broker the ID token into a PF user token."""
@@ -1069,34 +1236,32 @@ async def signup_callback(request: Request):
     id_token = p1_tokens.get("id_token", "")
     id_claims = jwt.decode(id_token, options={"verify_signature": False}) if id_token else {}
     username = (id_claims.get("preferred_username") or id_claims.get("sub") or "").lower()
-
-    # Broker into PF: the PingOne ID token is the RFC 8693 subject token; PF validates
-    # iss/signature/audience (signupTE) and mints a userJwtATM token, sub = username.
-    try:
-        async with httpx.AsyncClient(timeout=20.0, verify=False) as c:
-            xr = await c.post(PF_TOKEN, data={
-                "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
-                "subject_token": id_token,
-                "subject_token_type": "urn:ietf:params:oauth:token-type:id_token",
-                "client_id": OIDC_CLIENT_ID, "client_secret": OIDC_CLIENT_SECRET,
-                "scope": DEFAULT_SCOPES})
-            if xr.status_code != 200:
-                return JSONResponse(status_code=502, content={
-                    "error": "PF brokering failed", "detail": xr.text[:300]})
-            pf_access = xr.json().get("access_token", "")
-    except Exception as exc:  # noqa: BLE001
+    if not username:
         return JSONResponse(status_code=502,
-                            content={"error": f"PF brokering failed: {exc}"})
+                            content={"error": "no username in PingOne id_token"})
+
+    # Federate the PingOne authentication into PingFederate. PingOne (the OP) authenticated the
+    # user at its hosted page; the id_token came straight from PingOne's token endpoint over TLS
+    # in this code exchange, so we trust it. The BFF then vouches for that identity with its own
+    # short-lived JWT — the key PF's signupTE trusts — and token-exchanges it for a PF user token
+    # (same userJwtATM shape as alice's login). Keeping the broker BFF-signed means PF needs no
+    # redeploy; the BFF only ever mints it behind a completed PingOne sign-in.
+    pf_access = await _broker_passkey_to_pf(username)
+    if not pf_access:
+        return JSONResponse(status_code=502, content={"error": "PF brokering failed"})
     at_claims = jwt.decode(pf_access, options={"verify_signature": False}) \
         if pf_access.count(".") == 2 else {}
     sub = at_claims.get("sub") or username
 
-    # Provision the new customer in the bank's SCIM directory (idempotent).
+    # Provision the customer in the bank's SCIM directory (idempotent). A returning user
+    # already exists → plain sign-in; a first-time user is created → "account created" framing.
+    is_new = False
     try:
         async with httpx.AsyncClient(timeout=8.0) as c:
             sr = await c.get(f"{PROOFING_DIRECTORY_URL}/scim/v2/Users",
                              params={"filter": f'userName eq "{sub}"'})
             if not sr.json().get("Resources"):
+                is_new = True
                 await c.post(f"{PROOFING_DIRECTORY_URL}/scim/v2/Users",
                              json={"userName": sub, "displayName": sub.title(),
                                    "active": True})
@@ -1105,7 +1270,7 @@ async def signup_callback(request: Request):
 
     session = {"sub": sub, "name": id_claims.get("name") or sub.title(),
                "acr": at_claims.get("acr"), "pf_at": pf_access}
-    resp = RedirectResponse("/?signedup=1", status_code=302)
+    resp = RedirectResponse("/?signedup=1" if is_new else "/", status_code=302)
     resp.set_cookie(SESSION_COOKIE, _sign(session, SESSION_TTL),
                     httponly=True, secure=True, samesite="lax", max_age=SESSION_TTL)
     resp.delete_cookie(SIGNUP_TX_COOKIE)
@@ -1130,19 +1295,67 @@ async def onboarding_qr(request: Request):
     if not key:
         return JSONResponse(status_code=502, content={"error": "no_pairing_key",
                                                       "detail": json.dumps(pk)[:200]})
-    uri = f"idpapprover://enroll?user={urllib.parse.quote(user)}&key={urllib.parse.quote(key)}"
+    # The QR also carries a DEVICE TOKEN scoped to this signed-in user. The phone stores it and
+    # presents it as a Bearer on every BFF call — so the device can only ever act for this user.
+    dt = _mint_device_token(user)
+    uri = _pairing_uri(user, key, dt)
+    return {"user": user, "uri": uri, "svg": _qr_svg(uri), "expiresAt": pk.get("expiresAt", "")}
+
+
+def _pairing_uri(user: str, key: str, dt: str) -> str:
+    return (f"idpapprover://enroll?user={urllib.parse.quote(user)}"
+            f"&key={urllib.parse.quote(key)}&dt={urllib.parse.quote(dt)}")
+
+
+def _qr_svg(uri: str) -> str:
     try:
         import io
+        import re
         import qrcode
         import qrcode.image.svg
+        # The URI carries a ~170-char device-token JWT, so use LOW error correction to keep the
+        # QR from getting too dense to scan (it's a short-lived code scanned up close, not print).
         img = qrcode.make(uri, image_factory=qrcode.image.svg.SvgPathImage,
+                          error_correction=qrcode.constants.ERROR_CORRECT_L,
                           box_size=14, border=2)
         buf = io.BytesIO()
         img.save(buf)
         svg = buf.getvalue().decode()
+        # The library emits a FIXED intrinsic size (e.g. width="91mm" ≈ 344px) that overflows a
+        # small container — worse now the QR encodes a long device token, so it grew. Drop the mm
+        # dimensions and let the container size it; the viewBox preserves the aspect ratio.
+        svg = re.sub(r'\s+(?:width|height)="[0-9.]+mm"', "", svg, count=2)
+        svg = svg.replace("<svg ", '<svg style="width:100%;height:auto;display:block" ', 1)
+        return svg
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
+
+
+@app.get("/admin/pairing-qr")
+async def admin_pairing_qr(request: Request, user: str = ""):
+    """Provision a pairing QR (pairing key + device token) for a STAFF / headless user (e.g.
+    bob) who has no browser session to visit /onboarding/qr. Admin-token gated (X-Admin-Token
+    header). This is the AUTHENTICATED replacement for the old arbitrary-?user /enroll hole:
+    only an operator holding ADMIN_TOKEN can mint a pairing QR for someone else."""
+    if not ADMIN_TOKEN or request.headers.get("x-admin-token") != ADMIN_TOKEN:
+        return JSONResponse(status_code=401, content={"error": "admin_auth_required"})
+    user = (user or "").strip().lower()
+    if not user:
+        return JSONResponse(status_code=400, content={"error": "user_required"})
+    try:
+        pk = await _pingone_pairing_key(user)
     except Exception as exc:  # noqa: BLE001
-        svg = ""
-    return {"user": user, "uri": uri, "svg": svg, "expiresAt": pk.get("expiresAt", "")}
+        return JSONResponse(status_code=502, content={"error": str(exc)})
+    key = pk.get("code")
+    if not key:
+        return JSONResponse(status_code=502, content={"error": "no_pairing_key",
+                                                      "detail": json.dumps(pk)[:200]})
+    dt = _mint_device_token(user)
+    uri = _pairing_uri(user, key, dt)
+    return {"user": user, "uri": uri, "svg": _qr_svg(uri), "expiresAt": pk.get("expiresAt", "")}
 
 
 @app.get("/session/token")
@@ -1307,13 +1520,21 @@ async def _pingone_pairing_key(user: str) -> dict:
 
 
 @app.get("/enroll")
-async def enroll(user: str = "bob", format: str = "html"):
-    """Mint + show a pairing key for an identity's approver app (?user=alice|bob).
-    format=json returns {user, code, expiresAt} for the app's in-app sign-in flow."""
+async def enroll(request: Request, format: str = "html"):
+    """Mint + show a pairing key for the SIGNED-IN user's approver app. There is deliberately
+    NO arbitrary ?user= — a caller can only ever enrol their OWN identity (the session subject),
+    so this can't be used to mint a pairing key for someone else. format=json returns
+    {user, code, expiresAt}. (Phones normally pair via the /onboarding/qr QR, which also carries
+    a device token; this page is the signed-in user's manual fallback.)"""
     if not (P1_ENV and P1_CLIENT and P1_APP):
         return HTMLResponse("Enrolment not configured — set PINGONE_ENV / PINGONE_CLIENT_ID / "
                             "PINGONE_SECRET / PINGONE_NATIVE_APP_ID.", status_code=503)
-    user = (user or "bob").strip().lower()
+    s = _session(request)
+    if not s:
+        if format == "json":
+            return JSONResponse(status_code=401, content={"error": "login_required"})
+        return RedirectResponse("/", status_code=302)
+    user = (s.get("sub") or "").strip().lower()
     try:
         pk = await _pingone_pairing_key(user)
     except Exception as exc:  # noqa: BLE001
