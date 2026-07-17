@@ -29,6 +29,36 @@ type Subject struct {
 	Properties map[string]interface{} `json:"properties"` // Optional
 }
 
+// UnmarshalJSON accepts the subject id under EITHER key.
+//
+// AuthZEN 1.0 names it `id`; this adapter has always read `identity`, which is what the
+// demo's own PEP sends (demo/coaz-pep .. "identity": agent). That was invisible while the
+// PEP was the only caller, but it means a spec-conformant AuthZEN client is rejected by an
+// AuthZEN PDP: its subject id lands nowhere, and the "subject, resource, and action are
+// required" check fails. The Grant Management API is such a client.
+//
+// Both are accepted rather than migrating the PEP, because the two must interoperate during
+// any migration anyway. `identity` wins when both are present: it is what the existing
+// callers send, so no in-flight request changes meaning. The marshal side is untouched.
+func (s *Subject) UnmarshalJSON(b []byte) error {
+	var raw struct {
+		Type       string                 `json:"type"`
+		ID         string                 `json:"id"`
+		Identity   string                 `json:"identity"`
+		Properties map[string]interface{} `json:"properties"`
+	}
+	if err := json.Unmarshal(b, &raw); err != nil {
+		return err
+	}
+	s.Type = raw.Type
+	s.Properties = raw.Properties
+	s.ID = raw.Identity
+	if s.ID == "" {
+		s.ID = raw.ID
+	}
+	return nil
+}
+
 // Resource represents the "resource" object.
 // Note: The "id" field may be omitted in Resource Search requests
 // and, if present, is ignored by the PDP for the Resource Search API.
