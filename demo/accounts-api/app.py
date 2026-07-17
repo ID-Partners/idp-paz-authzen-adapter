@@ -84,6 +84,25 @@ def _forbid_foreign_customer(customer_id: str, principal: str | None) -> JSONRes
     return None
 
 
+def _customer_or_provision(customer_id: str, principal: str | None):
+    """The customer's file, opening one on first touch for a NEW signed-in user.
+
+    Self-provision ONLY: we open a file when the requested customer IS the authenticated
+    principal, so a newly signed-up passkey user becomes a customer owning everything under
+    their own `sub`. A staff principal (who may legitimately act on a NAMED customer) can never
+    conjure a customer that doesn't exist, and an unauthenticated/dev call can't either — both
+    still get the 404."""
+    existing = store.get_customer(customer_id)
+    if existing is not None:
+        return existing
+    if principal and customer_id == principal:
+        cust = store.get_or_create_customer(customer_id)
+        logger.info("Opened a customer file for new user %s (accounts=%s)",
+                    customer_id, cust.accounts)
+        return cust
+    return None
+
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
@@ -109,7 +128,7 @@ def list_accounts(customer_id: str,
         _audit("list_accounts", x_auth_principal, x_auth_agent,
                f"DENIED foreign customer={customer_id}")
         return denied
-    customer = store.get_customer(customer_id)
+    customer = _customer_or_provision(customer_id, x_auth_principal)
     if customer is None:
         return JSONResponse(status_code=404, content={"error": f"Unknown customer {customer_id}"})
     _audit("list_accounts", x_auth_principal, x_auth_agent, f"customer={customer_id}")
@@ -150,7 +169,7 @@ def open_account(body: OpenAccountBody,
         _audit("open_account", x_auth_principal, x_auth_agent,
                f"DENIED foreign customer={body.customer_id}")
         return denied
-    customer = store.get_customer(body.customer_id)
+    customer = _customer_or_provision(body.customer_id, x_auth_principal)
     if customer is None:
         return JSONResponse(status_code=404, content={"error": f"Unknown customer {body.customer_id}"})
     acct = store.open_account(body.customer_id, body.account_type, body.nickname)

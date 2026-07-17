@@ -99,9 +99,11 @@ Rules:
   returns "authorized": false or a message beginning "POLICY DENIED", do NOT
   retry. Clearly tell the customer the action was blocked and relay the policy
   reason, then stop or suggest a compliant alternative.
-- When opening a new account and funding it, first open the account, then make
-  the payment into the new account from the customer's existing checking account
-  (CHK-1001).
+- When opening a new account and funding it: first LIST the customer's accounts to
+  find their existing everyday/checking account, then open the new account, then pay
+  into it from that account. Never assume an account id — every customer has their
+  own (the seeded demo customer's checking is CHK-1001, but a new customer's is not),
+  so read it from their account list rather than guessing.
 """
 
 
@@ -322,6 +324,22 @@ async def agent_events(prompt: str, session_id: str = "demo",
                 yield {"type": "final", "session_id": session_id,
                        "final": "🔒 The account gateway requires you to sign in before I can act "
                                 "on your behalf. Redirecting you to the PingFederate login…"}
+                return
+
+            # Account opening needs a verified mDL identity-proofing activity. Relay an
+            # identity challenge: the app pushes the customer's phone (CIBA), the approver
+            # opens the wallet app2app, the mDL is presented, and origination resumes.
+            if md.get("identity_challenge"):
+                ic = md["identity_challenge"]
+                yield {"type": "identity_challenge", "role": route["role"],
+                       "agent_label": route["label"], "doctype": ic.get("doctype"),
+                       "pep": ic.get("pep"), "tool": tu.name,
+                       "account": tu.input if tu.name == "open_account" else None,
+                       "detail": ic.get("detail", "Identity proofing required.")}
+                yield {"type": "final", "session_id": session_id,
+                       "final": "🪪 Opening an account needs identity verification. "
+                                "Check your phone — present your mobile Driver's Licence "
+                                "(mDL) from your wallet, then I'll continue."}
                 return
 
             # The gateway needs a scope the user hasn't consented to (a sensitive

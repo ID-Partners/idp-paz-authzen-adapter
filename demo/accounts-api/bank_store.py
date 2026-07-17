@@ -12,8 +12,21 @@ Accounts API something realistic to act on so the Ping Authorize policy decision
 from __future__ import annotations
 
 import itertools
+import os
 from dataclasses import dataclass, field, asdict
 from typing import Any
+
+# Opening balance for a NEW customer's everyday account. A newly signed-up user needs somewhere
+# to move money FROM, otherwise the demo's open-an-account-then-fund-it flow dead-ends on them.
+STARTER_BALANCE = float(os.environ.get("STARTER_BALANCE", "5000"))
+
+# Account-id prefixes. `checking` would otherwise abbreviate to CHE and not match the seeded
+# CHK-1001, leaving one customer's ids looking unlike another's.
+_ACCT_PREFIX = {"checking": "CHK", "savings": "SAV"}
+
+
+def _acct_prefix(account_type: str) -> str:
+    return _ACCT_PREFIX.get(account_type, account_type[:3].upper())
 
 
 @dataclass
@@ -78,6 +91,27 @@ class BankStore:
     def get_customer(self, customer_id: str) -> Customer | None:
         return self._customers.get(customer_id)
 
+    def get_or_create_customer(self, customer_id: str, name: str | None = None) -> Customer:
+        """Open a customer file on first touch, keyed by the authenticated principal.
+
+        A customer IS their OIDC `sub` (see `_seed`), so a user who just signed up with a passkey
+        becomes a customer the first time they use the bank, owning everything under their own id
+        — no pre-seeding, and no way to end up transacting on someone else's file. They start with
+        a funded everyday account so `open account` → `transfer into it` works for them exactly as
+        it does for the seeded demo customer. Idempotent."""
+        existing = self._customers.get(customer_id)
+        if existing is not None:
+            return existing
+        cust = Customer(id=customer_id, name=name or customer_id.title(),
+                        email=f"{customer_id}@example.com", kyc_verified=True)
+        self._customers[customer_id] = cust
+        chk = Account(id=f"CHK-{next(self._acct_seq)}", customer_id=customer_id,
+                      type="checking", nickname="Everyday Checking",
+                      currency="AUD", balance=STARTER_BALANCE)
+        self._accounts[chk.id] = chk
+        cust.accounts.append(chk.id)
+        return cust
+
     # --- accounts ---
     def list_accounts(self, customer_id: str) -> list[Account]:
         return [self._accounts[a] for a in self._customers[customer_id].accounts]
@@ -98,7 +132,7 @@ class BankStore:
             prev = self._accounts.get(prev_id)
             if prev is not None and prev.customer_id == customer_id and prev.balance == 0.0:
                 return prev
-        acct_id = f"{account_type[:3].upper()}-{next(self._acct_seq)}"
+        acct_id = f"{_acct_prefix(account_type)}-{next(self._acct_seq)}"
         acct = Account(id=acct_id, customer_id=customer_id, type=account_type,
                        nickname=nickname or f"{account_type.title()} Account",
                        currency=currency, balance=0.0)
