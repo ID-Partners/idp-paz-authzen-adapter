@@ -5,8 +5,9 @@ __pycache__/
 # compiled Go binary (built in Docker; never commit)
 /authzen-adapter/authzen-pdp
 
-# local Claude Code session data
-.claude/
+# local Claude Code session data (but version skills)
+.claude/*
+!.claude/skills/
 
 # build/dependency caches — also keeps 'railway up' payloads small
 .spm-cache/
