@@ -540,7 +540,8 @@ def consume_proofing(body: ConsumeBody):
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "backend": "postgres" if DATABASE_URL else "memory"}
+    backend = "idm" if IDM_DATABASE_URL else ("postgres" if DATABASE_URL else "memory")
+    return {"status": "ok", "backend": backend}
 
 
 class ProofingBody(BaseModel):
