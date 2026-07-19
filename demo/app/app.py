@@ -748,6 +748,13 @@ color:#7fb0ff;font-weight:500;margin-top:14px;padding:4px}
 .vendor{margin-top:18px;padding-top:14px;border-top:1px solid #2a323c;color:#9aa5b1;
 font-size:11px;display:flex;align-items:center;justify-content:center;gap:7px}
 .vendor img{height:18px;width:auto}
+/* The consent being captured: the payment the passkey is about to authorise. */
+.paysum{background:#101418;border:1px solid #2a323c;border-left:3px solid #f26a1b;
+border-radius:10px;padding:14px 16px;margin:12px 0 4px}
+.paysum .amt{font-size:22px;font-weight:700;color:#fff;letter-spacing:-.5px}
+.paysum .row{display:flex;justify-content:space-between;font-size:12.5px;color:#9aa5b1;margin-top:7px}
+.paysum .row b{color:#e8e8e8;font-weight:600}
+.paysum .lbl{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:#7d8894;margin-bottom:2px}
 .hidden{display:none}</style>
 </head><body>
 <div class="card">
@@ -775,6 +782,7 @@ font-size:11px;display:flex;align-items:center;justify-content:center;gap:7px}
   <div id="signin" class="hidden">
     <h1>Sign in</h1>
     <p>Use your passkey. Leave the username blank to let your device pick a saved one.</p>
+    __PAYMENT__
     <input id="su" placeholder="username (optional)" autocomplete="username webauthn"
            autocapitalize="none">
     <button class="primary" id="signinBtn">Sign in with passkey</button>
@@ -911,8 +919,31 @@ $('signinBtn').onclick = async () => {
 </script></body></html>"""
 
 
+def _payment_summary_html(request: Request) -> str:
+    """Render WHAT the passkey is about to authorise, from the signed step-up cookie.
+
+    This is the consent capture made visible: without it the user taps 'Approve with passkey'
+    against an unstated payment — the passkey signs a blind consent. The cookie is httpOnly and
+    signed, so the page can't read it in JS; the server renders it. Values are HTML-escaped."""
+    su = _verify(request.cookies.get(STEPUP_COOKIE)) or {}
+    amount = str(su.get("amount") or "").strip()
+    if not amount:
+        return ""
+    esc = lambda s: (str(s or "").replace("&", "&amp;").replace("<", "&lt;")
+                     .replace(">", "&gt;").replace('"', "&quot;"))
+    try:
+        amt = f"{float(amount):,.2f}"
+    except ValueError:
+        amt = esc(amount)
+    cur, debtor, creditor = esc(su.get("currency") or "AUD"), esc(su.get("debtor")), esc(su.get("creditor"))
+    return (f'<div class="paysum"><div class="lbl">Payment to authorise</div>'
+            f'<div class="amt">{cur} {amt}</div>'
+            f'<div class="row"><span>From</span><b>{debtor or "—"}</b></div>'
+            f'<div class="row"><span>To</span><b>{creditor or "—"}</b></div></div>')
+
+
 @app.get("/signup")
-async def signup(user: str = "", davinci: str = ""):
+async def signup(request: Request, user: str = "", davinci: str = ""):
     """Front door = PASSWORDLESS passkey / security-key (WebAuthn on this BFF). Create an
     account or sign in with a passkey or YubiKey — no password anywhere. The whole ceremony
     runs on this origin so the browser's WebAuthn works directly (Safari Face ID + save-to-
@@ -929,7 +960,7 @@ async def signup(user: str = "", davinci: str = ""):
                             .replace("__APIROOT__", DAVINCI_API_ROOT)
                             .replace("__COMPANY__", DAVINCI_COMPANY_ID)
                             .replace("__POLICY__", DAVINCI_POLICY_ID))
-    return HTMLResponse(_SIGNUP_HTML)
+    return HTMLResponse(_SIGNUP_HTML.replace("__PAYMENT__", _payment_summary_html(request)))
 
 
 @app.get("/signup/davinci/token")
