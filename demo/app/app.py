@@ -800,9 +800,15 @@ $('signinBtn').onclick = async () => {
   if(q.get('stepup') !== '1') return;
   const u = (q.get('u')||'').toLowerCase();
   show('signin');
-  if(u && valid(u)) $('su').value = u;
+  // DISCOVERABLE sign-in — leave the username blank so the browser offers whatever passkey
+  // exists, exactly like the working front door. Do NOT force allowCredentials to a stored
+  // credential_id: it fails ("string did not match the expected pattern") for users whose stored
+  // id is stale or was registered elsewhere (e.g. a PingOne passkey under a different rpId).
+  $('su').value = '';
+  $('su').style.display = 'none';
   const h = $('signin').querySelector('h1'); if(h) h.textContent = 'Approve this payment';
-  const p = $('signin').querySelector('p'); if(p) p.textContent = 'Confirm with your passkey to authorise the payment.';
+  const p = $('signin').querySelector('p'); if(p) p.textContent =
+    (u ? 'Signed in as ' + u + '. ' : '') + 'Confirm with your passkey to authorise the payment.';
   $('signinBtn').textContent = 'Approve with passkey';
 })();
 </script></body></html>"""
