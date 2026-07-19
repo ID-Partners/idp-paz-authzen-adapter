@@ -439,7 +439,19 @@ class ConsentPostgresStore:
             return [dict(zip(cols, r)) for r in cur.fetchall()]
 
 
-if DATABASE_URL:
+# IDM_DATABASE_URL points this service at the ID Partners Identity Object Model directory
+# (idm.entry). When set, all three stores become a FAÇADE over that object model — same REST API,
+# storage repointed from the bespoke tables to model entries (consentRecord / identityProofingRecord
+# / identity+involvedParty). Opt-in and reversible: unset it to fall back to the bespoke tables.
+IDM_DATABASE_URL = os.environ.get("IDM_DATABASE_URL", "").strip()
+
+if IDM_DATABASE_URL:
+    logger.info("Proofing directory using Identity Object Model backend (idm.entry)")
+    from idm_store import IdmProofingStore, IdmUserStore, IdmConsentStore
+    store = IdmProofingStore(IDM_DATABASE_URL)
+    user_store = IdmUserStore(IDM_DATABASE_URL)
+    consent_store = IdmConsentStore(IDM_DATABASE_URL)
+elif DATABASE_URL:
     logger.info("Proofing directory using Postgres backend")
     store = PostgresStore(DATABASE_URL)
     user_store = UserPostgresStore(DATABASE_URL)
