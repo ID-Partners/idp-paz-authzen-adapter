@@ -637,6 +637,89 @@ SIGNUP_CLIENT_ID = os.environ.get("SIGNUP_CLIENT_ID", "")
 SIGNUP_CLIENT_SECRET = os.environ.get("SIGNUP_CLIENT_SECRET", "")
 SIGNUP_TX_COOKIE = "nw_signup_tx"
 
+# ── DaVinci-hosted passkeys (the WIDGET path) ──────────────────────────────────────────────
+# The PingOne↔DaVinci /as/authorize bridge is dead in this env (no console/API repair exists —
+# see the davinci-pingone-integration skill), so the demo can't reach DaVinci passkey flows via
+# the hosted redirect. The WIDGET path bypasses the bridge: the BFF mints a DaVinci sdkToken with
+# the "PingOne SSO Connection" app's SK API key and embeds the DaVinci widget, which runs the
+# flow (Bank Signup Passkey Live) directly. PingOne MFA verifies the WebAuthn assertion inside the
+# flow — so PingOne is AUTHORITATIVE for the passkey, unlike the BFF-native front door. On flow
+# success the BFF brokers to PF via signupTE, unchanged. Gated behind ?davinci=1 so the working
+# native front door is untouched.
+DAVINCI_SK_API_KEY = os.environ.get("DAVINCI_SK_API_KEY", "")
+DAVINCI_COMPANY_ID = os.environ.get("DAVINCI_COMPANY_ID", "")
+DAVINCI_POLICY_ID = os.environ.get("DAVINCI_POLICY_ID", "")
+DAVINCI_API_ROOT = os.environ.get("DAVINCI_API_ROOT", "https://auth.pingone.asia").rstrip("/")
+DAVINCI_ASSETS_ROOT = os.environ.get("DAVINCI_ASSETS_ROOT", "https://assets.pingone.asia").rstrip("/")
+
+
+async def _davinci_sdktoken() -> str:
+    """Mint a DaVinci sdkToken (usage=startSpecificFlowOrPolicyNonUserContext) with the SK API
+    key. The key stays server-side; only the short-lived (30 min) token reaches the browser.
+    NOTE: the path is lowercase `sdktoken` — wrong case = APIGW 403 'Missing Authentication'."""
+    if not (DAVINCI_SK_API_KEY and DAVINCI_COMPANY_ID):
+        return ""
+    root = DAVINCI_API_ROOT.replace("://auth.", "://orchestrate-api.")
+    async with httpx.AsyncClient(timeout=15.0) as c:
+        r = await c.get(f"{root}/v1/company/{DAVINCI_COMPANY_ID}/sdktoken",
+                        headers={"X-SK-API-KEY": DAVINCI_SK_API_KEY})
+        if r.status_code != 200:
+            logger.warning("davinci sdktoken %s: %s", r.status_code, r.text[:200])
+            return ""
+        return r.json().get("access_token", "")
+
+
+# DaVinci widget front door (PingOne verifies the passkey). Loads the DaVinci widget SDK, fetches
+# a server-minted sdkToken, runs the policy, and on success brokers the user into PF via the BFF.
+_DAVINCI_HTML = """<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Sign in — Demo Bank</title>
+<style>body{font-family:-apple-system,system-ui,sans-serif;background:#101418;color:#e8e8e8;
+display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}
+.card{background:#1a2027;border:1px solid #2a323c;border-radius:14px;padding:28px;width:400px}
+.brand{font-size:20px;font-weight:700;margin:0 0 4px}
+.sub{color:#9aa5b1;font-size:13px;margin:0 0 18px}
+#widget{min-height:120px}
+#msg{font-size:13px;margin-top:12px;min-height:18px;color:#ff8b7b}
+.vendor{margin-top:18px;padding-top:14px;border-top:1px solid #2a323c;color:#9aa5b1;
+font-size:11px;display:flex;align-items:center;justify-content:center;gap:7px}.vendor img{height:18px}
+a.alt{color:#7fb0ff;font-size:12px;text-decoration:none;display:block;margin-top:10px;text-align:center}</style>
+</head><body>
+<div class="card">
+  <div class="brand">🏦 Demo Bank</div>
+  <div class="sub">Passwordless — your passkey is verified by <b>PingOne</b> (DaVinci flow).</div>
+  <div id="widget"></div>
+  <div id="msg"></div>
+  <a class="alt" href="/signup">Use the app-native passkey instead →</a>
+  <div class="vendor">Powered by <img src="/static/idp-wordmark.svg" alt="ID Partners"></div>
+</div>
+<script src="__ASSETS__/davinci/latest/davinci.js"></script>
+<script>
+const msg = t => { document.getElementById('msg').textContent = t || ''; };
+async function run(){
+  let cfg;
+  try { cfg = await fetch('/signup/davinci/token').then(r=>r.json()); }
+  catch(e){ msg('Could not reach the flow service.'); return; }
+  if(cfg.error){ msg('DaVinci is not configured for this environment.'); return; }
+  if(!window.davinci || !window.davinci.skRenderScreen){ msg('Widget SDK failed to load.'); return; }
+  window.davinci.skRenderScreen(document.getElementById('widget'), {
+    config: { method:'runFlow', apiRoot: cfg.apiRoot, accessToken: cfg.accessToken,
+              companyId: cfg.companyId, policyId: cfg.policyId },
+    useModal: false,
+    successCallback: async function(response){
+      try {
+        const r = await fetch('/signup/davinci/finish', {method:'POST',
+          headers:{'content-type':'application/json'}, body: JSON.stringify(response||{})}).then(r=>r.json());
+        if(r.ok){ msg('✓ Signed in…'); setTimeout(()=>location.href=(r.next||'/'), 400); }
+        else { msg((r.detail||r.error||'Sign-in failed')); }
+      } catch(e){ msg('Broker failed: '+e.message); }
+    },
+    errorCallback: function(e){ msg('Flow error: '+(e && e.message ? e.message : JSON.stringify(e))); }
+  });
+}
+run();
+</script></body></html>"""
+
 
 _SIGNUP_HTML = """<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -815,15 +898,53 @@ $('signinBtn').onclick = async () => {
 
 
 @app.get("/signup")
-async def signup(user: str = ""):
+async def signup(user: str = "", davinci: str = ""):
     """Front door = PASSWORDLESS passkey / security-key (WebAuthn on this BFF). Create an
     account or sign in with a passkey or YubiKey — no password anywhere. The whole ceremony
     runs on this origin so the browser's WebAuthn works directly (Safari Face ID + save-to-
     iPhone QR, or a roaming security key): the BFF creates the PingOne user, PingOne's FIDO2
     device API issues the creationOptions (rp.id = this host), the browser creates the
     credential, and the BFF activates it. PingOne holds the identity; PF is brokered via
-    signupTE. No DaVinci, no hosted password page."""
+    signupTE. No DaVinci, no hosted password page.
+
+    ?davinci=1 serves the DaVinci WIDGET variant instead: PingOne (not the BFF) verifies the
+    passkey, via the embedded flow. Gated so the native front door above is untouched."""
+    if davinci == "1" and DAVINCI_SK_API_KEY:
+        return HTMLResponse(_DAVINCI_HTML
+                            .replace("__ASSETS__", DAVINCI_ASSETS_ROOT)
+                            .replace("__APIROOT__", DAVINCI_API_ROOT)
+                            .replace("__COMPANY__", DAVINCI_COMPANY_ID)
+                            .replace("__POLICY__", DAVINCI_POLICY_ID))
     return HTMLResponse(_SIGNUP_HTML)
+
+
+@app.get("/signup/davinci/token")
+async def davinci_token():
+    """Server-mint a fresh DaVinci sdkToken for the widget (the SK API key never reaches JS)."""
+    tok = await _davinci_sdktoken()
+    if not tok:
+        return JSONResponse(status_code=502, content={"error": "davinci_unconfigured"})
+    return {"accessToken": tok, "companyId": DAVINCI_COMPANY_ID,
+            "policyId": DAVINCI_POLICY_ID, "apiRoot": DAVINCI_API_ROOT + "/"}
+
+
+@app.post("/signup/davinci/finish")
+async def davinci_finish(request: Request):
+    """The DaVinci flow verified the passkey (PingOne-authoritative) and returned the user in its
+    success payload. Broker that user into a PF session via signupTE — the same wire the native
+    front door uses — so the delegation demo works identically."""
+    body = await request.json()
+    # The flow's createSuccessResponse shape varies; accept the common places the username lands.
+    user = (body.get("user") or body.get("username")
+            or (body.get("output") or {}).get("username")
+            or ((body.get("user") or {}) if isinstance(body.get("user"), dict) else {}).get("username")
+            or "")
+    user = str(user).strip().lower()
+    if not user or not re.match(r"^[a-z0-9._-]{2,30}$", user):
+        return JSONResponse(status_code=400, content={"error": "no_user_in_flow_result",
+                            "detail": "flow success payload carried no usable username"})
+    pf_at = await _broker_passkey_to_pf(user)
+    return _passkey_session_response(user, pf_at, new_signup=True)
 
 
 # WebAuthn RP id = this BFF's host (the passkey binds to it; the browser ceremony must run
