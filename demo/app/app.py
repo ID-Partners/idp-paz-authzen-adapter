@@ -506,6 +506,27 @@ async def _record_stepup_consent(su: dict, subject: str) -> str:
     return txn
 
 
+async def _project_delegation_grant(subject: str, scope: str, consent_txn: str) -> None:
+    """Project the delegation grant into the identity store when the step-up authorises the agent
+    to act for the principal. oauthGrant + agentDelegation (principal=subject, agent=concierge),
+    linked to the consent that authorised it — the consent→grant→token→action chain, now held in
+    the Identity Object Model. Idempotent per (principal, agent): one grant relationship, upserted.
+    Best-effort; never blocks the sign-in."""
+    if not PROOFING_DIRECTORY_URL:
+        return
+    agent = "urn:agent:northwind-concierge:v1"
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as c:
+            await c.post(f"{PROOFING_DIRECTORY_URL}/grants", json={
+                "grant_guid": f"g_{subject}:{agent}",   # one grant per delegation relationship
+                "principal_id": subject, "agent_id": agent,
+                "client_id": OIDC_CLIENT_ID, "agent_operator_id": OIDC_CLIENT_ID,
+                "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+                "scope": scope, "consent_ref": consent_txn})
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("grant projection failed: %s", exc)
+
+
 @app.get("/login")
 async def login(request: Request):
     """Kick off the OIDC authorization-code + PKCE flow at PingFederate.
@@ -1135,7 +1156,8 @@ async def signin_finish(request: Request):
     su = _verify(request.cookies.get(STEPUP_COOKIE))
     stepup = (su or {}).get("scope", "")
     if stepup and (su or {}).get("amount"):
-        await _record_stepup_consent(su, u)
+        txn = await _record_stepup_consent(su, u)
+        await _project_delegation_grant(u, stepup, txn)
     pf_at = await _broker_passkey_to_pf(u, extra_scope=stepup)
     resp = _passkey_session_response(u, pf_at)
     if stepup:
