@@ -21,7 +21,9 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import logging
 import os
+import re
 import secrets
 import time
 import urllib.parse
@@ -34,6 +36,12 @@ from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,
 from fastapi.staticfiles import StaticFiles
 
 app = FastAPI(title="Northwind Web App (BFF)")
+# Module logger. Every logger.* call in this file used to NameError — including inside the
+# except: handlers that were supposed to make consent-recording best-effort, so a failure there
+# escaped and 500'd /signin/passkey/finish AFTER a perfectly good passkey ceremony. The browser
+# then showed Safari's JSON.parse message ("The string did not match the expected pattern")
+# because it tried to r.json() the HTML 500 — a server crash disguised as a WebAuthn error.
+logger = logging.getLogger("northwind-app")
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 
 # --- config ------------------------------------------------------------------
@@ -850,9 +858,15 @@ async function doSignin(user){
                 authenticatorData: bufToB64u(cred.response.authenticatorData),
                 signature: bufToB64u(cred.response.signature),
                 userHandle: cred.response.userHandle ? bufToB64u(cred.response.userHandle) : null } };
-  const fin = await fetch('/signin/passkey/finish', {method:'POST',
+  // Parse defensively: if the server 500s, the body is HTML and r.json() throws a SyntaxError
+  // whose message ("The string did not match the expected pattern" on Safari) looks exactly like
+  // a WebAuthn failure. Surface the real status instead.
+  const finRes = await fetch('/signin/passkey/finish', {method:'POST',
     headers:{'content-type':'application/json'},
-    body: JSON.stringify({origin: location.origin, assertion: JSON.stringify(asr)})}).then(r=>r.json());
+    body: JSON.stringify({origin: location.origin, assertion: JSON.stringify(asr)})});
+  let fin;
+  try { fin = await finRes.json(); }
+  catch(e){ msg('Server error completing sign-in (HTTP '+finRes.status+'). The passkey was fine.', 'err'); return; }
   if(fin.ok){ msg('✓ Signed in — welcome back…', 'ok'); setTimeout(()=>location.href=(fin.next||'/'), 500); }
   else if(fin.error==='unknown passkey' || fin.error==='no_passkey'){
     msg('No passkey found for that account on this device. Create an account instead?', 'err'); }
