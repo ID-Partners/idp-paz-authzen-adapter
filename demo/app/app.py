@@ -58,6 +58,7 @@ DEFAULT_SCOPES = os.environ.get("DEFAULT_SCOPES",
                                 "openid banking:accounts:list banking:accounts:originate")
 SESSION_COOKIE = "nw_session"
 TX_COOKIE = "nw_oidc_tx"  # short-lived: holds PKCE verifier + state during the redirect
+STEPUP_COOKIE = "nw_stepup"  # short-lived: carries the requested step-up scope across the passkey ceremony
 
 
 def _b64u(b: bytes) -> str:
@@ -486,65 +487,18 @@ async def login(request: Request):
     and pushed via PAR (RFC 9126) so Alice consents to THIS payment at the AS.
     """
     stepup = (request.query_params.get("stepup") or "").strip()
-    # FRONT DOOR (no step-up) is PASSWORDLESS: send the user to the passkey / security-key page
-    # (WebAuthn on this BFF). The PF authorization-code path below is reserved for the PAYMENT
-    # STEP-UP (?stepup=…), where the RAR authorization_details must be governed by Ping Authorize
-    # at PF issuance (RFC 9470 + 9396) — that stays at PingFederate.
-    if not stepup:
-        return RedirectResponse("/signup", status_code=302)
-
-    verifier = _b64u(secrets.token_bytes(40))
-    challenge = _b64u(hashlib.sha256(verifier.encode()).digest())
-    state = secrets.token_urlsafe(16)
-    nonce = secrets.token_urlsafe(16)
-    scope = DEFAULT_SCOPES + ((" " + stepup) if stepup else "")
-    params = {"client_id": OIDC_CLIENT_ID, "response_type": "code",
-              "redirect_uri": REDIRECT_URI, "scope": scope,
-              "code_challenge": challenge, "code_challenge_method": "S256",
-              "state": state, "nonce": nonce}
+    # BOTH the front door AND the payment step-up are now PASSWORDLESS via the same WebAuthn
+    # passkey page. There are no passwords anywhere. The step-up difference is only the OUTCOME:
+    # the passkey ceremony (assertion acr=urn:northwind:loa:passkey) is the step-up authentication,
+    # and the requested elevated scope is carried across it in a short-lived signed cookie, then
+    # granted on the signupTE exchange in the passkey-finish handler. The old PF authorization-code
+    # + PAR/RAR redirect (which forced PF's htmlform password page) is retired for the step-up;
+    # RAR consent no longer lives on a PF page (accepted trade-off — the elevated scope is what
+    # gates the payment at the gateway PEP).
+    resp = RedirectResponse("/signup", status_code=302)
     if stepup:
-        params["prompt"] = "login consent"   # force re-auth AND the consent/approval page
-    # Assert the authenticated principal so the RAR governance decision is attributed to Alice, not the
-    # OAuth client. PingFederate's AuthorizationDetailProcessor SDK exposes no resource-owner accessor, so
-    # the pf-rar-paz-plugin reads this login_hint as the decision's UserID (the agent stays the 'actor').
-    sess = _session(request)
-    principal_sub = sess.get("sub") if sess else None
-    if principal_sub:
-        params["login_hint"] = principal_sub   # carries on the non-PAR path
-    rar = _payment_rar(request)
-    if rar:
-        # Fold the authenticated principal into each authorization_details entry. PingFederate does not
-        # surface PAR-pushed request params (login_hint) to the AuthorizationDetailProcessor, but it DOES
-        # hand it the authorization_details — the reliable PAR-surviving channel for the pf-rar-paz-plugin
-        # to attribute the governance decision to Alice as UserID (agent recorded as 'actor'). The plugin
-        # reads '_principal_sub' then strips it, so it never reaches the consent page or the issued token.
-        if principal_sub:
-            for entry in rar:
-                entry["_principal_sub"] = principal_sub
-        params["authorization_details"] = json.dumps(rar)
-        # Record the consent (status=requested) keyed by the minted transaction id.
-        await _record_consent(rar, principal_sub or "alice")
-
-    authz = None
-    if rar:
-        # PAR: push the request (incl. authorization_details) to PF, reference it by
-        # request_uri — keeps the RAR payload off the browser URL.
-        try:
-            async with httpx.AsyncClient(timeout=15.0, verify=False) as c:
-                pr = await c.post(PF_PAR, data={**params, "client_secret": OIDC_CLIENT_SECRET})
-                pr.raise_for_status()
-                request_uri = pr.json()["request_uri"]
-            authz = (PF_AUTHORIZE + "?" +
-                     urllib.parse.urlencode({"client_id": OIDC_CLIENT_ID, "request_uri": request_uri}))
-        except Exception:  # noqa: BLE001 - fall back to a plain (non-PAR) request
-            authz = PF_AUTHORIZE + "?" + urllib.parse.urlencode(params)
-    else:
-        authz = PF_AUTHORIZE + "?" + urllib.parse.urlencode(params)
-
-    resp = RedirectResponse(authz, status_code=302)
-    # Stash the PKCE verifier + state in a short-lived signed cookie.
-    resp.set_cookie(TX_COOKIE, _sign({"v": verifier, "state": state, "nonce": nonce}, 600),
-                    httponly=True, secure=True, samesite="lax", max_age=600)
+        resp.set_cookie(STEPUP_COOKIE, _sign({"scope": stepup}, 600),
+                        httponly=True, secure=True, samesite="lax", max_age=600)
     return resp
 
 
@@ -967,11 +921,18 @@ def _mint_passkey_jwt(user: str) -> str:
         pem, algorithm="ES256", headers={"kid": BFF_PASSKEY_KID})
 
 
-async def _broker_passkey_to_pf(user: str) -> str:
-    """Exchange the BFF-signed passkey JWT at PF (signupTE) for a PF user access token."""
+async def _broker_passkey_to_pf(user: str, extra_scope: str = "") -> str:
+    """Exchange the BFF-signed passkey JWT at PF (signupTE) for a PF user access token.
+
+    extra_scope elevates the token for a step-up: the passkey ceremony IS the step-up
+    authentication (the assertion carries acr=urn:northwind:loa:passkey), so a payment's
+    elevated scope (e.g. banking:payments:transfer) is granted off the SAME passwordless
+    passkey the front door uses — no PF password page. The client (northwind-webapp) is
+    unrestricted on scopes, so PF grants what's requested here."""
     if not (BFF_PASSKEY_KID and os.environ.get("BFF_PASSKEY_KEY_PEM")):
         return ""
     assertion = _mint_passkey_jwt(user)
+    scope = DEFAULT_SCOPES + ((" " + extra_scope) if extra_scope.strip() else "")
     try:
         async with httpx.AsyncClient(timeout=20.0, verify=False) as c:
             r = await c.post(PF_TOKEN, data={
@@ -979,7 +940,7 @@ async def _broker_passkey_to_pf(user: str) -> str:
                 "subject_token": assertion,
                 "subject_token_type": "urn:ietf:params:oauth:token-type:id_token",
                 "client_id": OIDC_CLIENT_ID, "client_secret": OIDC_CLIENT_SECRET,
-                "scope": DEFAULT_SCOPES})
+                "scope": scope})
             if r.status_code == 200:
                 return r.json().get("access_token", "")
             logger.warning("passkey PF broker failed %s: %s", r.status_code, r.text[:200])
@@ -1101,8 +1062,16 @@ async def signin_finish(request: Request):
     except Exception as exc:  # noqa: BLE001
         return JSONResponse(status_code=401, content={"error": "verification failed",
                                                       "detail": str(exc)[:200]})
-    pf_at = await _broker_passkey_to_pf(u)
-    return _passkey_session_response(u, pf_at)
+    # Step-up: /login?stepup=<scope> stashed the elevated scope in a signed cookie before sending
+    # the user here. The passkey ceremony IS the step-up auth, so broker with that scope, then
+    # clear the cookie so it can never elevate a subsequent ordinary sign-in.
+    su = _verify(request.cookies.get(STEPUP_COOKIE))
+    stepup = (su or {}).get("scope", "")
+    pf_at = await _broker_passkey_to_pf(u, extra_scope=stepup)
+    resp = _passkey_session_response(u, pf_at)
+    if stepup:
+        resp.delete_cookie(STEPUP_COOKIE)
+    return resp
 
 
 # ── Native passkey sign-in for the approver app ─────────────────────────────────────────────
