@@ -451,16 +451,21 @@ if IDM_DATABASE_URL:
     store = IdmProofingStore(IDM_DATABASE_URL)
     user_store = IdmUserStore(IDM_DATABASE_URL)
     consent_store = IdmConsentStore(IDM_DATABASE_URL)
+    from idm_store import IdmClientStore, IdmGrantStore
+    client_store = IdmClientStore(IDM_DATABASE_URL)   # oauthClientRegistration (projected from PF)
+    grant_store = IdmGrantStore(IDM_DATABASE_URL)      # oauthGrant + agentDelegation (projected on delegation)
 elif DATABASE_URL:
     logger.info("Proofing directory using Postgres backend")
     store = PostgresStore(DATABASE_URL)
     user_store = UserPostgresStore(DATABASE_URL)
     consent_store = ConsentPostgresStore(DATABASE_URL)
+    client_store = grant_store = None   # client/grant registries live only in the idm model
 else:
     logger.info("Proofing directory using in-memory backend (no DATABASE_URL)")
     store = MemoryStore()
     user_store = UserMemoryStore()
     consent_store = ConsentMemoryStore()
+    client_store = grant_store = None
 
 
 # Seed the demo identities so the approver/BFF can list them from day one.
@@ -477,6 +482,36 @@ def _seed_users() -> None:
 
 
 _seed_users()
+
+
+# The demo's OAuth clients, projected into the directory as oauthClientRegistration entries. PF is
+# the config source of truth; this is the directory's read-model, so the identity store holds the
+# full authority graph (identities + clients + grants + consents + proofings) in one place.
+_DEMO_CLIENTS = [
+    {"client_id": "northwind-webapp", "name": "Northwind Web App (BFF)", "subject_type": "workload",
+     "token_endpoint_auth_method": "client_secret_basic",
+     "grant_types": ["authorization_code", "urn:ietf:params:oauth:grant-type:token-exchange"]},
+    {"client_id": "urn:agent:northwind-concierge:v1", "name": "Concierge Agent", "subject_type": "agent",
+     "token_endpoint_auth_method": "attest_jwt_client_auth", "grant_types": ["urn:ietf:params:oauth:grant-type:token-exchange"]},
+    {"client_id": "urn:agent:northwind-account:v1", "name": "Account Agent", "subject_type": "agent",
+     "token_endpoint_auth_method": "attest_jwt_client_auth", "grant_types": ["urn:ietf:params:oauth:grant-type:token-exchange"]},
+    {"client_id": "urn:agent:northwind-payments:v1", "name": "Payments Agent", "subject_type": "agent",
+     "token_endpoint_auth_method": "attest_jwt_client_auth", "grant_types": ["urn:ietf:params:oauth:grant-type:token-exchange"]},
+    {"client_id": "urn:agent:northwind-autonomous:v1", "name": "Autonomous Agent", "subject_type": "agent",
+     "token_endpoint_auth_method": "private_key_jwt", "grant_types": ["urn:openid:params:grant-type:ciba"]},
+]
+
+
+def _seed_clients() -> None:
+    if client_store is None:
+        return
+    for c in _DEMO_CLIENTS:
+        if client_store.get(c["client_id"]) is None:
+            client_store.upsert({**c, "status": "active", "enabled": True})
+            logger.info("seeded oauthClientRegistration %s", c["client_id"])
+
+
+_seed_clients()
 
 
 def _as_dt(v) -> datetime:
@@ -905,6 +940,76 @@ def patch_consent(txn: str, body: ConsentPatch):
     consent_store.upsert(row)
     logger.info("consent txn=%s -> status=%s", txn, row["status"])
     return _consent_resource(row)
+
+
+# ---------------------------------------------------------------------------
+# OAuth clients (oauthClientRegistration) — the directory's read-model of PF's clients
+# ---------------------------------------------------------------------------
+@app.get("/clients")
+def list_clients():
+    if client_store is None:
+        return JSONResponse(status_code=501, content={"error": "client registry needs the idm backend"})
+    return {"totalResults": len(client_store.list()), "resources": client_store.list()}
+
+
+@app.get("/clients/{client_id:path}")
+def get_client(client_id: str):
+    if client_store is None:
+        return JSONResponse(status_code=501, content={"error": "client registry needs the idm backend"})
+    row = client_store.get(client_id)
+    if row is None:
+        return JSONResponse(status_code=404, content={"error": f"Unknown client {client_id}"})
+    return row
+
+
+# ---------------------------------------------------------------------------
+# Delegation grants (oauthGrant + agentDelegation) — projected when the delegation happens
+# ---------------------------------------------------------------------------
+class GrantBody(BaseModel):
+    grant_guid: str | None = None       # PF's agid when known; generated if absent
+    principal_id: str                   # the human whose authority is exercised (sub)
+    agent_id: str                       # the agent actually acting (act.sub)
+    client_id: str | None = None        # the agent operator / registered client
+    agent_operator_id: str | None = None
+    grant_type: str | None = None
+    scope: str | None = None
+    consent_ref: str | None = None      # the consent transaction_id that authorised this
+
+
+@app.post("/grants")
+def record_grant(body: GrantBody):
+    """Project a delegation grant into the directory at the moment the agent acts on the
+    principal's behalf (the RFC 8693 exchange). Upserts by grant_guid, so re-projecting the
+    same delegation is idempotent."""
+    if grant_store is None:
+        return JSONResponse(status_code=501, content={"error": "grant registry needs the idm backend"})
+    guid = (body.grant_guid or "").strip() or f"g_{uuid.uuid4().hex[:16]}"
+    grant_store.upsert({
+        "grant_guid": guid, "principal_id": body.principal_id, "agent_id": body.agent_id,
+        "client_id": body.client_id, "agent_operator_id": body.agent_operator_id or body.client_id,
+        "grant_type": body.grant_type, "scope": body.scope, "consent_ref": body.consent_ref,
+        "issued_timestamp": _now(),
+    })
+    logger.info("projected oauthGrant guid=%s principal=%s agent=%s", guid, body.principal_id, body.agent_id)
+    return grant_store.get(guid)
+
+
+@app.get("/grants")
+def list_grants(principal: str | None = Query(default=None)):
+    if grant_store is None:
+        return JSONResponse(status_code=501, content={"error": "grant registry needs the idm backend"})
+    rows = grant_store.list(principal=principal)
+    return {"totalResults": len(rows), "resources": rows}
+
+
+@app.get("/grants/{grant_guid}")
+def get_grant(grant_guid: str):
+    if grant_store is None:
+        return JSONResponse(status_code=501, content={"error": "grant registry needs the idm backend"})
+    row = grant_store.get(grant_guid)
+    if row is None:
+        return JSONResponse(status_code=404, content={"error": f"Unknown grant {grant_guid}"})
+    return row
 
 
 if __name__ == "__main__":

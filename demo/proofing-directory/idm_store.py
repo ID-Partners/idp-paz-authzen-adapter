@@ -313,3 +313,119 @@ class IdmConsentStore(_Idm):
         q += " ORDER BY created_at DESC LIMIT 200"
         with self._conn() as conn:
             return [self._to_row(e) for e in self._row(conn.execute(q, tuple(params)))]
+
+
+# ---------------------------------------------------------------------------
+# OAuth clients (projected from PingFederate)  ->  oauthClientRegistration
+# ---------------------------------------------------------------------------
+class IdmClientStore(_Idm):
+    """The demo's OAuth clients, mirrored into the directory as oauthClientRegistration entries.
+    PF remains the config source of truth; this is the directory's read-model of the clients."""
+    OC = ["oauthClientRegistration"]
+
+    def _to_row(self, e: dict) -> dict:
+        a = e["attrs"]
+        return {
+            "client_id": a.get("clientId"),
+            "name": a.get("name"),
+            "status": a.get("clientStatus"),
+            "token_endpoint_auth_method": a.get("tokenEndpointAuthMethod"),
+            "grant_types": a.get("grantTypes") or [],
+            "subject_type": e.get("subject_type"),
+            "created_at": _iso(e.get("created_at")),
+            "updated_at": _iso(e.get("modified_at")),
+        }
+
+    def upsert(self, row: dict) -> None:
+        attrs = {
+            # oauthClientRegistration MUST: clientId, clientStatus, tokenEndpointAuthMethod
+            "clientId": row["client_id"],
+            "clientStatus": row.get("status") or ("active" if row.get("enabled", True) else "inactive"),
+            "tokenEndpointAuthMethod": row.get("token_endpoint_auth_method") or "none",
+            # MAY
+            "name": row.get("name") or row["client_id"],
+            "grantTypes": row.get("grant_types") or [],
+        }
+        self._upsert(self.OC, row["client_id"], row.get("subject_type") or "workload",
+                     row["client_id"], attrs)
+
+    def list(self) -> list[dict]:
+        with self._conn() as conn:
+            cur = conn.execute(
+                "SELECT subject_type, created_at, modified_at, attrs FROM idm.entry "
+                "WHERE %s = ANY(object_classes) ORDER BY attrs->>'clientId'", (self.OC[0],))
+            return [self._to_row(e) for e in self._row(cur)]
+
+    def get(self, client_id: str) -> dict | None:
+        with self._conn() as conn:
+            cur = conn.execute(
+                "SELECT subject_type, created_at, modified_at, attrs FROM idm.entry "
+                "WHERE %s = ANY(object_classes) AND correlation_id = %s LIMIT 1",
+                (self.OC[0], client_id))
+            rows = self._row(cur)
+            return self._to_row(rows[0]) if rows else None
+
+
+# ---------------------------------------------------------------------------
+# Delegation grants (projected when the delegation happens)  ->  oauthGrant + agentDelegation
+# ---------------------------------------------------------------------------
+class IdmGrantStore(_Idm):
+    """A delegation grant, projected into the directory at the moment the agent acts on the
+    principal's behalf (the RFC 8693 exchange: sub=principal, act=agent). oauthGrant carries the
+    grant; the agentDelegation auxiliary carries principal->agent. Linked to the consent that
+    authorised it (consentRef) when known — the consent->grant->token->action audit chain."""
+    OC = ["oauthGrant", "agentDelegation"]
+
+    def _to_row(self, e: dict) -> dict:
+        a = e["attrs"]
+        return {
+            "grant_guid": a.get("grantGuid"),
+            "client_id": a.get("clientId"),
+            "grant_type": a.get("grantType"),
+            "issued_timestamp": a.get("issuedTimestamp"),
+            "principal_id": a.get("principalId"),
+            "agent_id": a.get("agentId"),
+            "agent_operator_id": a.get("agentOperatorId"),
+            "scope": a.get("scope"),
+            "consent_ref": a.get("consentRef"),
+            "subject": e.get("subject_id"),
+            "created_at": _iso(e.get("created_at")),
+            "updated_at": _iso(e.get("modified_at")),
+        }
+
+    def upsert(self, row: dict) -> None:
+        attrs = {
+            # oauthGrant MUST: grantGuid, clientId, grantType, issuedTimestamp
+            "grantGuid": row["grant_guid"],
+            "clientId": row.get("client_id"),
+            "grantType": row.get("grant_type") or "urn:ietf:params:oauth:grant-type:token-exchange",
+            "issuedTimestamp": _iso(row.get("issued_timestamp")),
+            # agentDelegation MUST: principalId, agentId
+            "principalId": row["principal_id"],
+            "agentId": row["agent_id"],
+            # MAY
+            "agentOperatorId": row.get("agent_operator_id"),
+            "scope": row.get("scope"),
+            "consentRef": row.get("consent_ref"),
+        }
+        self._upsert(self.OC, row["principal_id"], "person", row["grant_guid"], attrs,
+                     expires_at=row.get("expires_at"))
+
+    def list(self, principal: str | None = None) -> list[dict]:
+        q = ("SELECT subject_id, created_at, modified_at, attrs FROM idm.entry "
+             "WHERE %s = ANY(object_classes)")
+        params: list[Any] = [self.OC[0]]
+        if principal:
+            q += " AND subject_id = %s"; params.append(principal)
+        q += " ORDER BY created_at DESC LIMIT 200"
+        with self._conn() as conn:
+            return [self._to_row(e) for e in self._row(conn.execute(q, tuple(params)))]
+
+    def get(self, grant_guid: str) -> dict | None:
+        with self._conn() as conn:
+            cur = conn.execute(
+                "SELECT subject_id, created_at, modified_at, attrs FROM idm.entry "
+                "WHERE %s = ANY(object_classes) AND correlation_id = %s LIMIT 1",
+                (self.OC[0], grant_guid))
+            rows = self._row(cur)
+            return self._to_row(rows[0]) if rows else None
