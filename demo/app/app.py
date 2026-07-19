@@ -476,6 +476,36 @@ async def _record_consent(rar: list, subject: str, status: str = "requested") ->
         pass
 
 
+async def _record_stepup_consent(su: dict, subject: str) -> str:
+    """Record the passkey step-up payment as an AUTHORIZED consent in the consent directory.
+
+    The passkey ceremony that just completed IS the acceptance of THIS payment (amount/creditor
+    came from the step-up cookie). The PDP looks this consent up when the payment request returns
+    through the gateway (a policy information provider on the directory), so the policy passes
+    without the RAR being carried in the token. Returns the minted transaction id (best-effort)."""
+    if not PROOFING_DIRECTORY_URL:
+        return ""
+    txn = "txn_" + secrets.token_hex(6)
+    try:
+        amt = float(su.get("amount") or 0)
+    except (TypeError, ValueError):
+        amt = 0.0
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as c:
+            await c.post(f"{PROOFING_DIRECTORY_URL}/consents", json={
+                "transaction_id": txn,
+                "subject": subject, "actor": subject, "channel": "passkey-stepup",
+                "amount": amt, "currency": su.get("currency") or "AUD",
+                "debtor_account": su.get("debtor") or "",
+                "creditor_account": su.get("creditor") or "",
+                "status": "authorized"})
+        logger.info("recorded passkey-stepup consent txn=%s subject=%s amount=%s creditor=%s",
+                    txn, subject, amt, su.get("creditor"))
+    except Exception as exc:  # noqa: BLE001 — must never block the passkey sign-in
+        logger.warning("stepup consent record failed: %s", exc)
+    return txn
+
+
 @app.get("/login")
 async def login(request: Request):
     """Kick off the OIDC authorization-code + PKCE flow at PingFederate.
@@ -495,9 +525,24 @@ async def login(request: Request):
     # + PAR/RAR redirect (which forced PF's htmlform password page) is retired for the step-up;
     # RAR consent no longer lives on a PF page (accepted trade-off — the elevated scope is what
     # gates the payment at the gateway PEP).
-    resp = RedirectResponse("/signup", status_code=302)
+    # Carry the step-up across the passkey ceremony in a signed cookie: the elevated scope
+    # AND the specific payment (amount/creditor/debtor). On passkey-finish we record this as an
+    # AUTHORIZED consent in the consent directory — the passkey IS the acceptance. The payment
+    # request then returns through the gateway to the PDP, which looks the consent up (a policy
+    # information provider on the consent directory) and permits. The consent lives in the DB,
+    # not in the token — mirroring the mDL identity-proofing gate.
+    sess = _session(request)
+    subject = (sess or {}).get("sub") or ""
+    hint = "?stepup=1" + (("&u=" + urllib.parse.quote(subject)) if subject else "")
+    resp = RedirectResponse("/signup" + (hint if stepup else ""), status_code=302)
     if stepup:
-        resp.set_cookie(STEPUP_COOKIE, _sign({"scope": stepup}, 600),
+        qp = request.query_params
+        payload = {"scope": stepup, "subject": subject,
+                   "amount": (qp.get("amount") or "").strip(),
+                   "currency": (qp.get("cur") or "AUD").strip(),
+                   "debtor": (qp.get("from") or "").strip(),
+                   "creditor": (qp.get("to") or "").strip()}
+        resp.set_cookie(STEPUP_COOKIE, _sign(payload, 600),
                         httponly=True, secure=True, samesite="lax", max_age=600)
     return resp
 
@@ -720,6 +765,21 @@ $('signinBtn').onclick = async () => {
   try { await doSignin(u); } catch(e){ msg('Sign-in cancelled or failed: '+e.message, 'err'); }
   $('signinBtn').disabled = false;
 };
+
+// Step-up: /login?stepup=1&u=<user> sent an ALREADY signed-in user here to approve a payment.
+// Skip the create/choose screen (they have an account) and go straight to a pre-filled passkey
+// sign-in, relabelled as payment approval. One tap — WebAuthn needs a user gesture, so we don't
+// auto-fire it. This is the "login hint" so the step-up never offers 'create a new account'.
+(function(){
+  const q = new URLSearchParams(location.search);
+  if(q.get('stepup') !== '1') return;
+  const u = (q.get('u')||'').toLowerCase();
+  show('signin');
+  if(u && valid(u)) $('su').value = u;
+  const h = $('signin').querySelector('h1'); if(h) h.textContent = 'Approve this payment';
+  const p = $('signin').querySelector('p'); if(p) p.textContent = 'Confirm with your passkey to authorise the payment.';
+  $('signinBtn').textContent = 'Approve with passkey';
+})();
 </script></body></html>"""
 
 
@@ -1062,11 +1122,16 @@ async def signin_finish(request: Request):
     except Exception as exc:  # noqa: BLE001
         return JSONResponse(status_code=401, content={"error": "verification failed",
                                                       "detail": str(exc)[:200]})
-    # Step-up: /login?stepup=<scope> stashed the elevated scope in a signed cookie before sending
-    # the user here. The passkey ceremony IS the step-up auth, so broker with that scope, then
-    # clear the cookie so it can never elevate a subsequent ordinary sign-in.
+    # Step-up: /login?stepup stashed the elevated scope + the specific payment in a signed cookie.
+    # The passkey ceremony that just succeeded IS the acceptance, so we (a) record the payment as
+    # an AUTHORIZED consent in the consent directory — which the PDP looks up when the payment
+    # request returns, so the policy passes without the RAR being in the token — and (b) broker a
+    # PF token carrying the elevated scope. Then clear the cookie so it can't elevate a later
+    # ordinary sign-in.
     su = _verify(request.cookies.get(STEPUP_COOKIE))
     stepup = (su or {}).get("scope", "")
+    if stepup and (su or {}).get("amount"):
+        await _record_stepup_consent(su, u)
     pf_at = await _broker_passkey_to_pf(u, extra_scope=stepup)
     resp = _passkey_session_response(u, pf_at)
     if stepup:
