@@ -619,7 +619,7 @@ SIGNUP_TX_COOKIE = "nw_signup_tx"
 
 _SIGNUP_HTML = """<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Sign up — ID Partners Bank</title>
+<title>Sign up — Demo Bank</title>
 <style>body{font-family:-apple-system,system-ui,sans-serif;background:#101418;color:#e8e8e8;
 display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}
 .card{background:#1a2027;border:1px solid #2a323c;border-radius:14px;padding:32px;width:370px}
@@ -633,10 +633,13 @@ font-weight:600;cursor:pointer;margin-top:8px}button:disabled{opacity:.45;cursor
 color:#7fb0ff;font-weight:500;margin-top:14px;padding:4px}
 #msg{font-size:13px;margin-top:12px;min-height:18px}.err{color:#ff8b7b}.ok{color:#5fd08a}
 .hint{font-size:12px;margin:2px 0 0}.avail{color:#5fd08a}.taken{color:#ffcf6a}
+.vendor{margin-top:18px;padding-top:14px;border-top:1px solid #2a323c;color:#9aa5b1;
+font-size:11px;display:flex;align-items:center;justify-content:center;gap:7px}
+.vendor img{height:18px;width:auto}
 .hidden{display:none}</style>
 </head><body>
 <div class="card">
-  <div class="brand"><span class="o">■</span> ID <span class="o">PARTNERS</span> Bank</div>
+  <div class="brand">🏦 Demo Bank</div>
 
   <!-- CHOOSE -->
   <div id="choose">
@@ -667,6 +670,7 @@ color:#7fb0ff;font-weight:500;margin-top:14px;padding:4px}
   </div>
 
   <div id="msg"></div>
+  <div class="vendor">Powered by <img src="/static/idp-wordmark.svg" alt="ID Partners"></div>
 </div>
 <script>
 const b64uToBuf = s => { s = s.replace(/-/g,'+').replace(/_/g,'/'); s += '='.repeat((4-s.length%4)%4);
@@ -886,7 +890,7 @@ async def passkey_begin(request: Request):
                 headers={"Authorization": f"Bearer {tok}",
                          "Content-Type": "application/vnd.pingidentity.device.fido2+json"},
                 json={"type": "FIDO2",
-                      "rp": {"id": _rp_id(), "name": "ID Partners Bank"}})
+                      "rp": {"id": _rp_id(), "name": "Demo Bank"}})
             if r.status_code >= 300:
                 return JSONResponse(status_code=502, content={
                     "error": "device create failed", "detail": r.text[:300]})
@@ -1590,7 +1594,7 @@ async def enroll(request: Request, format: str = "html"):
 
 _ENROLL_HTML = """<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>ID Partners Bank — Enrol device</title><style>
+<title>Demo Bank — Enrol device</title><style>
 :root{--bg:#0d1117;--panel:#161b22;--border:#2d333b;--text:#e6edf3;--muted:#9198a1;--accent:#ff6600}
 *{box-sizing:border-box}body{margin:0;min-height:100vh;background:var(--bg);color:var(--text);
  font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;display:flex;align-items:center;justify-content:center;padding:24px}
@@ -1608,7 +1612,10 @@ ol b{color:var(--text)}
  background:var(--accent);color:#fff;font-weight:600;border-radius:9px}
 .foot{text-align:center;color:var(--muted);font-size:11px;margin-top:16px}
 </style></head><body><div class="card">
-<div><span class="idp-mark"><span class="sq"></span>ID<span class="pa">PARTNERS</span></span><span class="bank">Bank</span></div>
+<div style="display:flex;align-items:center;justify-content:space-between;gap:12px">
+  <span style="font-size:20px;font-weight:800">🏦 Demo Bank</span>
+  <img src="/static/idp-wordmark.svg" alt="ID Partners" style="height:18px;width:auto;opacity:.9">
+</div>
 <h1>Enrol this device for approvals</h1>
 <p class="sub">__USER__'s phone pairs once, then approves with Face&nbsp;ID.</p>
 <div class="code" id="code">__CODE__</div>

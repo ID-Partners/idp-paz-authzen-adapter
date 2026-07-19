@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>ID Partners Bank · Agentic identity + Ping Authorize (AuthZEN)</title>
+<title>Demo Bank · Agentic identity + Ping Authorize (AuthZEN)</title>
 <style>
   :root {
     --bg:#0d1117; --panel:#161b22; --panel2:#0b0f14; --border:#2d333b; --text:#e6edf3;
@@ -104,6 +104,12 @@
   .idp-mark { display:inline-flex; align-items:center; gap:.42em; font-weight:800; letter-spacing:.05em; }
   .idp-mark .idp-sq { width:.66em; height:.66em; background:var(--accent); border-radius:2px; display:inline-block; }
   .idp-mark .idp-id { color:var(--text); } .idp-mark .idp-pa { color:var(--accent); }
+  /* ID Partners vendor lockup (the real brand asset, on-dark variant) */
+  .idp-logo { height:22px; width:auto; vertical-align:middle; display:inline-block; }
+  .idp-logo-sm { height:16px; margin-left:10px; opacity:.9; }
+  .login-vendor { margin-top:16px; padding-top:14px; border-top:1px solid var(--border);
+    color:var(--muted); font-size:12px; display:flex; align-items:center; justify-content:center; gap:8px; }
+  .login-vendor .idp-logo { height:20px; }
   .gnode.permit rect { stroke:var(--ok); filter:drop-shadow(0 0 3px rgba(63,185,80,.5)); }
   .gnode.deny rect { stroke:var(--deny); filter:drop-shadow(0 0 4px rgba(248,81,73,.5)); }
   .gnode.done .gflag { fill:var(--accent); }
@@ -349,7 +355,7 @@
 
 <div id="login" class="login-overlay">
   <div class="login-card">
-    <div class="login-brand"><span class="idp-mark"><i class="idp-sq"></i><span class="idp-id">ID</span><span class="idp-pa">PARTNERS</span></span> Bank</div>
+    <div class="login-brand">🏦 Demo Bank</div>
     <div class="login-sub">Sign in to your AI account assistant</div>
     <button id="loginbtn" class="login-btn" type="button" onclick="location.href='/signup'">
       🔑 Sign in with a passkey
@@ -361,12 +367,13 @@
     <div class="login-hint"><b>Passwordless</b> — sign in or register with a <b>passkey</b> or
       <b>security key</b> (YubiKey). No passwords. Your identity lives at PingOne and is brokered
       into a PingFederate session (RFC&nbsp;8693) so the agent&nbsp;delegation demo works as before.</div>
+    <div class="login-vendor">Powered by <img src="/static/idp-wordmark.svg" alt="ID Partners" class="idp-logo"></div>
   </div>
 </div>
 
 <header>
   <div>
-    <h1><span class="idp-mark"><i class="idp-sq"></i><span class="idp-id">ID</span><span class="idp-pa">PARTNERS</span></span> Bank — AI Account Assistant</h1>
+    <h1>🏦 Demo Bank — AI Account Assistant <img src="/static/idp-wordmark.svg" alt="ID Partners" class="idp-logo idp-logo-sm"></h1>
     <span class="tag">Agent identity · RFC 8693 token exchange · DPoP · <span class="gw-name">__GATEWAY__</span> PDP enforcement (MCP + API)</span>
   </div>
   <span id="whoami" class="whoami" hidden>
