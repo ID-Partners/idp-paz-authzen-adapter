@@ -904,6 +904,52 @@ def record_consent(body: ConsentBody):
     return _consent_resource(row)
 
 
+@app.get("/consents/check")
+def check_consent(subject: str = Query(...), creditor: str = Query(default=""),
+                  amount: float = Query(default=0.0), currency: str = Query(default="")):
+    """Does an AUTHORIZED consent on record cover this payment? The PDP's policy information
+    provider calls this; it answers with a plain boolean so the policy doesn't have to iterate.
+
+    Match = same subject, status authorized, creditor equal (case-insensitive), and the requested
+    amount WITHIN the consented amount. The consent is the ceiling, so a payment for less than was
+    consented is covered and a payment for more is not.
+
+    ⚠️  ASSURANCE: this proves a consent was RECORDED, not that the user cryptographically
+    authorised THIS payment. The consent is asserted by the application (the passkey signs a random
+    challenge, not the transaction), so a PERMIT from here is NOT non-repudiable and would not
+    satisfy PSD2 RTS Art.5 dynamic linking. See demo/TRANSACTION-AUTHORIZATION.md §2. Replace with
+    a signature over the instruction (CIBA+RAR, or a wallet-bound presentation) before this is
+    anything more than a demo."""
+    rows = consent_store.list(subject=subject, status="authorized")
+    cred = (creditor or "").strip().lower()
+    matches = []
+    for r in rows:
+        if cred and str(r.get("creditor_account") or "").strip().lower() != cred:
+            continue
+        try:
+            consented = float(r.get("amount") or 0)
+        except (TypeError, ValueError):
+            continue
+        if amount and amount > consented:
+            continue
+        if currency and str(r.get("currency") or "").upper() != currency.upper():
+            continue
+        matches.append(r)
+    covered = bool(matches)
+    newest = matches[0] if matches else None
+    logger.info("consent check subject=%s creditor=%s amount=%s -> covered=%s (%d candidate(s))",
+                subject, creditor, amount, covered, len(rows))
+    return {
+        "covered": covered,                       # the attribute the policy reads
+        "transactionId": (newest or {}).get("transaction_id"),
+        "consentedAmount": (newest or {}).get("amount"),
+        "creditorAccount": (newest or {}).get("creditor_account"),
+        "channel": (newest or {}).get("channel"),
+        "assurance": "app-asserted",              # honest label, carried to the policy
+        "nonRepudiable": False,
+    }
+
+
 @app.get("/consents")
 def list_consents(subject: str | None = Query(default=None),
                   status: str | None = Query(default=None)):
