@@ -83,8 +83,13 @@ resource "pingfederate_oauth_token_exchange_processor_policy" "user_to_agent" {
 #    instead of the old per-agent Text literal. The current actor's own id is a literal (it IS
 #    this agent); everything under it is wrapped from tepp.act. Empty incoming act → just {sub}.
 locals {
-  # Wrap the inbound act (from the token-exchange processor policy) under this agent.
-  act_expression = { for id in [var.agent_payments, var.agent_account] : id =>
+  # THE act RULE — one expression, every agent, no demo topology encoded anywhere.
+  # Wrap WHATEVER act arrived on the subject token under this agent:
+  #     act = { sub: <this agent>, act: <incoming act verbatim> }
+  # and when no act arrived (the root exchange) collapse to  act = { sub: <this agent> }.
+  # This is RFC 8693 §4.1 actor nesting: the chain is whatever the caller presents, not a
+  # shape this deployment assumes. Adding a hop needs NO PingFederate change.
+  act_expression = { for id in [var.agent_payments, var.agent_account, var.agent_concierge] : id =>
     "\"{\\\"sub\\\":\\\"${id}\\\"\" + (#this.get(\"act\") == null ? \"\" : \",\\\"act\\\":\" + #this.get(\"act\").getValue()) + \"}\""
   }
 
@@ -95,12 +100,28 @@ locals {
   attestation_criterion = "@${var.attestation_utils_class}@validateClientAttestation(#this)"
 }
 
+# ── PREREQUISITE for the act derivation below ────────────────────────────────────────────────
+# The mappings use source = EXPRESSION, which means PingFederate must EVALUATE OGNL at token
+# issuance. PF ships with expression evaluation OFF by default (it is a code-execution surface),
+# so a mapping that uses it will fail on a server where nobody turned it on.
+#
+# Declaring it here makes the config SELF-CONTAINED: rebuild PF from this terraform alone and the
+# act derivation works. Previously this was an undeclared dependency — the .tf asserted a mapping
+# that silently assumed a server-level setting it never mentioned, which is the same class of
+# hidden assumption as the hardcoded act chain it replaces.
+resource "pingfederate_config_store" "enable_ognl_expressions" {
+  bundle       = "org.sourceid.common.expression.ExpressionManager"
+  setting_id   = "evaluateExpressions"
+  string_value = "true"
+}
+
 resource "pingfederate_oauth_access_token_mapping" "te_payments" {
   context = {
     type        = "TOKEN_EXCHANGE_PROCESSOR_POLICY"
     context_ref = { id = pingfederate_oauth_token_exchange_processor_policy.user_to_agent.policy_id }
   }
   access_token_manager_ref = { id = "attestJwtPmts" }
+  depends_on               = [pingfederate_config_store.enable_ognl_expressions]
 
   attribute_contract_fulfillment = {
     "sub" = {
@@ -108,11 +129,10 @@ resource "pingfederate_oauth_access_token_mapping" "te_payments" {
       value  = "subject" # sub = the human principal (Alice), unchanged
     }
     "act" = {
-      # Nested act chain: this agent wrapping the concierge (the demo's fixed delegation
-      # topology). sub stays the human principal; act records who acted. TEXT literal — the
-      # working form; a dynamic derivation from subjecttoken.act is a future refinement.
-      source = { type = "TEXT" }
-      value  = "{\"sub\":\"${var.agent_payments}\",\"act\":{\"sub\":\"${var.agent_concierge}\"}}"
+      # Derived, never assumed: nests the INCOMING act under this agent. sub stays the human
+      # principal; act records the full actor chain as presented.
+      source = { type = "EXPRESSION" }
+      value  = local.act_expression[var.agent_payments]
     }
     "client_id" = {
       source = { type = "CONTEXT" }
@@ -138,6 +158,7 @@ resource "pingfederate_oauth_access_token_mapping" "te_account" {
     context_ref = { id = pingfederate_oauth_token_exchange_processor_policy.user_to_agent.policy_id }
   }
   access_token_manager_ref = { id = "attestJwtAcct" }
+  depends_on               = [pingfederate_config_store.enable_ognl_expressions]
 
   attribute_contract_fulfillment = {
     "sub" = {
@@ -145,8 +166,8 @@ resource "pingfederate_oauth_access_token_mapping" "te_account" {
       value  = "subject"
     }
     "act" = {
-      source = { type = "TEXT" }
-      value  = "{\"sub\":\"${var.agent_account}\",\"act\":{\"sub\":\"${var.agent_concierge}\"}}"
+      source = { type = "EXPRESSION" }
+      value  = local.act_expression[var.agent_account]
     }
     "client_id" = {
       source = { type = "CONTEXT" }
@@ -163,6 +184,7 @@ resource "pingfederate_oauth_access_token_mapping" "te_account" {
   }
 }
 
-# NOTE: the concierge mapping (attestJwtATM) is intentionally NOT changed — the concierge is the
-# ROOT of the chain (it exchanges Alice's login token, which has no act), so its act is always
-# just {concierge}. Leaving it as the existing literal keeps the root case explicit.
+# NOTE: the concierge is TODAY the root (it exchanges a login token carrying no act), so the same
+# expression collapses to {sub: concierge}. It is deliberately NOT special-cased: if a deeper chain
+# ever reaches the concierge, it nests correctly with no config change. Encoding "the root has no
+# act" would be exactly the hardcoded topology this file is meant to avoid.
