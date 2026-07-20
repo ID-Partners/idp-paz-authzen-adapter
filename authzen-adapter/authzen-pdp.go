@@ -414,7 +414,12 @@ func proofingPresent(subject, account string) bool {
 	if base == "" || subject == "" {
 		return false
 	}
-	u := fmt.Sprintf("%s/proofing?active=true&subject=%s", base, url.QueryEscape(subject))
+	// Ask the directory's gate question directly: does the subject have, for this account
+	// type, an active proofing (new origination) OR a consumed-but-unexpired one (already
+	// proofed and opened it — a resume replay of open_account must not re-challenge)? Keeping
+	// this in the directory, not the adapter, means a full-prompt resume is safe in any tool
+	// order without the adapter reasoning about consume/expiry state.
+	u := fmt.Sprintf("%s/proofing/present?subject=%s", base, url.QueryEscape(subject))
 	if account != "" {
 		u += "&account=" + url.QueryEscape(account)
 	}
@@ -429,12 +434,12 @@ func proofingPresent(subject, account string) bool {
 		return false
 	}
 	var out struct {
-		TotalResults int `json:"totalResults"`
+		Present bool `json:"present"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return false
 	}
-	return out.TotalResults > 0
+	return out.Present
 }
 
 // Build PDP decision payload for single evaluation

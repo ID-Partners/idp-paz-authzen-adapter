@@ -204,6 +204,22 @@ def open_account(body: OpenAccountBody,
     customer = _customer_or_provision(body.customer_id, x_auth_principal)
     if customer is None:
         return JSONResponse(status_code=404, content={"error": f"Unknown customer {body.customer_id}"})
+
+    # IDEMPOTENT: if this customer already has an account of this type, return it rather than
+    # originating a duplicate. A multi-step prompt ("open an account and transfer …") is REPLAYED
+    # whole on a step-up resume, so open_account can be re-invoked after it already succeeded —
+    # re-running it must be a no-op, not a second account. (Combined with the identity gate now
+    # passing on an already-proofed account, the replay is safe.) Does not consume proofing again.
+    existing = next((a for a in store.list_accounts(body.customer_id)
+                     if a.type == body.account_type), None)
+    if existing is not None:
+        _audit("open_account", x_auth_principal, x_auth_agent,
+               f"idempotent: returned existing {existing.id} ({body.account_type}) for {body.customer_id}")
+        return {
+            "message": f"You already have a {body.account_type} account ({existing.id}).",
+            "account": existing.to_dict(),
+        }
+
     acct = store.open_account(body.customer_id, body.account_type, body.nickname)
     _consume_proofing(body.customer_id, body.account_type, acct.id)
     _audit("open_account", x_auth_principal, x_auth_agent,

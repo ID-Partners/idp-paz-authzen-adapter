@@ -649,6 +649,36 @@ def list_proofing(subject: str | None = Query(default=None),
     }
 
 
+@app.get("/proofing/present")
+def proofing_present(subject: str = Query(...), account: str | None = Query(default=None)):
+    """The PDP gate's question, answered where the DATA lives (keeps the adapter thin).
+
+    present = the customer has, for this account type, EITHER
+        - an ACTIVE (fresh, unconsumed, unexpired) proofing — a new origination is authorised; OR
+        - a CONSUMED-but-unexpired proofing — they ALREADY proofed and opened this account type,
+          so re-running open_account in the same flow (a resume replay) must NOT re-challenge.
+    EXPIRED proofings never count either way.
+
+    This is what makes a full-prompt resume safe in any tool order: replaying a completed
+    open_account finds the consumed record and passes, instead of looping on the identity gate."""
+    subj = subject.strip().lower()
+    acc = (account or "").strip().lower()
+    now = _now()
+    active = consumed = False
+    for r in store.list_by_subject(subj):
+        if acc and (r.get("account") or "").strip().lower() != acc:
+            continue
+        if _as_dt(r["expires_at"]) <= now:
+            continue                      # expired: never counts
+        if r.get("consumed_at"):
+            consumed = True
+        else:
+            active = True
+    reason = "active" if active else ("consumed" if consumed else "none")
+    return {"present": active or consumed, "reason": reason,
+            "subject": subj, "account": acc}
+
+
 @app.get("/proofing/{rid}")
 def get_proofing(rid: str):
     row = store.get(rid)

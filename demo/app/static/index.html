@@ -1642,10 +1642,10 @@ async function streamRun(prompt, spin){
         // PingFederate for that scope, then resume the request. For a payment we
         // also carry the specific operation so the app requests it as an RFC 9396
         // authorization_details (RAR) that Alice consents to at PingFederate.
-        // Resume ONLY the payment, not the whole prompt: an earlier open_account in the same
-        // prompt has already completed (and consumed its mDL proofing), so replaying it would
-        // re-fire the identity gate. The agent supplies a payment-scoped resume_prompt.
-        sessionStorage.setItem('pending_prompt', ev.resume_prompt || prompt);
+        // Replay the FULL prompt on resume. Making the gates state-aware (idempotent
+        // open_account, consent_covered payment) is what makes replay safe in ANY tool order —
+        // a payment-scoped resume was order-fragile and could drop the account-opening.
+        sessionStorage.setItem('pending_prompt', prompt);
         setNode(stackOf(ev)+'pep2','deny','insufficient_scope');
         out.appendChild(el('step tool_result convo', `<div class="label">🔐 Step-up required — scope <code>${esc(ev.scope||'')}</code></div><div>${esc(ev.detail||'')} You'll re-authenticate at PingFederate and approve this specific payment, then it continues.</div>`));
         let url = '/login?stepup=' + encodeURIComponent(ev.scope||'banking:payments:transfer');
