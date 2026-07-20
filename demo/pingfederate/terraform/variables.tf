@@ -20,8 +20,19 @@ variable "pf_admin_password" {
   sensitive   = true
 }
 
+# A SYMBOLIC identifier, not an endpoint — nothing ever dials this host, and it deliberately
+# matches no live hostname (PF's own discovery issuer is https://localhost:9031). It is the
+# RFC 9068 `iss` STRING that the ATMs stamp into tokens and that subjectJwtProc string-compares
+# on the way back in. Key material is fetched from a separate field (JWKS Endpoint URI →
+# http://localhost:9080/pf/JWKS), which is what actually goes over the wire.
+#
+# It is therefore NOT per-environment: repointing it at the environment's real hostname breaks
+# the demo, because the mint side would keep stamping the old value and every subject-token
+# validation would fail. Both sides are wired to this one variable so they cannot drift — change
+# it only if you change it for mint and validate together, and note userJwtATM's copy lives in
+# data.zip (not Terraform-managed), so it must be updated there in lockstep.
 variable "pf_issuer" {
-  description = "The runtime issuer the subject-token JWT processor validates against"
+  description = "Symbolic RFC 9068 `iss` string shared by the token ATMs (mint) and subjectJwtProc (validate). Not a URL that is dialed; not environment-specific."
   type        = string
   default     = "https://pingfederate-production-cb0a.up.railway.app"
 }

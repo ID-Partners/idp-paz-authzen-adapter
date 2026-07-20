@@ -86,6 +86,14 @@ def summarize(resp: httpx.Response) -> dict[str, Any]:
                 "scope_required": body.get("scope"), "pep": body.get("pep") or pep,
                 "message": f"STEP-UP REQUIRED at {pep}: scope '{body.get('scope')}' needed",
                 "policy_reason": body.get("reason") or "insufficient scope"}
+    # mDL identity-proofing challenge: origination needs a verified identity-proofing
+    # activity for the customer. Surface it so the agent relays an identity challenge
+    # (CIBA push → app2app wallet presentation) instead of narrating a flat denial.
+    if body.get("error") == "identity_verification_required":
+        return {"authorized": False, "identity_proofing_required": True,
+                "doctype": body.get("doctype"), "pep": body.get("pep") or pep,
+                "message": f"IDENTITY PROOFING REQUIRED at {pep}: present {body.get('doctype')}",
+                "policy_reason": body.get("reason") or "identity proofing required"}
     if resp.status_code == 401:
         return {"authorized": False, "pep": pep,
                 "message": f"UNAUTHENTICATED at {pep}: {body.get('reason', 'no valid token')}",

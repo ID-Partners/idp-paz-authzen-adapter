@@ -120,6 +120,8 @@ async def call_tool(cred: Credential, tool: str, arguments: dict[str, Any],
                     "pep_action": (parsed or {}).get("pep_action"),
                     "insufficient_scope": (parsed or {}).get("insufficient_scope"),
                     "scope_required": (parsed or {}).get("scope_required"),
+                    "identity_proofing_required": (parsed or {}).get("identity_proofing_required"),
+                    "doctype": (parsed or {}).get("doctype"),
                 }
     except LoginRequired:
         raise
@@ -140,6 +142,18 @@ async def call_tool(cred: Credential, tool: str, arguments: dict[str, Any],
             return {"result": {"authorized": False, "insufficient_scope": True,
                                "scope_required": scope, "policy_reason": reason},
                     "authorized": False, "insufficient_scope": True, "scope_required": scope,
+                    "policy_reason": reason, "pep": "gateway", "pep_action": tool}
+        # mDL identity-proofing challenge (NOT a hard deny): origination needs a verified
+        # identity-proofing activity. coaz-pep (MCP edge) encodes it as
+        # "identity_verification_required doctype=<dt> :: <reason>".
+        if "identity_verification_required" in low:
+            m = re.search(r"doctype=(\S+)", detail)
+            doctype = m.group(1) if m else "org.iso.18013.5.1.mDL"
+            reason = detail.split("::", 1)[1].strip() if "::" in detail else detail
+            log.info("MCP call_tool(%s) → identity proofing required (doctype=%s)", tool, doctype)
+            return {"result": {"authorized": False, "identity_proofing_required": True,
+                               "doctype": doctype, "policy_reason": reason},
+                    "authorized": False, "identity_proofing_required": True, "doctype": doctype,
                     "policy_reason": reason, "pep": "gateway", "pep_action": tool}
         if "401" in detail or "login_required" in low or "unauthorized" in low:
             raise LoginRequired(detail) from exc

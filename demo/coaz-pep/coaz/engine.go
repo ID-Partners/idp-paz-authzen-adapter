@@ -101,15 +101,32 @@ func (e *Engine) CheckToolCall(ctx context.Context, upstreamURL, authorization s
 			JSONRPCError: jsonRPCError(rpc.ID, CodeMappingError, fmt.Sprintf("COAZ mapping error: %v", err))}
 	}
 
-	decision, reason, stepUp, stepUpScope, err := e.evaluate(ctx, built)
+	out, err := e.evaluate(ctx, built)
 	if err != nil {
 		return Verdict{CoazTool: true, Decision: false, PDPRequest: built.Body,
 			Reason:       fmt.Sprintf("PDP error: %v", err),
 			JSONRPCError: jsonRPCError(rpc.ID, CodePDPError, "Authorization service unavailable")}
 	}
+	decision, reason := out.Decision, out.Reason
 	if !decision {
-		if stepUp {
-			scope := stepUpScope
+		if out.IdentityReq {
+			// mDL identity-proofing gate (origination) — NOT a hard deny. Encode the
+			// requirement + doctype in the JSON-RPC error so the MCP client relays it as an
+			// identity challenge: the app pushes the customer's phone (CIBA), the approver
+			// opens the wallet app2app, the mDL is presented, and origination resumes.
+			doctype := out.IdentityDoctype
+			if doctype == "" {
+				doctype = "org.iso.18013.5.1.mDL"
+			}
+			msg := "identity_verification_required doctype=" + doctype
+			if reason != "" {
+				msg += " :: " + reason
+			}
+			return Verdict{CoazTool: true, Decision: false, PDPRequest: built.Body, Reason: msg,
+				JSONRPCError: jsonRPCError(rpc.ID, CodeDenied, msg)}
+		}
+		if out.StepUp {
+			scope := out.StepUpScope
 			if scope == "" {
 				scope = "banking:payments:transfer"
 			}
@@ -136,16 +153,28 @@ func (e *Engine) CheckToolCall(ctx context.Context, upstreamURL, authorization s
 	return Verdict{CoazTool: true, Decision: true, PDPRequest: built.Body, Reason: reason}
 }
 
+// pdpOutcome carries the PDP decision plus the policy's challenge advice: the RFC 9470
+// scope step-up (payments) and/or the mDL identity-proofing requirement (origination).
+type pdpOutcome struct {
+	Decision        bool
+	Reason          string
+	StepUp          bool
+	StepUpScope     string
+	IdentityReq     bool
+	IdentityDoctype string
+}
+
 // evaluate POSTs the built request to the AuthZEN PDP and folds the
 // decision(s): every decision must be true for a permit.
-func (e *Engine) evaluate(ctx context.Context, built *BuiltRequest) (bool, string, bool, string, error) {
+func (e *Engine) evaluate(ctx context.Context, built *BuiltRequest) (pdpOutcome, error) {
+	var out pdpOutcome
 	endpoint := e.pdp.URL + "/access/v1/evaluation"
 	if built.Batch {
 		endpoint = e.pdp.URL + "/access/v1/evaluations"
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(built.Body))
 	if err != nil {
-		return false, "", false, "", err
+		return out, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if e.pdp.APIKey != "" {
@@ -153,54 +182,55 @@ func (e *Engine) evaluate(ctx context.Context, built *BuiltRequest) (bool, strin
 	}
 	resp, err := e.pdpc.Do(req)
 	if err != nil {
-		return false, "", false, "", err
+		return out, err
 	}
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return false, "", false, "", err
+		return out, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return false, "", false, "", fmt.Errorf("PDP returned %d", resp.StatusCode)
+		return out, fmt.Errorf("PDP returned %d", resp.StatusCode)
 	}
 
 	type decision struct {
 		Decision bool `json:"decision"`
 		Context  *struct {
-			Reason         string `json:"reason"`
-			StepUpRequired bool   `json:"step_up_required"`
-			StepUpScope    string `json:"step_up_scope"`
+			Reason           string `json:"reason"`
+			StepUpRequired   bool   `json:"step_up_required"`
+			StepUpScope      string `json:"step_up_scope"`
+			IdentityRequired bool   `json:"identity_proofing_required"`
+			IdentityDoctype  string `json:"identity_proofing_doctype"`
 		} `json:"context"`
 	}
-	fold := func(d decision) (bool, string, bool, string) {
-		reason, stepUp, scope := "", false, ""
+	fold := func(d decision) pdpOutcome {
+		o := pdpOutcome{Decision: d.Decision}
 		if d.Context != nil {
-			reason, stepUp, scope = d.Context.Reason, d.Context.StepUpRequired, d.Context.StepUpScope
+			o.Reason, o.StepUp, o.StepUpScope = d.Context.Reason, d.Context.StepUpRequired, d.Context.StepUpScope
+			o.IdentityReq, o.IdentityDoctype = d.Context.IdentityRequired, d.Context.IdentityDoctype
 		}
-		return d.Decision, reason, stepUp, scope
+		return o
 	}
 	if !built.Batch {
 		var d decision
 		if err := json.Unmarshal(raw, &d); err != nil {
-			return false, "", false, "", fmt.Errorf("bad PDP response: %w", err)
+			return out, fmt.Errorf("bad PDP response: %w", err)
 		}
-		dec, reason, stepUp, scope := fold(d)
-		return dec, reason, stepUp, scope, nil
+		return fold(d), nil
 	}
 	var batch struct {
 		Evaluations []decision `json:"evaluations"`
 	}
 	if err := json.Unmarshal(raw, &batch); err != nil {
-		return false, "", false, "", fmt.Errorf("bad PDP evaluations response: %w", err)
+		return out, fmt.Errorf("bad PDP evaluations response: %w", err)
 	}
 	if len(batch.Evaluations) == 0 {
-		return false, "", false, "", fmt.Errorf("PDP evaluations response was empty")
+		return out, fmt.Errorf("PDP evaluations response was empty")
 	}
 	for _, d := range batch.Evaluations {
 		if !d.Decision {
-			_, reason, stepUp, scope := fold(d)
-			return false, reason, stepUp, scope, nil
+			return fold(d), nil
 		}
 	}
-	return true, "", false, "", nil
+	return pdpOutcome{Decision: true}, nil
 }

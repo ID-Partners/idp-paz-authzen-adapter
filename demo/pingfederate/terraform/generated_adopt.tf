@@ -188,7 +188,7 @@ resource "pingfederate_oauth_access_token_manager" "attest_jwt_acct" {
       },
       {
         name  = "Issuer Claim Value"
-        value = "https://pingfederate-production-cb0a.up.railway.app" # RFC 9068 iss; must match subjectJwtProc's Issuer so delegated tokens can be flatten-exchange subjects
+        value = var.pf_issuer # RFC 9068 iss; same var as subjectJwtProc's Issuer so delegated tokens stay valid flatten-exchange subjects
       },
       {
         name  = "JWE Algorithm"
@@ -381,7 +381,7 @@ resource "pingfederate_oauth_access_token_manager" "attest_jwt_pmts" {
       },
       {
         name  = "Issuer Claim Value"
-        value = "https://pingfederate-production-cb0a.up.railway.app" # RFC 9068 iss; must match subjectJwtProc's Issuer so delegated tokens can be flatten-exchange subjects
+        value = var.pf_issuer # RFC 9068 iss; same var as subjectJwtProc's Issuer so delegated tokens stay valid flatten-exchange subjects
       },
       {
         name  = "JWE Algorithm"
