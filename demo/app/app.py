@@ -231,10 +231,14 @@ async def proofing_status(session_id: str, request: Request):
                             content={"error": "verifier_unreachable", "detail": str(e)})
     recorded = False
     if d.get("status") == "verified":
-        # Scope the record to the account this proofing was FOR (from the in-flight
-        # proofing registered by /proofing/begin, matched by verifier session).
+        # Scope the record to the account this proofing was FOR. _PROOFINGS is in-memory, so
+        # after a restart the account is gone; fall back to what the verifier session recorded,
+        # then to "savings" (the demo default) so the write STILL lands scoped rather than being
+        # dropped. A verified mDL must never be lost because the process bounced.
         account = next((p.get("account") or "" for p in _PROOFINGS.values()
                         if p.get("session_id") == session_id), "")
+        if not account:
+            account = str((d.get("claims") or {}).get("account") or "savings")
         try:
             async with httpx.AsyncClient(timeout=8.0) as c:
                 pr = await c.post(f"{PROOFING_DIRECTORY_URL}/proofing", json={
@@ -242,8 +246,12 @@ async def proofing_status(session_id: str, request: Request):
                     "claims": d.get("claims") or {}, "session_id": session_id,
                     "account": account})
                 recorded = pr.status_code < 300
-        except Exception:
-            recorded = False
+            logger.info("proofing VERIFIED subject=%s account=%s recorded=%s (http %s)",
+                        subject, account, recorded, pr.status_code)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("proofing write FAILED subject=%s: %s", subject, exc)
+    elif d.get("status") not in ("pending", None):
+        logger.info("proofing status subject=%s session=%s -> %s", subject, session_id, d.get("status"))
     return {"status": d.get("status"), "claims": d.get("claims"),
             "error": d.get("error"), "recorded": recorded, "subject": subject}
 
