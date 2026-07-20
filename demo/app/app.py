@@ -485,6 +485,158 @@ async def _project_delegation_grant(subject: str, scope: str, consent_txn: str) 
         logger.warning("grant projection failed: %s", exc)
 
 
+# ── Adaptive step-up ────────────────────────────────────────────────────────────────
+# ONE entry point for every step-up, which BRANCHES on whether the user has a usable
+# authenticator (the enrolment-vs-authentication split — a flow that always authenticates
+# blocks every device-less user):
+#
+#   paired device  → CIBA push to that device. The push carries only a ≤20-char code;
+#                    the approver app PULLS the amount + payee from /stepup/code/{code}
+#                    and signs over the transaction hash. THIS is the binding: the
+#                    signature covers the instruction, so it is dynamically linked
+#                    (PSD2 RTS Art.5) and the artefact is retained for a dispute.
+#   no device      → local browser passkey (and, for origination, an mDL QR). This path
+#                    CANNOT bind — a browser passkey signs a random challenge (WebAuthn
+#                    has no transaction-authorization extension). It is a real DOWNGRADE.
+#
+# Both outcomes carry the assurance ACTUALLY ACHIEVED, so the PDP can decline the weak
+# path for high-value operations instead of silently accepting it.
+# See demo/TRANSACTION-AUTHORIZATION.md sections 2-4.
+
+# assurance ladder, weakest → strongest. The PDP sees this verbatim.
+ASSURANCE_APP_ASSERTED = "app-asserted"    # local passkey; signature does NOT cover the payment
+ASSURANCE_DEVICE_APPROVED = "device-approved"  # paired device approved, but sent no signature
+ASSURANCE_DEVICE_SIGNED = "device-signed"      # paired device signed over the transaction hash
+
+# In-flight step-ups keyed by the ≤20-char code that rides the CIBA binding_message.
+_STEPUPS: dict[str, dict] = {}
+
+
+def _txn_hash(su: dict) -> str:
+    """Canonical hash of the INSTRUCTION. This is what the device signs, and what the
+    dispute layer re-derives to prove what the user actually approved."""
+    canon = json.dumps({"subject": su.get("subject", ""), "amount": str(su.get("amount", "")),
+                        "currency": su.get("currency", ""), "debtor": su.get("debtor", ""),
+                        "creditor": su.get("creditor", "")},
+                       sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canon.encode()).hexdigest()
+
+
+async def _device_paired(user: str) -> bool:
+    """Does this user have a usable (paired) authenticator right now? The identity store
+    is the record; /identities/{user}/reconcile refreshes it from PingOne."""
+    if not user:
+        return False
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as c:
+            r = await c.get(f"{PROOFING_DIRECTORY_URL}/scim/v2/Users",
+                            params={"filter": f'userName eq "{user}"'})
+            for u in (r.json().get("Resources") or []):
+                ext = u.get("urn:idpartners:params:scim:schemas:extension:2.0:User") or {}
+                return bool(ext.get("devicePaired"))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("device-paired lookup failed for %s: %s", user, exc)
+    return False  # fail to the LOCAL path: never assume a device exists
+
+
+@app.post("/stepup/begin")
+async def stepup_begin(request: Request):
+    """Adaptive step-up entry. Returns the mode the caller must drive."""
+    s = _session(request)
+    subject = (s or {}).get("sub") or ""
+    if not subject:
+        return JSONResponse(status_code=401, content={"error": "login_required"})
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        pass
+    su = {"subject": subject, "scope": body.get("scope") or "banking:payments:transfer",
+          "amount": str(body.get("amount") or ""), "currency": body.get("currency") or "AUD",
+          "debtor": body.get("from") or "", "creditor": body.get("to") or ""}
+
+    if not await _device_paired(subject):
+        # No usable authenticator → local passkey. Labelled as the weaker path.
+        return {"mode": "local", "assurance": ASSURANCE_APP_ASSERTED, "bound": False,
+                "reason": "no paired device",
+                "note": "browser passkey signs a random challenge; it does not bind to this payment"}
+
+    code = "PAY-" + secrets.token_hex(3)  # ≤20 chars, CIBA binding_message charset-safe
+    su.update({"code": code, "txn": "txn_" + secrets.token_hex(6),
+               "hash": _txn_hash(su), "status": "pending", "created": int(time.time())})
+    _STEPUPS[code] = su
+    pushed, detail = await _ciba_push(subject, code)
+    if not pushed:
+        logger.warning("stepup ciba push failed for %s: %s", subject, detail)
+        return {"mode": "local", "assurance": ASSURANCE_APP_ASSERTED, "bound": False,
+                "reason": f"push failed: {detail}"}
+    return {"mode": "ciba", "code": code, "txn": su["txn"], "hash": su["hash"],
+            "assurance": ASSURANCE_DEVICE_SIGNED, "bound": True}
+
+
+@app.get("/stepup/code/{code}")
+async def stepup_code(code: str, request: Request):
+    """The approver app pulls the FULL instruction by the pushed code — the push itself
+    carries only 20 characters, so the detail the user sees comes from here."""
+    user = _device_user(request)
+    su = _STEPUPS.get(code)
+    if not su:
+        return JSONResponse(status_code=404, content={"error": "unknown code"})
+    if user and user != su["subject"]:
+        return JSONResponse(status_code=403, content={"error": "not your step-up"})
+    return {"code": code, "txn": su["txn"], "hash": su["hash"], "subject": su["subject"],
+            "amount": su["amount"], "currency": su["currency"],
+            "debtorAccount": su["debtor"], "creditorAccount": su["creditor"],
+            "status": su["status"]}
+
+
+@app.post("/stepup/approve")
+async def stepup_approve(request: Request):
+    """The paired device approves. A signature over `hash` is what makes this binding;
+    without one the approval is recorded at the WEAKER device-approved level."""
+    user = _device_user(request)
+    if not user:
+        return JSONResponse(status_code=401, content={"error": "device token required"})
+    body = await request.json()
+    su = _STEPUPS.get(str(body.get("code") or ""))
+    if not su:
+        return JSONResponse(status_code=404, content={"error": "unknown code"})
+    if user != su["subject"]:
+        return JSONResponse(status_code=403, content={"error": "not your step-up"})
+
+    signature = str(body.get("signature") or "")
+    su["status"] = "approved"
+    su["assurance"] = ASSURANCE_DEVICE_SIGNED if signature else ASSURANCE_DEVICE_APPROVED
+    su["signature"] = signature
+    su["approved_at"] = int(time.time())
+
+    # Retain the ARTEFACT, not a boolean: the dispute layer needs what was signed.
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as c:
+            await c.post(f"{PROOFING_DIRECTORY_URL}/consents", json={
+                "transaction_id": su["txn"], "subject": su["subject"], "actor": su["subject"],
+                "channel": "ciba-device", "status": "authorized",
+                "amount": float(su["amount"] or 0), "currency": su["currency"],
+                "debtor_account": su["debtor"], "creditor_account": su["creditor"],
+                "authorization_details": [{"type": "payment_initiation",
+                                           "transactionHash": su["hash"],
+                                           "signature": signature,
+                                           "assurance": su["assurance"]}]})
+    except Exception as exc:  # noqa: BLE001 — never block the approval
+        logger.warning("stepup consent record failed: %s", exc)
+    return {"ok": True, "txn": su["txn"], "assurance": su["assurance"]}
+
+
+@app.get("/stepup/status/{code}")
+async def stepup_status(code: str):
+    """The browser polls this while the phone is being tapped."""
+    su = _STEPUPS.get(code)
+    if not su:
+        return JSONResponse(status_code=404, content={"error": "unknown code"})
+    return {"code": code, "status": su["status"], "txn": su["txn"],
+            "assurance": su.get("assurance", "")}
+
+
 @app.get("/login")
 async def login(request: Request):
     """Send the user to the PASSKEY ceremony (/signup) — the only authentication path.
