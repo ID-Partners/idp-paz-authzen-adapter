@@ -637,6 +637,63 @@ async def stepup_status(code: str):
             "assurance": su.get("assurance", "")}
 
 
+@app.get("/stepup/complete")
+async def stepup_complete(code: str = ""):
+    """After the device approves, elevate the browser session — same signupTE broker the
+    passkey path uses, so the elevated scope reaches the gateway PEP identically. The
+    DIFFERENCE from the passkey path is the evidence behind it: a signature over this
+    payment, not a random challenge."""
+    su = _STEPUPS.get(code)
+    if not su:
+        return JSONResponse(status_code=404, content={"error": "unknown code"})
+    if su.get("status") != "approved":
+        return JSONResponse(status_code=409, content={"error": "not approved yet"})
+    user = su["subject"]
+    await _project_delegation_grant(user, su["scope"], su["txn"])
+    pf_at = await _broker_passkey_to_pf(user, extra_scope=su["scope"])
+    logger.info("stepup complete via device: subject=%s txn=%s assurance=%s",
+                user, su["txn"], su.get("assurance"))
+    return _passkey_session_response(user, pf_at)
+
+
+# The browser's "check your phone" page. It polls the step-up, then completes (which
+# elevates the session) and returns to the chat, where resumePending() replays the payment.
+_STEPUP_WAIT_HTML = """<!doctype html><html><head><meta charset="utf-8">
+<title>Approve on your phone</title><meta name="viewport" content="width=device-width,initial-scale=1">
+<style>body{font-family:-apple-system,Segoe UI,Roboto,sans-serif;background:#0b1020;color:#e8ecf7;
+display:flex;align-items:center;justify-content:center;height:100vh;margin:0}
+.c{max-width:420px;text-align:center;padding:32px;background:#141a2f;border-radius:16px}
+.a{font-size:32px;font-weight:600;margin:12px 0}.m{color:#94a3b8;font-size:14px;line-height:1.5}
+.code{letter-spacing:2px;font-family:ui-monospace,monospace;background:#0b1020;padding:8px 14px;
+border-radius:8px;display:inline-block;margin-top:14px}.s{margin-top:18px;font-size:13px;color:#7dd3fc}</style>
+</head><body><div class="c">
+<div style="font-size:40px">📲</div>
+<div class="a">__AMOUNT__ __CUR__</div>
+<div class="m">to <b>__TO__</b><br><br>We've sent this payment to your paired device.
+Open the approver app to see the full details and approve it there.</div>
+<div class="code">__CODE__</div>
+<div class="s" id="s">Waiting for approval…</div></div>
+<script>
+const code = "__CODE__";
+async function poll(){
+  try{
+    const r = await fetch('/stepup/status/'+code);
+    if(r.ok){
+      const d = await r.json();
+      if(d.status === 'approved'){
+        document.getElementById('s').textContent = 'Approved ('+(d.assurance||'')+') — continuing…';
+        await fetch('/stepup/complete?code='+encodeURIComponent(code));
+        location.href = '/';
+        return;
+      }
+    }
+  }catch(e){}
+  setTimeout(poll, 2000);
+}
+poll();
+</script></body></html>"""
+
+
 @app.get("/login")
 async def login(request: Request):
     """Send the user to the PASSKEY ceremony (/signup) — the only authentication path.
@@ -669,6 +726,34 @@ async def login(request: Request):
     # not in the token — mirroring the mDL identity-proofing gate.
     sess = _session(request)
     subject = (sess or {}).get("sub") or ""
+
+    # ADAPTIVE BRANCH. A step-up for a user who HAS a paired device goes to that device
+    # over CIBA — the phone shows the amount + payee it pulled from us and signs over the
+    # transaction hash. Only a user with NO usable device falls through to the local
+    # browser passkey, which cannot bind to the payment.
+    if stepup and subject:
+        qp = request.query_params
+        su = {"subject": subject, "scope": stepup,
+              "amount": (qp.get("amount") or "").strip(),
+              "currency": (qp.get("cur") or "AUD").strip(),
+              "debtor": (qp.get("from") or "").strip(),
+              "creditor": (qp.get("to") or "").strip()}
+        if await _device_paired(subject):
+            code = "PAY-" + secrets.token_hex(3)
+            su.update({"code": code, "txn": "txn_" + secrets.token_hex(6),
+                       "hash": _txn_hash(su), "status": "pending",
+                       "created": int(time.time())})
+            _STEPUPS[code] = su
+            pushed, detail = await _ciba_push(subject, code)
+            if pushed:
+                logger.info("stepup -> CIBA device push subject=%s code=%s", subject, code)
+                return HTMLResponse(_STEPUP_WAIT_HTML
+                                    .replace("__CODE__", code)
+                                    .replace("__AMOUNT__", su["amount"])
+                                    .replace("__CUR__", su["currency"])
+                                    .replace("__TO__", su["creditor"]))
+            logger.warning("stepup push failed (%s) — falling back to local passkey", detail)
+
     hint = "?stepup=1" + (("&u=" + urllib.parse.quote(subject)) if subject else "")
     resp = RedirectResponse("/signup" + (hint if stepup else ""), status_code=302)
     if stepup:
