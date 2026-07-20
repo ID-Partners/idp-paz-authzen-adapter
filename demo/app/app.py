@@ -998,9 +998,29 @@ async def stepup_consent_finish(request: Request):
         body = await request.json()
     except Exception:  # noqa: BLE001
         pass
-    blob = json.dumps(body).lower()
-    approved = "approve" in blob and "decline" not in blob
-    logger.info("davinci consent decision approved=%s subject=%s", approved, su.get("subject"))
+    # Read the DECISION, not a substring of the whole payload. The screen defines BOTH an
+    # "approve" and a "decline" button, and the flow's success response echoes both, so a
+    # blob scan for "decline not in blob" flagged EVERY approval as a decline — the payment
+    # loop. The skbutton writes the clicked value into a "buttonValue" field; find that.
+    def _decision(o) -> str:
+        if isinstance(o, dict):
+            for k, v in o.items():
+                if k.lower() in ("buttonvalue", "svalue", "value") and isinstance(v, str) \
+                   and v.lower() in ("approve", "decline"):
+                    return v.lower()
+                d = _decision(v)
+                if d:
+                    return d
+        elif isinstance(o, list):
+            for v in o:
+                d = _decision(v)
+                if d:
+                    return d
+        return ""
+    decision = _decision(body)
+    approved = decision == "approve"
+    logger.info("davinci consent decision=%r approved=%s subject=%s | raw=%s",
+                decision or "unknown", approved, su.get("subject"), json.dumps(body)[:400])
     if not approved:
         # A DECLINE is a real decision and belongs in the directory. Recording only
         # approvals leaves a record that cannot distinguish "refused" from "never asked".
