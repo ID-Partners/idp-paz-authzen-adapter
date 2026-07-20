@@ -609,6 +609,61 @@ APPROVER_CONSENT_URL = os.environ.get(
 APPROVER_REGISTER_SECRET = os.environ.get("APPROVER_REGISTER_SECRET", "")
 
 
+async def _persist_stepup(su: dict) -> None:
+    """Write the PENDING resource authorisation to the directory, keyed by its code.
+
+    _STEPUPS is an in-memory dict, but the approval window is minutes long and spans a
+    container restart (a deploy mid-window wiped it: /stepup/status then 404'd forever while
+    the user had already approved). The directory is the durable store, so the step-up is
+    written at creation and rehydrated on poll. The CODE is the transaction reference, so one
+    record covers requested -> authorized rather than two."""
+    if not PROOFING_DIRECTORY_URL:
+        return
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as c:
+            await c.post(f"{PROOFING_DIRECTORY_URL}/consents", json={
+                "transaction_id": su["code"], "subject": su["subject"], "actor": su["subject"],
+                "channel": "ciba-device", "status": "requested",
+                "amount": float(su.get("amount") or 0), "currency": su.get("currency") or "AUD",
+                "debtor_account": su.get("debtor") or "",
+                "creditor_account": su.get("creditor") or "",
+                # carries what the poll needs to resume after a restart
+                "authorization_details": [{"type": "payment_initiation",
+                                           "authzType": AUTHZ_TYPE_RESOURCE,
+                                           "authReqId": su.get("auth_req_id", ""),
+                                           "transactionHash": su.get("hash", ""),
+                                           "scope": su.get("scope", "")}]})
+    except Exception as exc:  # noqa: BLE001 — never block the push
+        logger.warning("stepup persist failed for %s: %s", su.get("code"), exc)
+
+
+async def _rehydrate_stepup(code: str) -> dict | None:
+    """Rebuild an in-flight step-up from the directory after a restart."""
+    if not PROOFING_DIRECTORY_URL:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as c:
+            r = await c.get(f"{PROOFING_DIRECTORY_URL}/consents/{code}")
+        if r.status_code != 200:
+            return None
+        d = r.json()
+        det = (d.get("authorizationDetails") or d.get("authorization_details") or [{}])[0]
+        su = {"code": code, "txn": code, "subject": d.get("subject", ""),
+              "amount": str(d.get("amount") or ""), "currency": d.get("currency") or "AUD",
+              "debtor": d.get("debtorAccount") or "", "creditor": d.get("creditorAccount") or "",
+              "scope": det.get("scope", ""), "hash": det.get("transactionHash", ""),
+              "auth_req_id": det.get("authReqId", ""),
+              "authz_type": AUTHZ_TYPE_RESOURCE,
+              "status": "approved" if d.get("status") == "authorized" else "pending",
+              "created": int(time.time())}
+        _STEPUPS[code] = su
+        logger.info("rehydrated step-up %s from the directory after restart", code)
+        return su
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("stepup rehydrate failed for %s: %s", code, exc)
+        return None
+
+
 async def _register_for_device(su: dict) -> None:
     """Publish the pending RESOURCE AUTHORISATION where the approver app resolves pushed codes.
     The app reads consent detail from the autonomous-agent, not from here, so without this the
@@ -738,6 +793,7 @@ async def stepup_begin(request: Request):
     await _register_for_device(su)                  # so the phone can resolve the code
     pushed, detail = await _ciba_push(subject, code)
     su["auth_req_id"] = detail if pushed else ""    # needed to poll for the approval
+    await _persist_stepup(su)                       # survive a restart mid-approval
     if not pushed:
         logger.warning("stepup ciba push failed for %s: %s", subject, detail)
         return {"mode": "local", "assurance": ASSURANCE_APP_ASSERTED, "bound": False,
@@ -808,7 +864,7 @@ async def stepup_status(code: str):
     autonomous-agent — it never calls /stepup/approve, so waiting for that alone left the
     browser polling forever after a successful approval. We ask the AS instead: CIBA is
     defined as the client polling the token endpoint for the outcome."""
-    su = _STEPUPS.get(code)
+    su = _STEPUPS.get(code) or await _rehydrate_stepup(code)
     if not su:
         return JSONResponse(status_code=404, content={"error": "unknown code"})
 
@@ -822,8 +878,12 @@ async def stepup_status(code: str):
             su.setdefault("assurance", ASSURANCE_DEVICE_APPROVED)
             su["approved_at"] = int(time.time())
             logger.info("stepup %s approved on device (assurance=%s)", code, su["assurance"])
-            await _record_stepup_consent(
-                {**su, "channel": "ciba-device"}, su["subject"])
+            try:
+                async with httpx.AsyncClient(timeout=8.0) as c:
+                    await c.patch(f"{PROOFING_DIRECTORY_URL}/consents/{code}",
+                                  json={"status": "authorized"})
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("consent advance failed for %s: %s", code, exc)
         elif outcome in ("denied", "expired"):
             su["status"] = outcome
             logger.info("stepup %s %s on device", code, outcome)
@@ -1064,6 +1124,7 @@ async def login(request: Request):
             await _register_for_device(su)          # so the phone can resolve the code
             pushed, detail = await _ciba_push(subject, code)
             su["auth_req_id"] = detail if pushed else ""   # needed to poll for the approval
+            await _persist_stepup(su)                       # survive a restart mid-approval
             if pushed:
                 logger.info("stepup -> CIBA device push subject=%s code=%s", subject, code)
                 return HTMLResponse(_STEPUP_WAIT_HTML
