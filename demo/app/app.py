@@ -216,7 +216,11 @@ async def proofing_status(session_id: str, request: Request):
     s = _session(request)
     if not s:
         return JSONResponse(status_code=401, content={"error": "login_required"})
-    subject = s.get("sub") or "alice"
+    subject = s.get("sub") or ""
+    if not subject:
+        # Never substitute a default subject. In a system whose whole claim is WHO
+        # authorised WHAT, a fallback manufactures a wrong answer instead of refusing.
+        return JSONResponse(status_code=401, content={"error": "no_subject"})
     try:
         async with httpx.AsyncClient(timeout=15.0, verify=False) as c:
             r = await c.get(f"{VERIFIER_URL}/verify/status/{session_id}")
@@ -302,7 +306,9 @@ async def proofing_begin(request: Request, user: str = ""):
     s = _session(request)
     if not s and not user:
         return JSONResponse(status_code=401, content={"error": "login_required"})
-    subject = (s.get("sub") if s else None) or user.strip().lower() or "alice"
+    subject = (s.get("sub") if s else None) or user.strip().lower()
+    if not subject:
+        return JSONResponse(status_code=401, content={"error": "no_subject"})
     # The proofing is scoped to the SPECIFIC account being originated (its type, e.g.
     # "savings") — carried from the identity challenge's open_account arguments. A
     # proofing for one account does not satisfy the gate for another.
@@ -560,8 +566,13 @@ async def _device_paired(user: str) -> bool:
             r = await c.get(f"{PROOFING_DIRECTORY_URL}/scim/v2/Users",
                             params={"filter": f'userName eq "{user}"'})
             for u in (r.json().get("Resources") or []):
-                ext = u.get("urn:idpartners:params:scim:schemas:extension:2.0:User") or {}
-                return bool(ext.get("devicePaired"))
+                # Read the extension by SHAPE, not by a hardcoded URN. The directory emits
+                # urn:idpartners:scim:1.0:BankUser; hardcoding a different URN here made this
+                # silently return False for EVERY user, so nobody ever took the device path.
+                for k, v in u.items():
+                    if k.startswith("urn:") and isinstance(v, dict) and "devicePaired" in v:
+                        return bool(v.get("devicePaired"))
+                return False
     except Exception as exc:  # noqa: BLE001
         logger.warning("device-paired lookup failed for %s: %s", user, exc)
     return False  # fail to the LOCAL path: never assume a device exists

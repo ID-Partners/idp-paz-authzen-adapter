@@ -210,7 +210,10 @@ async def agent_events(prompt: str, session_id: str = "demo",
     # target as `customer_id`, honoured ONLY for staff principals; a customer
     # principal can never act on anyone but themselves. The Bank API applies the
     # same rule server-side (staff principals may act on a customer, audited).
-    sub = _token_sub(principal.token) or _token_sub(user_token) or "alice"
+    # No default subject: if neither token carries a sub we do not know who is acting,
+    # and guessing attributes someone else's payment to them. Empty flows through to the
+    # PDP, which denies — a refusal is the correct outcome, not a substitution.
+    sub = _token_sub(principal.token) or _token_sub(user_token) or ""
     staff_subs = set((os.environ.get("STAFF_SUBS", "bob")).split(","))
     staff_note = ""
     if customer_id and sub in staff_subs:
