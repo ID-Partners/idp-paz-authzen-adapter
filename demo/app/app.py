@@ -369,7 +369,21 @@ async def proofing_latest(request: Request):
              if now - p.get("created", 0) < 300 and (p.get("subject") or "").lower() == du]
     if not fresh:
         return JSONResponse(status_code=404, content={"error": "no_pending_proofing"})
-    return sorted(fresh, key=lambda p: p["created"])[-1]
+    newest = sorted(fresh, key=lambda p: p["created"])[-1]
+
+    # DO NOT answer when the newest pending request for this user is a RESOURCE
+    # AUTHORISATION (a payment). The approver app asks this endpoint on ANY push whose code
+    # is not MDL-…, so a proofing from minutes ago would otherwise capture the payment push
+    # and open the mDL screen instead — observed exactly that. The app's own comment assumed
+    # "payment consents never register a proofing"; that stopped being true once payments
+    # started pushing to the same device.
+    newest_payment = max((su.get("created", 0) for su in _STEPUPS.values()
+                          if (su.get("subject") or "").lower() == du
+                          and su.get("status") == "pending"), default=0)
+    if newest_payment > newest.get("created", 0):
+        logger.info("proofing/latest yielding to a newer resource authorisation for %s", du)
+        return JSONResponse(status_code=404, content={"error": "newer_resource_authorisation"})
+    return newest
 
 
 # ── Identity roster for the approver app (proxies the SCIM directory; the app can't
@@ -537,6 +551,24 @@ async def _project_delegation_grant(subject: str, scope: str, consent_txn: str) 
 # path for high-value operations instead of silently accepting it.
 # See demo/TRANSACTION-AUTHORIZATION.md sections 2-4.
 
+# AUTHORISATION TYPE — what KIND of decision this is. Orthogonal to the assurance ladder
+# below (which says how STRONGLY it was made). The phone currently infers the type from a
+# code prefix and a fallback lookup, which is why a payment push can be read as a proofing
+# request; carrying the type explicitly removes the guess.
+#
+#   resource_authorisation  fine-grained, a SPECIFIC protected resource (RFC 9396 RAR):
+#                           this amount, this payee, this account. A payment is this.
+#   consent                 coarse-grained or non-OAuth agreement (ToS, data sharing, scope)
+#   identity_proofing       an attribute claim to be verified (VC/VP, mDL)
+#
+# NOTE: payments are recorded today under "consent"-named endpoints and the consent_covered
+# PDP attribute. That naming predates this taxonomy and is WRONG — a payment is a resource
+# authorisation. Renaming the store/PIP is a separate change; the type is carried explicitly
+# here so the record is at least self-describing.
+AUTHZ_TYPE_RESOURCE = "resource_authorisation"   # RAR — fine-grained, a specific resource
+AUTHZ_TYPE_CONSENT = "consent"                   # coarse-grained / non-OAuth agreement
+AUTHZ_TYPE_PROOFING = "identity_proofing"        # VC/VP presentation request
+
 # assurance ladder, weakest → strongest. The PDP sees this verbatim.
 ASSURANCE_APP_ASSERTED = "app-asserted"    # local passkey; signature does NOT cover the payment
 ASSURANCE_DEVICE_APPROVED = "device-approved"  # paired device approved, but sent no signature
@@ -554,6 +586,30 @@ def _txn_hash(su: dict) -> str:
                         "creditor": su.get("creditor", "")},
                        sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(canon.encode()).hexdigest()
+
+
+APPROVER_CONSENT_URL = os.environ.get(
+    "APPROVER_CONSENT_URL", "https://autonomous-agent-staging.up.railway.app").rstrip("/")
+APPROVER_REGISTER_SECRET = os.environ.get("APPROVER_REGISTER_SECRET", "")
+
+
+async def _register_for_device(su: dict) -> None:
+    """Publish the pending RESOURCE AUTHORISATION where the approver app resolves pushed codes.
+    The app reads consent detail from the autonomous-agent, not from here, so without this the
+    phone receives the push and finds nothing for the code."""
+    try:
+        headers = {"X-Register-Secret": APPROVER_REGISTER_SECRET} if APPROVER_REGISTER_SECRET else {}
+        async with httpx.AsyncClient(timeout=8.0) as c:
+            r = await c.post(f"{APPROVER_CONSENT_URL}/consent", headers=headers, json={
+                "code": su["code"], "approver": su["subject"], "paymentId": su["txn"],
+                "transactionId": su["txn"], "amount": su.get("amount") or 0,
+                "currency": su.get("currency") or "AUD",
+                "debtorAccount": su.get("debtor") or "",
+                "creditorAccount": su.get("creditor") or "",
+                "requestedBy": "Demo Bank (interactive step-up)"})
+            logger.info("registered step-up %s for device: %s", su["code"], r.status_code)
+    except Exception as exc:  # noqa: BLE001 — never block the push
+        logger.warning("device registration failed for %s: %s", su.get("code"), exc)
 
 
 async def _device_paired(user: str) -> bool:
@@ -602,8 +658,10 @@ async def stepup_begin(request: Request):
 
     code = "PAY-" + secrets.token_hex(3)  # ≤20 chars, CIBA binding_message charset-safe
     su.update({"code": code, "txn": "txn_" + secrets.token_hex(6),
-               "hash": _txn_hash(su), "status": "pending", "created": int(time.time())})
+               "hash": _txn_hash(su), "status": "pending", "created": int(time.time()),
+               "authz_type": AUTHZ_TYPE_RESOURCE})
     _STEPUPS[code] = su
+    await _register_for_device(su)                  # so the phone can resolve the code
     pushed, detail = await _ciba_push(subject, code)
     if not pushed:
         logger.warning("stepup ciba push failed for %s: %s", subject, detail)
@@ -623,7 +681,8 @@ async def stepup_code(code: str, request: Request):
         return JSONResponse(status_code=404, content={"error": "unknown code"})
     if user and user != su["subject"]:
         return JSONResponse(status_code=403, content={"error": "not your step-up"})
-    return {"code": code, "txn": su["txn"], "hash": su["hash"], "subject": su["subject"],
+    return {"code": code, "type": su.get("authz_type", AUTHZ_TYPE_RESOURCE),
+            "txn": su["txn"], "hash": su["hash"], "subject": su["subject"],
             "amount": su["amount"], "currency": su["currency"],
             "debtorAccount": su["debtor"], "creditorAccount": su["creditor"],
             "status": su["status"]}
@@ -900,6 +959,7 @@ async def login(request: Request):
                        "hash": _txn_hash(su), "status": "pending",
                        "created": int(time.time())})
             _STEPUPS[code] = su
+            await _register_for_device(su)          # so the phone can resolve the code
             pushed, detail = await _ciba_push(subject, code)
             if pushed:
                 logger.info("stepup -> CIBA device push subject=%s code=%s", subject, code)

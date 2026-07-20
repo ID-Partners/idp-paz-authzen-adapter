@@ -146,6 +146,10 @@ def _binding(p: dict) -> str:
 # the trigger, the rich consent screen is an out-of-band fetch. The code doubles as the
 # binding_message so it also shows on the push banner.
 _CONSENTS: dict[str, dict] = {}
+# Optional shared secret for POST /consent (server-to-server from the BFF). Unset = open,
+# which matches the rest of this demo's posture but means anyone who can reach this service
+# can queue an approval prompt on a paired phone. Set REGISTER_SECRET in staging.
+REGISTER_SECRET = os.environ.get("REGISTER_SECRET", "")
 _CONSENT_TTL = 600  # seconds a pending consent stays fetchable
 
 
@@ -544,9 +548,54 @@ def _device_user(request: Request) -> str | None:
 # resolves it to the full consent here — device-token scoped: only the consent's own approver's
 # phone may read it. `/consent` (no code) returns that phone's latest pending consent.
 def _consent_view(c: dict) -> dict:
-    return {k: c[k] for k in ("code", "paymentId", "status", "amount", "currency",
+    return {k: c[k] for k in ("code", "paymentId", "status", "authzType", "amount", "currency",
                               "debtorAccount", "creditorAccount", "accountOwner",
                               "authorization_details", "requestedBy", "approver") if k in c}
+
+
+# The INTERACTIVE payment step-up (northwind-app) pushes to the same approver app, which
+# resolves any pushed code against THIS service's consent store. So the BFF registers its
+# pending resource authorisation here. Without it the phone gets the push, finds no consent
+# for the code, and renders an empty approval.
+#
+# TYPE: a payment is a RESOURCE AUTHORISATION (RFC 9396 RAR) — fine-grained, one specific
+# protected resource — not a coarse "consent". The endpoint keeps its historical name; the
+# record carries the type explicitly.
+@app.post("/consent")
+async def consent_register(request: Request) -> JSONResponse:
+    """Register a pending resource authorisation so the paired device can resolve its code."""
+    if REGISTER_SECRET and request.headers.get("X-Register-Secret") != REGISTER_SECRET:
+        return JSONResponse({"error": "forbidden"}, status_code=403)
+    try:
+        b = await request.json()
+    except Exception:  # noqa: BLE001
+        return JSONResponse({"error": "bad_request"}, status_code=400)
+    code = str(b.get("code") or "").strip()
+    approver = str(b.get("approver") or "").strip().lower()
+    if not code or not approver:
+        return JSONResponse({"error": "code and approver required"}, status_code=400)
+    now = time.time()
+    for k in [k for k, v in _CONSENTS.items() if now - v.get("ts", 0) > _CONSENT_TTL]:
+        _CONSENTS.pop(k, None)
+    _CONSENTS[code] = {
+        "code": code, "paymentId": str(b.get("paymentId") or code),
+        "status": "pending", "ts": now,
+        "transactionId": str(b.get("transactionId") or ""),
+        "authzType": "resource_authorisation",
+        "amount": float(b.get("amount", 0) or 0),
+        "currency": b.get("currency") or "AUD",
+        "debtorAccount": b.get("debtorAccount") or "",
+        "creditorAccount": b.get("creditorAccount") or "",
+        "accountOwner": approver,
+        "authorization_details": b.get("authorization_details") or [],
+        "requestedBy": str(b.get("requestedBy") or "Demo Bank (interactive step-up)"),
+        # The approver is WHOEVER is being asked — never a fixed demo user. The device-token
+        # scope on the read path then ensures only that person's phone can resolve it.
+        "approver": approver,
+    }
+    log.info("registered resource authorisation code=%s approver=%s amount=%s",
+             code, approver, b.get("amount"))
+    return JSONResponse({"ok": True, "code": code})
 
 
 @app.get("/consent")
