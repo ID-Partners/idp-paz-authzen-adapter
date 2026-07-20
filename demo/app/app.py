@@ -1108,6 +1108,7 @@ async def login(request: Request):
     # over CIBA — the phone shows the amount + payee it pulled from us and signs over the
     # transaction hash. Only a user with NO usable device falls through to the local
     # browser passkey, which cannot bind to the payment.
+    fallback_from_device = False
     if stepup and subject:
         qp = request.query_params
         su = {"subject": subject, "scope": stepup,
@@ -1132,17 +1133,33 @@ async def login(request: Request):
                                     .replace("__AMOUNT__", su["amount"])
                                     .replace("__CUR__", su["currency"])
                                     .replace("__TO__", su["creditor"]))
-            logger.warning("stepup push failed (%s) — falling back to local passkey", detail)
+            # PUSH FAILED for a PAIRED user. Fall back to a LOCAL check on this device rather
+            # than dead-ending — but do NOT pretend it was a clean local flow. We have LOST the
+            # cross-device security property (the approval no longer happens on a separate
+            # trusted device). Record that explicitly so:
+            #   - the audit trail shows a downgraded authorisation, not a normal one, and
+            #   - a future compensating control (a re-auth, a lower amount cap, a second factor
+            #     on THIS device) can key off channel == "local-fallback-from-device".
+            logger.warning("stepup push failed (%s) — DOWNGRADING to a local check for %s",
+                           detail, subject)
+            try:
+                async with httpx.AsyncClient(timeout=8.0) as c:
+                    await c.patch(f"{PROOFING_DIRECTORY_URL}/consents/{code}",
+                                  json={"status": "failed"})   # retire the un-pushed device record
+            except Exception:  # noqa: BLE001
+                pass
+            fallback_from_device = True
 
-    # No usable device. Capture the consent in the DaVinci flow FIRST (config-as-code,
-    # consistent with the passkey UX), then continue to the passkey ceremony which
-    # authenticates and records it. Falls through to the passkey directly if the consent
-    # flow isn't configured, so an unconfigured tenant can't dead-end the demo.
+    # No usable device (or a push that could not be delivered). Capture the consent in the
+    # DaVinci flow FIRST (config-as-code, consistent with the passkey UX), then continue to the
+    # passkey ceremony which authenticates and records it. Falls through to the passkey directly
+    # if the consent flow isn't configured, so an unconfigured tenant can't dead-end the demo.
     if stepup and subject and DAVINCI_CONSENT_POLICY_ID:
         resp = RedirectResponse("/stepup/consent", status_code=302)
         qp = request.query_params
         resp.set_cookie(STEPUP_COOKIE, _sign(
-            {"scope": stepup, "subject": subject, "channel": "davinci-consent",
+            {"scope": stepup, "subject": subject,
+             "channel": "local-fallback-from-device" if fallback_from_device else "davinci-consent",
              "amount": (qp.get("amount") or "").strip(),
              "currency": (qp.get("cur") or "AUD").strip(),
              "debtor": (qp.get("from") or "").strip(),
