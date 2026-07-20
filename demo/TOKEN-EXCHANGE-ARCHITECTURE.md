@@ -9,12 +9,13 @@ Written 2026-07-20 against the configuration in `demo/pingfederate/terraform/`,
 
 ---
 
-## 1. Two token planes
+## 1. Two kinds of token
 
-PingFederate issues two different types of token from the same token exchange processor
-policy (`userToAgentTE`).
+PingFederate issues two different kinds of token from the same token exchange processor
+policy (`userToAgentTE`). This document calls them the banking token and the events
+token.
 
-| | Banking plane (nest) | Events plane (flatten) |
+| | Banking token (nest) | Events token (flatten) |
 |---|---|---|
 | `sub` | `alice`, the human user | `urn:agent:northwind-concierge:v1`, an agent |
 | `act` | nested agent chain | not present |
@@ -22,12 +23,12 @@ policy (`userToAgentTE`).
 | ATM | `attestJwtPmts` / `attestJwtAcct` / `attestJwtATM` | `eventsFlatJwtATM` |
 | Lifetime | 720s | 120s |
 
-Both types are issued by the same issuer, from the same processor policy, using the same
+Both kinds are issued by the same issuer, from the same processor policy, using the same
 subject token. The `resource` parameter in the exchange request (RFC 8707) determines
-which of the two types PingFederate returns.
+which of the two PingFederate returns.
 
-The `sub` claim therefore means different things on the two planes. On the banking plane
-`sub` is the human user. On the events plane `sub` is an agent. A resource server that
+The `sub` claim therefore means different things in the two tokens. In a banking token
+`sub` is the human user. In an events token `sub` is an agent. A resource server that
 reads `sub` without also checking `aud` will treat an agent as if it were the human user.
 The event sink checks both (`demo/event-sink/app.py`).
 
@@ -127,21 +128,8 @@ policy does expose the inbound `act` as `tepp.act`, and the policy passes it thr
 no mapping reads it. If a payments token were issued directly from Alice's login token,
 the `act` claim would still say the request came through the concierge.
 
-### The one `act` value that is calculated
-
-`entra-agents.tf:119-126` contains the only OGNL expression that builds an `act` claim at
-runtime:
-
-```hcl
-"act" = {
-  source = { type = "EXPRESSION" }
-  value  = "\"{\\\"sub\\\":\\\"\" + #this.get(\"context.ClientId\") + \"\\\"}\""
-}
-```
-
-This produces a single-level `act` claim. The comment in the file explains why nothing
-deeper is calculated: PingFederate 13.x rejects OGNL expressions that reference the
-inbound `act`. `ClientId` works because it is an ordinary context attribute.
+No `act` value on either the payments or the account mapping is calculated at runtime.
+Both are fixed strings.
 
 ---
 
@@ -248,11 +236,10 @@ only, `generated_adopt.tf:82` sets:
 restrict_to_default_access_token_manager = false
 ```
 
-The concierge client (`generated_agents.tf:82`), the account client
-(`generated_agents.tf:173`) and both Entra clients (`entra-agents.tf:150`) set this to
-`true`. Those clients cannot reach the flatten token manager even if they send the
-`resource` parameter. This single setting is the only control over which clients can
-flatten.
+The concierge client (`generated_agents.tf:82`) and the account client
+(`generated_agents.tf:173`) set this to `true`. Those clients cannot reach the flatten
+token manager even if they send the `resource` parameter. This single setting is the only
+control over which clients can flatten.
 
 The receiving service checks the result. `_verify_flattened()` in
 `demo/event-sink/app.py:48` rejects a token that still carries an `act` claim, and
@@ -273,7 +260,7 @@ and a policy named "Event-endpoint flatten governance":
 Three decision tests are recorded. A request for the events audience from the payments
 client returns PERMIT. The same request from the account client returns DENY. A normal
 banking request with no audience returns NOT_APPLICABLE, because the audience attribute
-has `defaultValue=""` and so the rule cannot affect the banking plane under
+has `defaultValue=""` and so the rule cannot affect ordinary banking requests under
 `DenyOverrides`.
 
 Under this approach the agent proposes the root actor and PingAuthorize decides whether
@@ -293,7 +280,6 @@ centralized signing key, and `typ: at+jwt`.
 | `attestJwtATM` | data.zip only | `sub, act, client_id` | none | 720 |
 | `attestJwtPmts` | `generated_adopt.tf:289` | `sub, act, client_id` | `.../bank` | 720 |
 | `attestJwtAcct` | `generated_adopt.tf:96` | `sub, act, client_id` | `.../bank` | 720 |
-| `attestJwtEntra` | `entra-agents.tf:28` | `sub, act, client_id` | `.../bank` | 720 |
 | `eventsFlatJwtATM` | `flatten.tf:17` | `sub, client_id` | `.../events` | 120 |
 
 The `acr` claim appears only on `userJwtATM`, which is the token issued when a human logs
@@ -325,7 +311,7 @@ which resolves to:
 ```
 
 PingFederate applies this as a token authorization issuance criterion on `te_payments`,
-`te_account`, `te_entra`, `te_events` and the three `client_credentials` mappings, with
+`te_account`, `te_events` and the three `client_credentials` mappings, with
 `ErrorResult="attestation_validation_failed"`.
 
 The implementation is a prebuilt jar, `demo/pingfederate/pf-oidf-modules.jar`. It reads
@@ -741,9 +727,10 @@ tests request construction and JSON-RPC error handling, not policy content.
    concierge URN regardless of the incoming chain. If the payments agent were invoked
    through a different root agent, the flattened token would still name the concierge.
 
-2. **The nested `act` is also a fixed string.** Every banking-plane `act` value encodes an
-   assumed topology of concierge to payments or account. The real inbound `act` is
-   available in the processor policy and is not used.
+2. **The nested `act` is also a fixed string.** Every `act` value in a banking token
+   assumes the request came from the concierge to either the payments agent or the
+   account agent. The real inbound `act` is available in the processor policy and is not
+   used.
 
 3. **Only one level of the actor chain reaches the policy.** PingFederate produces
    `act.act`, no PEP reads it, and no rule references it. The only code that recovers the
