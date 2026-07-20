@@ -356,9 +356,24 @@ async def agent_events(prompt: str, session_id: str = "demo",
                 # consents to at PingFederate — consent to THIS payment, governed
                 # by Ping Authorize at issuance, not just to a coarse scope.
                 pay = tu.input if tu.name == "make_payment" else None
+                # A scoped resume: by the time a PAYMENT is blocked, any earlier step in the
+                # prompt (e.g. opening the account) has ALREADY completed — that is how we
+                # reached the payment. Replaying the whole prompt re-runs the finished
+                # origination and re-fires its (now consumed) mDL gate. So resume ONLY the
+                # payment, explicitly forbidding other actions.
+                resume_prompt = None
+                if pay:
+                    amt = pay.get("amount"); cur = pay.get("currency") or "AUD"
+                    frm = pay.get("from_account") or pay.get("from") or ""
+                    to = pay.get("to_account") or pay.get("to") or ""
+                    resume_prompt = (
+                        f"The step-up approval is complete. Make ONLY this one payment and take "
+                        f"no other action — do NOT open any account or start anything else: "
+                        f"transfer {amt} {cur}" + (f" from {frm}" if frm else "") +
+                        (f" to {to}" if to else "") + ".")
                 yield {"type": "scope_challenge", "role": route["role"],
                        "agent_label": route["label"], "scope": scope, "pep": sc.get("pep"),
-                       "tool": tu.name, "payment": pay,
+                       "tool": tu.name, "payment": pay, "resume_prompt": resume_prompt,
                        "detail": sc.get("detail", "A step-up scope is required.")}
                 yield {"type": "final", "session_id": session_id,
                        "final": f"🔒 That transfer needs your approval for the '{scope}' scope. "
