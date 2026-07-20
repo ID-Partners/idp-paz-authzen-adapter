@@ -614,7 +614,8 @@ localStorage.setItem('bankagent_sid', SID);
 // --- Principal login (real OIDC via the BFF) ---------------------------------
 // The BFF holds the session in an httponly cookie; the browser sends it
 // automatically (same origin), so app calls need no bearer header. Sign-in is a
-// redirect to PingFederate (button → /login → PF → /callback → back here).
+// PASSKEY ceremony (button → /login → /signup → WebAuthn → signupTE → back here);
+// there is no password page and no authorization-code redirect.
 // The app is NOT gated: Alice can browse and even ask the agent while signed
 // out — the gateway (__GATEWAY__ PEP #1) is what requires a logged-in user and pushes
 // back a login challenge, which redirects her to PingFederate. The header shows

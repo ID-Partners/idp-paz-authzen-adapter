@@ -9,8 +9,8 @@ Alice's identity and her PF access token so the downstream gateway can enforce
 that a real user is logged in (RFC 9470 step-up challenge — see Phase 3).
 
     GET  /                → the web UI
-    GET  /login           → redirect to PingFederate (authorization code + PKCE)
-    GET  /callback        → exchange the code, establish the session, back to /
+    GET  /login           → start the PASSKEY ceremony (/signup); ?stepup carries the
+                            elevated scope + the payment across it in a signed cookie
     GET  /me              → the signed-in principal (or 401)
     POST /logout          → clear the session
     POST /stream          → proxy (SSE) to the principal agent, carrying Alice's identity
@@ -52,9 +52,8 @@ PF_AUTHORIZE = os.environ.get("PF_AUTHORIZE_URL", PF_BASE + "/as/authorization.o
 PF_TOKEN = os.environ.get("PF_TOKEN_URL", PF_BASE + "/as/token.oauth2")
 OIDC_CLIENT_ID = os.environ.get("OIDC_CLIENT_ID", "northwind-webapp")
 OIDC_CLIENT_SECRET = os.environ.get("OIDC_CLIENT_SECRET", "webapp-secret-123")
-# This app's own public base URL — the redirect_uri is <APP_BASE_URL>/callback.
+# This app's own public base URL.
 APP_BASE_URL = os.environ.get("APP_BASE_URL", "http://localhost:8090").rstrip("/")
-REDIRECT_URI = APP_BASE_URL + "/callback"
 # The headless principal agent (private network).
 PRINCIPAL_AGENT_URL = os.environ.get("PRINCIPAL_AGENT_URL",
                                      "http://bank-agent.railway.internal:8000").rstrip("/")
@@ -65,7 +64,6 @@ SESSION_TTL = int(os.environ.get("SESSION_TTL", "28800"))  # 8h
 DEFAULT_SCOPES = os.environ.get("DEFAULT_SCOPES",
                                 "openid banking:accounts:list banking:accounts:originate")
 SESSION_COOKIE = "nw_session"
-TX_COOKIE = "nw_oidc_tx"  # short-lived: holds PKCE verifier + state during the redirect
 STEPUP_COOKIE = "nw_stepup"  # short-lived: carries the requested step-up scope across the passkey ceremony
 
 
@@ -146,8 +144,6 @@ def health():
     return {"status": "ok"}
 
 
-PF_PAR = os.environ.get("PF_PAR_URL", PF_BASE + "/as/par.oauth2")
-RAR_TYPE = os.environ.get("PAYMENT_RAR_TYPE", "payment_initiation")
 
 # The OID4VP verifier that runs the mDL identity-proofing presentation (idp-pf-vcs — a
 # different Railway project, so reached over its PUBLIC URL) and the proofing directory
@@ -438,52 +434,6 @@ async def identities_pairing(user_name: str, request: Request):
                                                       "detail": str(e)})
 
 
-def _payment_rar(request: Request) -> list | None:
-    """Build an RFC 9396 authorization_details entry from the step-up payment
-    params, so Alice consents to THIS specific payment at PingFederate (governed
-    by Ping Authorize at issuance) rather than to a coarse scope."""
-    amount = (request.query_params.get("amount") or "").strip()
-    if not amount:
-        return None
-    try:
-        amt = float(amount)
-    except ValueError:
-        return None
-    return [{
-        "type": RAR_TYPE,
-        "purpose": RAR_TYPE,                       # dot-free marker the PAZ policy reads
-        "amount": amt,
-        "currency": (request.query_params.get("cur") or "AUD").strip(),
-        "debtorAccount": (request.query_params.get("from") or "").strip(),
-        "creditorAccount": (request.query_params.get("to") or "").strip(),
-        # The consent's TRANSACTION ID: minted here, recorded in the consent directory,
-        # and carried inside the authorization_details through PAR → PF → the issued
-        # token → the gateways → the payments RS, which stamps the executed payment
-        # with it. This is the consent→grant→token→action audit link.
-        "transactionId": "txn_" + secrets.token_hex(6),
-    }]
-
-
-async def _record_consent(rar: list, subject: str, status: str = "requested") -> None:
-    """Persist the payment authorization consent to the directory (best-effort)."""
-    if not rar:
-        return
-    e = rar[0]
-    try:
-        async with httpx.AsyncClient(timeout=8.0) as c:
-            await c.post(f"{PROOFING_DIRECTORY_URL}/consents", json={
-                "transaction_id": e.get("transactionId"),
-                "subject": subject, "actor": subject, "channel": "rar-stepup",
-                "amount": e.get("amount"), "currency": e.get("currency"),
-                "debtor_account": e.get("debtorAccount"),
-                "creditor_account": e.get("creditorAccount"),
-                "authorization_details": [
-                    {k: v for k, v in d.items() if k != "_principal_sub"} for d in rar],
-                "status": status})
-    except Exception:  # noqa: BLE001 — consent persistence must never block the login
-        pass
-
-
 async def _record_stepup_consent(su: dict, subject: str) -> str:
     """Record the passkey step-up payment as an AUTHORIZED consent in the consent directory.
 
@@ -537,13 +487,18 @@ async def _project_delegation_grant(subject: str, scope: str, consent_txn: str) 
 
 @app.get("/login")
 async def login(request: Request):
-    """Kick off the OIDC authorization-code + PKCE flow at PingFederate.
+    """Send the user to the PASSKEY ceremony (/signup) — the only authentication path.
 
-    By default Alice consents to the everyday scopes. A `?stepup=<scope>` request
-    is a step-up: it adds the elevated scope (e.g. banking:payments:transfer) and
-    forces re-authentication (prompt=login) — RFC 9470 step-up for a risky action.
-    For a payment, the specific operation is attached as RFC 9396 authorization_details
-    and pushed via PAR (RFC 9126) so Alice consents to THIS payment at the AS.
+    A `?stepup=<scope>` request is a step-up (RFC 9470) for a risky action: the elevated
+    scope AND the specific payment ride across the ceremony in a short-lived signed cookie,
+    and the scope is granted on the signupTE exchange in the passkey-finish handler.
+
+    NOTE — no RAR here. The PF authorization-code + PAR (RFC 9126) + RFC 9396
+    authorization_details step-up was REMOVED when this went passwordless, so the payment
+    detail does NOT reach the token. The PDP instead reads a recorded consent via the
+    ConsentDirectory policy-information provider — which is app-asserted and NOT
+    non-repudiable. See demo/TRANSACTION-AUTHORIZATION.md sections 2 and 6; restoring real
+    binding is the CIBA + RAR work in section 6 step 2.
     """
     stepup = (request.query_params.get("stepup") or "").strip()
     # BOTH the front door AND the payment step-up are now PASSWORDLESS via the same WebAuthn
@@ -573,58 +528,6 @@ async def login(request: Request):
                    "creditor": (qp.get("to") or "").strip()}
         resp.set_cookie(STEPUP_COOKIE, _sign(payload, 600),
                         httponly=True, secure=True, samesite="lax", max_age=600)
-    return resp
-
-
-@app.get("/callback")
-async def callback(request: Request):
-    """Handle the redirect back from PingFederate: exchange the code, set the session."""
-    tx = _verify(request.cookies.get(TX_COOKIE))
-    code = request.query_params.get("code")
-    state = request.query_params.get("state")
-    if not tx or not code or state != tx.get("state"):
-        return JSONResponse(status_code=400, content={"error": "invalid login state"})
-    try:
-        async with httpx.AsyncClient(timeout=20.0, verify=False) as c:
-            tr = await c.post(PF_TOKEN, data={
-                "grant_type": "authorization_code", "code": code,
-                "redirect_uri": REDIRECT_URI, "client_id": OIDC_CLIENT_ID,
-                "client_secret": OIDC_CLIENT_SECRET, "code_verifier": tx["v"]})
-            tr.raise_for_status()
-            tok = tr.json()
-    except Exception as exc:  # noqa: BLE001
-        return JSONResponse(status_code=502, content={"error": f"token exchange failed: {exc}"})
-
-    # We received the tokens directly from PF over TLS in the code exchange, so we
-    # trust them without re-verifying the signature (demo BFF).
-    id_claims = jwt.decode(tok["id_token"], options={"verify_signature": False}) \
-        if tok.get("id_token") else {}
-    sub = id_claims.get("sub", "alice")
-    pf_access = tok.get("access_token", "")
-    at_claims = {}
-    if pf_access.count(".") == 2:
-        at_claims = jwt.decode(pf_access, options={"verify_signature": False})
-    session = {"sub": sub, "name": id_claims.get("name") or sub,
-               "acr": at_claims.get("acr"), "pf_at": pf_access}
-
-    # The issued token carrying our authorization_details = Alice consented at PF and
-    # the RAR passed governance. Advance the consent record(s) to 'authorized' by the
-    # transaction id riding in the details (best-effort; never blocks the login).
-    for d in (at_claims.get("authorization_details") or []):
-        txn = isinstance(d, dict) and d.get("transactionId")
-        if txn:
-            try:
-                async with httpx.AsyncClient(timeout=8.0) as c:
-                    await c.patch(f"{PROOFING_DIRECTORY_URL}/consents/{txn}", json={
-                        "status": "authorized",
-                        "authorization_details": at_claims["authorization_details"]})
-            except Exception:  # noqa: BLE001
-                pass
-
-    resp = RedirectResponse("/", status_code=302)
-    resp.set_cookie(SESSION_COOKIE, _sign(session, SESSION_TTL),
-                    httponly=True, secure=True, samesite="lax", max_age=SESSION_TTL)
-    resp.delete_cookie(TX_COOKIE)
     return resp
 
 
