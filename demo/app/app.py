@@ -691,6 +691,12 @@ font-size:11px;display:flex;align-items:center;justify-content:center;gap:7px}.v
 <div class="card">
   <div class="brand">🏦 Demo Bank</div>
   <div class="sub">Payment approval — presented by <b>PingOne DaVinci</b>.</div>
+  <div id="detail" style="background:#141a22;border:1px solid #2a323c;border-radius:10px;
+       padding:16px;margin-bottom:16px">
+    <div id="amt" style="font-size:26px;font-weight:600"></div>
+    <div id="to" style="color:#9aa5b1;font-size:13px;margin-top:4px"></div>
+    <div id="from" style="color:#6b7684;font-size:12px;margin-top:2px"></div>
+  </div>
   <div id="widget"></div>
   <div id="msg"></div>
   <div class="vendor">Powered by <img src="/static/idp-wordmark.svg" alt="ID Partners"></div>
@@ -703,11 +709,18 @@ async function run(){
   try { cfg = await fetch('/stepup/consent/token').then(r=>r.json()); }
   catch(e){ msg('Could not reach the flow service.'); return; }
   if(cfg.error){ msg('Consent flow is not configured.'); return; }
+  const p = cfg.parameters || {};
+  document.getElementById('amt').textContent  = (p.currency||'') + ' ' + (p.amount||'');
+  document.getElementById('to').textContent   = p.creditor ? ('to ' + p.creditor) : '';
+  document.getElementById('from').textContent = p.debtor ? ('from ' + p.debtor) : '';
   if(!window.davinci || !window.davinci.skRenderScreen){ msg('Widget SDK failed to load.'); return; }
   window.davinci.skRenderScreen(document.getElementById('widget'), {
+    // NOTE: no `parameters` key here. DaVinci rejects unknown keys in the runFlow body
+    // ("Flow error: Body contains additional parameters"), the same way PUT /flows rejects
+    // extra properties. The payment detail is rendered by THIS page instead (below); the
+    // flow owns the decision, not the display, until the flow fetches the detail itself.
     config: { method:'runFlow', apiRoot: cfg.apiRoot, accessToken: cfg.accessToken,
-              companyId: cfg.companyId, policyId: cfg.policyId,
-              parameters: cfg.parameters },
+              companyId: cfg.companyId, policyId: cfg.policyId },
     useModal: false,
     successCallback: async function(response){
       try {
