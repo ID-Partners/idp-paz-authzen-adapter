@@ -319,9 +319,15 @@ async def proofing_begin(request: Request, user: str = ""):
     except Exception:  # noqa: BLE001 — body is optional
         pass
     account = (account or request.query_params.get("account", "")).strip().lower()
+    # Same branch as the payment step-up: paired device -> cross-device push into the wallet
+    # app2app; no device -> SAME-DEVICE Digital Credentials API picker. Never a QR, because a
+    # user with no paired phone cannot scan one.
+    channel = await _authz_channel(subject)
+    start_path = "/verify/start" if channel == "device" else "/verify/start/dcapi"
     try:
         async with httpx.AsyncClient(timeout=15.0, verify=False) as c:
-            r = await c.post(f"{VERIFIER_URL}/verify/start", json={"credential": "mdl"})
+            r = await c.post(f"{VERIFIER_URL}{start_path}",
+                             json={"credential": "mdl"} if channel == "device" else {})
             r.raise_for_status()
             v = r.json()
     except Exception as e:
@@ -331,9 +337,19 @@ async def proofing_begin(request: Request, user: str = ""):
     _PROOFINGS[code] = {"code": code, "session_id": v.get("session_id"),
                         "request_uri": v.get("request_uri"), "subject": subject,
                         "doctype": PROOFING_DOCTYPE, "account": account,
+                        "authz_type": AUTHZ_TYPE_PROOFING, "channel": channel,
                         "created": int(time.time())}
+    if channel == "local":
+        # Nothing to push: hand the browser the DC-API request so the OS wallet picker opens
+        # on THIS device. dcApiRequest is what navigator.credentials.get() consumes.
+        logger.info("proofing -> LOCAL dc-api (no paired device) subject=%s code=%s", subject, code)
+        return {"code": code, "session_id": v.get("session_id"),
+                "type": AUTHZ_TYPE_PROOFING, "channel": "local",
+                "dcApiRequest": v.get("dcApiRequest") or v.get("request"),
+                "subject": subject, "account": account}
     pushed, detail = await _ciba_push(subject, code)
     return {"code": code, "session_id": v.get("session_id"),
+            "type": AUTHZ_TYPE_PROOFING, "channel": "device",
             "push": "sent" if pushed else "failed", "push_detail": detail if not pushed else "",
             "subject": subject, "account": account}
 
@@ -612,6 +628,22 @@ async def _register_for_device(su: dict) -> None:
         logger.warning("device registration failed for %s: %s", su.get("code"), exc)
 
 
+async def _authz_channel(user: str) -> str:
+    """Which channel should carry an authorisation request for this user?
+
+        "device"  a paired authenticator exists -> CIBA push, cross-device
+        "local"   no usable authenticator      -> do it HERE, on this device
+
+    ONE decision for every authorisation type (resource_authorisation, consent,
+    identity_proofing) so the branch cannot drift per flow — /proofing/begin used to push
+    unconditionally, which sent a device-less user a notification that could never arrive.
+
+    Local must mean SAME-DEVICE, never a QR to a second device: if the user has no phone
+    paired, telling them to scan something with a phone is the one instruction guaranteed
+    not to help. For mDL that means the browser's Digital Credentials API picker."""
+    return "device" if await _device_paired(user) else "local"
+
+
 async def _device_paired(user: str) -> bool:
     """Does this user have a usable (paired) authenticator right now? The identity store
     is the record; /identities/{user}/reconcile refreshes it from PingOne."""
@@ -650,7 +682,7 @@ async def stepup_begin(request: Request):
           "amount": str(body.get("amount") or ""), "currency": body.get("currency") or "AUD",
           "debtor": body.get("from") or "", "creditor": body.get("to") or ""}
 
-    if not await _device_paired(subject):
+    if await _authz_channel(subject) != "device":
         # No usable authenticator → local passkey. Labelled as the weaker path.
         return {"mode": "local", "assurance": ASSURANCE_APP_ASSERTED, "bound": False,
                 "reason": "no paired device",
@@ -953,7 +985,7 @@ async def login(request: Request):
               "currency": (qp.get("cur") or "AUD").strip(),
               "debtor": (qp.get("from") or "").strip(),
               "creditor": (qp.get("to") or "").strip()}
-        if await _device_paired(subject):
+        if await _authz_channel(subject) == "device":
             code = "PAY-" + secrets.token_hex(3)
             su.update({"code": code, "txn": "txn_" + secrets.token_hex(6),
                        "hash": _txn_hash(su), "status": "pending",
