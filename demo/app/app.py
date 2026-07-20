@@ -637,6 +637,107 @@ async def stepup_status(code: str):
             "assurance": su.get("assurance", "")}
 
 
+# The DaVinci-hosted consent screen, used on the NO-DEVICE path. The amount and payee are
+# rendered by a DaVinci flow (config-as-code, demo/davinci/) rather than by this app, so the
+# consent screen is owned by the orchestration layer and is consistent with the passkey UX.
+#
+# ASSURANCE: this changes WHERE consent is captured, not what the signature covers. The
+# browser passkey that follows still signs a RANDOM challenge, so this path remains
+# app-asserted and NOT non-repudiable. Only the paired-device path binds (see _txn_hash).
+# demo/TRANSACTION-AUTHORIZATION.md sections 2 and 6.
+DAVINCI_CONSENT_POLICY_ID = os.environ.get(
+    "DAVINCI_CONSENT_POLICY_ID", "122354553b1301f114619a576c4e57fc")
+
+_DAVINCI_CONSENT_HTML = """<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Approve payment — Demo Bank</title>
+<style>body{font-family:-apple-system,system-ui,sans-serif;background:#101418;color:#e8e8e8;
+display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}
+.card{background:#1a2027;border:1px solid #2a323c;border-radius:14px;padding:28px;width:420px}
+.brand{font-size:20px;font-weight:700;margin:0 0 4px}
+.sub{color:#9aa5b1;font-size:13px;margin:0 0 18px}
+#widget{min-height:200px}#msg{font-size:13px;margin-top:12px;min-height:18px;color:#ff8b7b}
+.vendor{margin-top:18px;padding-top:14px;border-top:1px solid #2a323c;color:#9aa5b1;
+font-size:11px;display:flex;align-items:center;justify-content:center;gap:7px}.vendor img{height:18px}</style>
+</head><body>
+<div class="card">
+  <div class="brand">🏦 Demo Bank</div>
+  <div class="sub">Payment approval — presented by <b>PingOne DaVinci</b>.</div>
+  <div id="widget"></div>
+  <div id="msg"></div>
+  <div class="vendor">Powered by <img src="/static/idp-wordmark.svg" alt="ID Partners"></div>
+</div>
+<script src="__ASSETS__/davinci/latest/davinci.js"></script>
+<script>
+const msg = t => { document.getElementById('msg').textContent = t || ''; };
+async function run(){
+  let cfg;
+  try { cfg = await fetch('/stepup/consent/token').then(r=>r.json()); }
+  catch(e){ msg('Could not reach the flow service.'); return; }
+  if(cfg.error){ msg('Consent flow is not configured.'); return; }
+  if(!window.davinci || !window.davinci.skRenderScreen){ msg('Widget SDK failed to load.'); return; }
+  window.davinci.skRenderScreen(document.getElementById('widget'), {
+    config: { method:'runFlow', apiRoot: cfg.apiRoot, accessToken: cfg.accessToken,
+              companyId: cfg.companyId, policyId: cfg.policyId,
+              parameters: cfg.parameters },
+    useModal: false,
+    successCallback: async function(response){
+      try {
+        const r = await fetch('/stepup/consent/finish', {method:'POST',
+          headers:{'content-type':'application/json'},
+          body: JSON.stringify(response||{})}).then(r=>r.json());
+        location.href = r.next || '/';
+      } catch(e){ msg('Could not record the decision: '+e.message); }
+    },
+    errorCallback: function(e){ msg('Flow error: '+(e && e.message ? e.message : JSON.stringify(e))); }
+  });
+}
+run();
+</script></body></html>"""
+
+
+@app.get("/stepup/consent")
+async def stepup_consent(request: Request):
+    """Render the DaVinci consent screen for the pending step-up (no-device path)."""
+    if not _verify(request.cookies.get(STEPUP_COOKIE)):
+        return RedirectResponse("/", status_code=302)
+    return HTMLResponse(_DAVINCI_CONSENT_HTML.replace("__ASSETS__", DAVINCI_ASSETS_ROOT))
+
+
+@app.get("/stepup/consent/token")
+async def stepup_consent_token(request: Request):
+    """sdkToken + the payment the flow must display. The SK API key never reaches JS."""
+    su = _verify(request.cookies.get(STEPUP_COOKIE)) or {}
+    if not DAVINCI_CONSENT_POLICY_ID:
+        return JSONResponse(status_code=502, content={"error": "consent_policy_unconfigured"})
+    tok = await _davinci_sdktoken()
+    if not tok:
+        return JSONResponse(status_code=502, content={"error": "davinci_unconfigured"})
+    return {"accessToken": tok, "companyId": DAVINCI_COMPANY_ID,
+            "policyId": DAVINCI_CONSENT_POLICY_ID, "apiRoot": DAVINCI_API_ROOT + "/",
+            "parameters": {"amount": su.get("amount", ""), "currency": su.get("currency", "AUD"),
+                           "creditor": su.get("creditor", ""), "debtor": su.get("debtor", "")}}
+
+
+@app.post("/stepup/consent/finish")
+async def stepup_consent_finish(request: Request):
+    """The DaVinci flow returned approve or decline. Approve continues to the passkey
+    ceremony, which authenticates the user and records the consent as today."""
+    su = _verify(request.cookies.get(STEPUP_COOKIE)) or {}
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        pass
+    blob = json.dumps(body).lower()
+    approved = "approve" in blob and "decline" not in blob
+    logger.info("davinci consent decision approved=%s subject=%s", approved, su.get("subject"))
+    if not approved:
+        return {"ok": False, "decision": "declined", "next": "/"}
+    hint = "?stepup=1" + (("&u=" + urllib.parse.quote(su.get("subject", ""))) if su.get("subject") else "")
+    return {"ok": True, "decision": "approved", "next": "/signup" + hint}
+
+
 @app.get("/stepup/complete")
 async def stepup_complete(code: str = ""):
     """After the device approves, elevate the browser session — same signupTE broker the
@@ -753,6 +854,22 @@ async def login(request: Request):
                                     .replace("__CUR__", su["currency"])
                                     .replace("__TO__", su["creditor"]))
             logger.warning("stepup push failed (%s) — falling back to local passkey", detail)
+
+    # No usable device. Capture the consent in the DaVinci flow FIRST (config-as-code,
+    # consistent with the passkey UX), then continue to the passkey ceremony which
+    # authenticates and records it. Falls through to the passkey directly if the consent
+    # flow isn't configured, so an unconfigured tenant can't dead-end the demo.
+    if stepup and subject and DAVINCI_CONSENT_POLICY_ID:
+        resp = RedirectResponse("/stepup/consent", status_code=302)
+        qp = request.query_params
+        resp.set_cookie(STEPUP_COOKIE, _sign(
+            {"scope": stepup, "subject": subject,
+             "amount": (qp.get("amount") or "").strip(),
+             "currency": (qp.get("cur") or "AUD").strip(),
+             "debtor": (qp.get("from") or "").strip(),
+             "creditor": (qp.get("to") or "").strip()}, 600),
+            httponly=True, secure=True, samesite="lax", max_age=600)
+        return resp
 
     hint = "?stepup=1" + (("&u=" + urllib.parse.quote(subject)) if subject else "")
     resp = RedirectResponse("/signup" + (hint if stepup else ""), status_code=302)
