@@ -937,16 +937,35 @@ def check_consent(subject: str = Query(...), creditor: str = Query(default=""),
         matches.append(r)
     covered = bool(matches)
     newest = matches[0] if matches else None
-    logger.info("consent check subject=%s creditor=%s amount=%s -> covered=%s (%d candidate(s))",
-                subject, creditor, amount, covered, len(rows))
+
+    # The assurance ACTUALLY ACHIEVED for this consent — not a fixed label. The policy reads
+    # it so a weak path cannot silently stand in for a strong one:
+    #   device-signed    a paired device signed over the transaction hash → dynamically
+    #                    linked, the artefact is retained, defensible in a dispute
+    #   device-approved  a paired device approved, but sent no signature → the tap is
+    #                    evidence of presence, NOT of what was agreed
+    #   app-asserted     browser passkey signed a RANDOM challenge; the app asserts the
+    #                    rest. NOT non-repudiable, would not satisfy PSD2 RTS Art.5.
+    assurance = "app-asserted"
+    if newest:
+        for d in (newest.get("authorization_details") or []):
+            if isinstance(d, dict) and d.get("assurance"):
+                assurance = str(d["assurance"])
+                break
+        else:
+            if str(newest.get("channel") or "") == "ciba-device":
+                assurance = "device-approved"
+
+    logger.info("consent check subject=%s creditor=%s amount=%s -> covered=%s assurance=%s "
+                "(%d candidate(s))", subject, creditor, amount, covered, assurance, len(rows))
     return {
         "covered": covered,                       # the attribute the policy reads
         "transactionId": (newest or {}).get("transaction_id"),
         "consentedAmount": (newest or {}).get("amount"),
         "creditorAccount": (newest or {}).get("creditor_account"),
         "channel": (newest or {}).get("channel"),
-        "assurance": "app-asserted",              # honest label, carried to the policy
-        "nonRepudiable": False,
+        "assurance": assurance,                   # the level achieved, carried to the policy
+        "nonRepudiable": assurance == "device-signed",
     }
 
 
