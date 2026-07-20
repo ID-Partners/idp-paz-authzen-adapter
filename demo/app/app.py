@@ -628,6 +628,48 @@ async def _register_for_device(su: dict) -> None:
         logger.warning("device registration failed for %s: %s", su.get("code"), exc)
 
 
+async def _ciba_poll(auth_req_id: str) -> str:
+    """Has the user approved on their device yet? RFC-correct CIBA: the client POLLS the token
+    endpoint with the auth_req_id.
+
+        "pending"   authorization_pending / slow_down  -> keep waiting
+        "approved"  200                                -> the user tapped approve
+        "denied"    access_denied
+        "expired"   expired_token
+
+    We do NOT keep the minted token: PF's CIBA grant falls through to a DEFAULT mapping whose
+    subject is fixed (ciba.tf), so the token is not usable as this user. We only need the
+    APPROVAL SIGNAL — the evidence is the device interaction, not the token."""
+    pem = os.environ.get("CIBA_CLIENT_KEY_PEM", "")
+    if not pem or not auth_req_id:
+        return "pending"
+    token_url = CIBA_ENDPOINT.replace("/as/bc-auth.ciba", "/as/token.oauth2")
+    form = {"grant_type": "urn:openid:params:grant-type:ciba", "auth_req_id": auth_req_id,
+            "client_assertion_type": "urn:ietf:params:oauth:client-assertion-type:jwt-bearer",
+            "client_assertion": _ciba_assertion(token_url)}
+    try:
+        async with httpx.AsyncClient(timeout=15.0, verify=False) as c:
+            r = await c.post(token_url, data=form)
+        if r.status_code == 200:
+            return "approved"
+        err = ""
+        try:
+            err = (r.json() or {}).get("error", "")
+        except Exception:  # noqa: BLE001
+            err = r.text[:80]
+        if err in ("authorization_pending", "slow_down"):
+            return "pending"
+        if err == "access_denied":
+            return "denied"
+        if err in ("expired_token", "invalid_grant"):
+            return "expired"
+        logger.info("ciba poll %s: %s %s", auth_req_id[:8], r.status_code, err)
+        return "pending"
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("ciba poll failed: %s", exc)
+        return "pending"
+
+
 async def _authz_channel(user: str) -> str:
     """Which channel should carry an authorisation request for this user?
 
@@ -695,6 +737,7 @@ async def stepup_begin(request: Request):
     _STEPUPS[code] = su
     await _register_for_device(su)                  # so the phone can resolve the code
     pushed, detail = await _ciba_push(subject, code)
+    su["auth_req_id"] = detail if pushed else ""    # needed to poll for the approval
     if not pushed:
         logger.warning("stepup ciba push failed for %s: %s", subject, detail)
         return {"mode": "local", "assurance": ASSURANCE_APP_ASSERTED, "bound": False,
@@ -759,11 +802,34 @@ async def stepup_approve(request: Request):
 
 @app.get("/stepup/status/{code}")
 async def stepup_status(code: str):
-    """The browser polls this while the phone is being tapped."""
+    """The browser polls this while the phone is being tapped.
+
+    The approver app completes the PingOne device authentication and reports to the
+    autonomous-agent — it never calls /stepup/approve, so waiting for that alone left the
+    browser polling forever after a successful approval. We ask the AS instead: CIBA is
+    defined as the client polling the token endpoint for the outcome."""
     su = _STEPUPS.get(code)
     if not su:
         return JSONResponse(status_code=404, content={"error": "unknown code"})
+
+    if su.get("status") == "pending" and su.get("auth_req_id"):
+        outcome = await _ciba_poll(su["auth_req_id"])
+        if outcome == "approved":
+            su["status"] = "approved"
+            # device-APPROVED, not device-SIGNED: the phone proved presence and intent on a
+            # trusted device, but it did not sign over _txn_hash, so this is not dynamically
+            # linked to THIS payment. Recording it as signed would overstate the evidence.
+            su.setdefault("assurance", ASSURANCE_DEVICE_APPROVED)
+            su["approved_at"] = int(time.time())
+            logger.info("stepup %s approved on device (assurance=%s)", code, su["assurance"])
+            await _record_stepup_consent(
+                {**su, "channel": "ciba-device"}, su["subject"])
+        elif outcome in ("denied", "expired"):
+            su["status"] = outcome
+            logger.info("stepup %s %s on device", code, outcome)
+
     return {"code": code, "status": su["status"], "txn": su["txn"],
+            "type": su.get("authz_type", AUTHZ_TYPE_RESOURCE),
             "assurance": su.get("assurance", "")}
 
 
@@ -927,6 +993,10 @@ async function poll(){
     const r = await fetch('/stepup/status/'+code);
     if(r.ok){
       const d = await r.json();
+      if(d.status === 'denied' || d.status === 'expired'){
+        document.getElementById('s').textContent = 'Declined or expired — returning…';
+        setTimeout(()=>location.href='/', 1200); return;
+      }
       if(d.status === 'approved'){
         document.getElementById('s').textContent = 'Approved ('+(d.assurance||'')+') — continuing…';
         await fetch('/stepup/complete?code='+encodeURIComponent(code));
@@ -993,6 +1063,7 @@ async def login(request: Request):
             _STEPUPS[code] = su
             await _register_for_device(su)          # so the phone can resolve the code
             pushed, detail = await _ciba_push(subject, code)
+            su["auth_req_id"] = detail if pushed else ""   # needed to poll for the approval
             if pushed:
                 logger.info("stepup -> CIBA device push subject=%s code=%s", subject, code)
                 return HTMLResponse(_STEPUP_WAIT_HTML
