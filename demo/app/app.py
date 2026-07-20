@@ -452,7 +452,12 @@ async def _record_stepup_consent(su: dict, subject: str) -> str:
         async with httpx.AsyncClient(timeout=8.0) as c:
             await c.post(f"{PROOFING_DIRECTORY_URL}/consents", json={
                 "transaction_id": txn,
-                "subject": subject, "actor": subject, "channel": "passkey-stepup",
+                "subject": subject, "actor": subject,
+                # Where the consent was ACTUALLY captured. The DaVinci flow renders the
+                # amount/payee on the no-device path; the app's own page is the fallback.
+                # Do not hardcode this: an audit record that names the wrong surface is
+                # the same class of defect as one that overstates assurance.
+                "channel": su.get("channel") or "passkey-stepup",
                 "amount": amt, "currency": su.get("currency") or "AUD",
                 "debtor_account": su.get("debtor") or "",
                 "creditor_account": su.get("creditor") or "",
@@ -462,6 +467,29 @@ async def _record_stepup_consent(su: dict, subject: str) -> str:
     except Exception as exc:  # noqa: BLE001 — must never block the passkey sign-in
         logger.warning("stepup consent record failed: %s", exc)
     return txn
+
+
+async def _record_consent_decision(su: dict, subject: str, status: str) -> None:
+    """Persist a consent DECISION that does not become an authorization (e.g. declined).
+    Kept separate from _record_stepup_consent so a decline can never be mistaken for one."""
+    if not PROOFING_DIRECTORY_URL or not subject:
+        return
+    try:
+        amt = float(su.get("amount") or 0)
+    except (TypeError, ValueError):
+        amt = 0.0
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as c:
+            await c.post(f"{PROOFING_DIRECTORY_URL}/consents", json={
+                "transaction_id": "txn_" + secrets.token_hex(6),
+                "subject": subject, "actor": subject, "channel": "davinci-consent",
+                "amount": amt, "currency": su.get("currency") or "AUD",
+                "debtor_account": su.get("debtor") or "",
+                "creditor_account": su.get("creditor") or "",
+                "status": status})
+        logger.info("recorded davinci consent decision=%s subject=%s", status, subject)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("consent decision record failed: %s", exc)
 
 
 async def _project_delegation_grant(subject: str, scope: str, consent_txn: str) -> None:
@@ -733,6 +761,9 @@ async def stepup_consent_finish(request: Request):
     approved = "approve" in blob and "decline" not in blob
     logger.info("davinci consent decision approved=%s subject=%s", approved, su.get("subject"))
     if not approved:
+        # A DECLINE is a real decision and belongs in the directory. Recording only
+        # approvals leaves a record that cannot distinguish "refused" from "never asked".
+        await _record_consent_decision(su, su.get("subject", ""), "declined")
         return {"ok": False, "decision": "declined", "next": "/"}
     hint = "?stepup=1" + (("&u=" + urllib.parse.quote(su.get("subject", ""))) if su.get("subject") else "")
     return {"ok": True, "decision": "approved", "next": "/signup" + hint}
@@ -863,7 +894,7 @@ async def login(request: Request):
         resp = RedirectResponse("/stepup/consent", status_code=302)
         qp = request.query_params
         resp.set_cookie(STEPUP_COOKIE, _sign(
-            {"scope": stepup, "subject": subject,
+            {"scope": stepup, "subject": subject, "channel": "davinci-consent",
              "amount": (qp.get("amount") or "").strip(),
              "currency": (qp.get("cur") or "AUD").strip(),
              "debtor": (qp.get("from") or "").strip(),
