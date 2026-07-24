@@ -58,6 +58,33 @@ def _audit(action: str, principal: str | None, agent: str | None, detail: str) -
 STAFF_PRINCIPALS = set((os.environ.get("STAFF_PRINCIPALS", "bob")).split(","))
 
 
+def _proofing_state(customer_id: str, account_type: str) -> tuple[str, str | None]:
+    """Ask the directory about this customer's identity-proofing for this account type. Returns
+    (reason, consumedByAccount):
+
+        "active"    a fresh, unconsumed proofing exists — a genuinely NEW origination is
+                    authorised (open a new account and bind the proofing to it).
+        "consumed"  the proofing was already spent to open an account — this call is a step-up
+                    RESUME replaying an already-completed open; return the account it opened
+                    (consumedByAccount) rather than stacking a duplicate.
+        "none"      no proofing on record — either the gate is off for this type, or the gateway
+                    would already have challenged (so we just open).
+    """
+    if not PROOFING_DIRECTORY_URL:
+        return "none", None
+    try:
+        r = httpx.get(f"{PROOFING_DIRECTORY_URL}/proofing/present", timeout=4.0,
+                      params={"subject": customer_id, "account": account_type})
+        if r.status_code >= 300:
+            return "none", None
+        d = r.json()
+        return (d.get("reason") or "none"), d.get("consumedByAccount")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("proofing-state lookup failed for %s/%s: %s — treating as none",
+                       customer_id, account_type, exc)
+        return "none", None
+
+
 def _forbid_foreign_customer(customer_id: str, principal: str | None) -> JSONResponse | None:
     """Enforce that the action targets the AUTHENTICATED principal's own data.
 
@@ -205,23 +232,11 @@ def open_account(body: OpenAccountBody,
     if customer is None:
         return JSONResponse(status_code=404, content={"error": f"Unknown customer {body.customer_id}"})
 
-    # IDEMPOTENT: if this customer already has an account of this type, return it rather than
-    # originating a duplicate. A multi-step prompt ("open an account and transfer …") is REPLAYED
-    # whole on a step-up resume, so open_account can be re-invoked after it already succeeded —
-    # re-running it must be a no-op, not a second account. (Combined with the identity gate now
-    # passing on an already-proofed account, the replay is safe.) Does not consume proofing again.
-    existing = next((a for a in store.list_accounts(body.customer_id)
-                     if a.type == body.account_type), None)
-    if existing is not None:
-        _audit("open_account", x_auth_principal, x_auth_agent,
-               f"idempotent: returned existing {existing.id} ({body.account_type}) for {body.customer_id}")
-        return {
-            "message": f"You already have a {body.account_type} account ({existing.id}).",
-            "account": existing.to_dict(),
-        }
-
+    # Origination is FREE: opening an account requires no proofing. The identity gate now lives on
+    # the PAYMENT — money cannot move INTO an account until that destination account holds a
+    # verified mDL proofing record. So this simply creates the account; a customer may hold as many
+    # accounts as they like. (Proofing is bound to the account at first funding, not at open.)
     acct = store.open_account(body.customer_id, body.account_type, body.nickname)
-    _consume_proofing(body.customer_id, body.account_type, acct.id)
     _audit("open_account", x_auth_principal, x_auth_agent,
            f"opened {acct.id} ({body.account_type}) for {body.customer_id}")
     return {

@@ -665,6 +665,8 @@ def proofing_present(subject: str = Query(...), account: str | None = Query(defa
     acc = (account or "").strip().lower()
     now = _now()
     active = consumed = False
+    consumed_by = None
+    consumed_at_latest = None
     for r in store.list_by_subject(subj):
         if acc and (r.get("account") or "").strip().lower() != acc:
             continue
@@ -672,10 +674,18 @@ def proofing_present(subject: str = Query(...), account: str | None = Query(defa
             continue                      # expired: never counts
         if r.get("consumed_at"):
             consumed = True
+            # Remember the account opened by the NEWEST consumed-but-unexpired proofing, so a
+            # resume replay of open_account can return THAT account instead of stacking a
+            # duplicate. One proofing activity backs exactly one account.
+            cat = _as_dt(r["consumed_at"])
+            if consumed_at_latest is None or cat > consumed_at_latest:
+                consumed_at_latest = cat
+                consumed_by = r.get("consumed_by_account")
         else:
             active = True
     reason = "active" if active else ("consumed" if consumed else "none")
     return {"present": active or consumed, "reason": reason,
+            "consumedByAccount": consumed_by,
             "subject": subj, "account": acc}
 
 
@@ -881,6 +891,13 @@ class ConsentPatch(BaseModel):
     payment_result: dict | None = None
 
 
+class ConsentConsumeBody(BaseModel):
+    subject: str
+    creditor: str = ""
+    amount: float = 0.0
+    currency: str = ""
+
+
 def _consent_resource(row: dict) -> dict:
     created = row["created_at"]; updated = row["updated_at"]
     if isinstance(created, str):
@@ -997,6 +1014,37 @@ def check_consent(subject: str = Query(...), creditor: str = Query(default=""),
         "assurance": assurance,                   # the level achieved, carried to the policy
         "nonRepudiable": assurance == "device-signed",
     }
+
+
+@app.post("/consents/consume")
+def consume_consent(body: ConsentConsumeBody):
+    """Spend every AUTHORIZED consent that COVERS this payment (same match as /consents/check),
+    transitioning it to 'executed'. This is what makes a consent SINGLE-USE: once a payment has
+    run, the consent that authorized it can no longer cover another, so the next payment is
+    challenged again and forces a fresh device approval. Called by payments-api after a
+    successful transfer — the interactive (scope-elevated) token carries no transaction id, so
+    the consent can only be found by its attributes here."""
+    rows = consent_store.list(subject=body.subject, status="authorized")
+    cred = (body.creditor or "").strip().lower()
+    spent = []
+    for r in rows:
+        if cred and str(r.get("creditor_account") or "").strip().lower() != cred:
+            continue
+        try:
+            consented = float(r.get("amount") or 0)
+        except (TypeError, ValueError):
+            continue
+        if body.amount and body.amount > consented:
+            continue
+        if body.currency and str(r.get("currency") or "").upper() != body.currency.upper():
+            continue
+        r["status"] = "executed"
+        r["updated_at"] = _now()
+        consent_store.upsert(r)
+        spent.append(r["transaction_id"])
+    logger.info("consent consume subject=%s creditor=%s amount=%s -> %d spent",
+                body.subject, body.creditor, body.amount, len(spent))
+    return {"consumed": len(spent), "transactionIds": spent}
 
 
 @app.get("/consents")

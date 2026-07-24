@@ -89,6 +89,31 @@ async def _consent_executed(txn: str, result: dict) -> None:
         pass
 
 
+async def _consent_consume(subject: str | None, creditor: str, amount: float,
+                           currency: str) -> None:
+    """Make the covering consent SINGLE-USE. The interactive (scope-elevated) payment token
+    carries no RFC 9396 transaction id, so the token-linked path above can't spend the consent
+    and it would otherwise authorize EVERY future matching payment. Here we spend — mark
+    'executed' — every AUTHORIZED consent that covered this payment, matched by attributes, so
+    the next payment finds none and is challenged for a fresh device approval.
+
+    Best-effort: a directory hiccup must not fail a payment that already moved money, but it
+    does mean the consent could be reused until the directory catches up (logged)."""
+    if not subject:
+        return
+    try:
+        async with httpx.AsyncClient(timeout=6.0) as c:
+            r = await c.post(f"{CONSENT_DIRECTORY_URL}/consents/consume",
+                             json={"subject": subject, "creditor": creditor,
+                                   "amount": amount, "currency": currency})
+            n = (r.json() or {}).get("consumed") if r.status_code == 200 else "?"
+        logger.info("consent consume subject=%s creditor=%s amount=%.2f -> %s spent",
+                    subject, creditor, amount, n)
+    except Exception:  # noqa: BLE001
+        logger.warning("consent consume failed subject=%s (consent may be reusable until "
+                       "retried)", subject)
+
+
 def _forbid_foreign_customer(customer_id: str, principal: str | None) -> JSONResponse | None:
     """Enforce that the payment targets the AUTHENTICATED principal's own data
     (same rule as the accounts-api; see that service for the full rationale)."""
@@ -184,6 +209,14 @@ async def make_payment(body: PaymentBody, request: Request,
             "payment_id": (upstream or {}).get("payment_id")
             if isinstance(upstream, dict) else None,
         })
+
+    # Single-use consent: once the money has actually moved, spend the covering consent(s) so a
+    # device approval authorizes exactly ONE payment. Only on success — a failed/denied transfer
+    # must not burn the consent. Covers the interactive flow (no txn id in the token) and clears
+    # any stale authorized consents that matched.
+    payment_ok = resp.status_code < 300 and isinstance(upstream, dict) and upstream.get("success")
+    if payment_ok:
+        await _consent_consume(x_auth_principal, body.to_account, body.amount, body.currency)
 
     _audit("make_payment", x_auth_principal, x_auth_agent,
            f"{body.amount:.2f} {body.currency} {body.from_account} -> {body.to_account} "

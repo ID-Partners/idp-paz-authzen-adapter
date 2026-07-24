@@ -618,21 +618,27 @@ func buildPdpDecisionPayload(evalRequest EvaluationRequest) (*PdpPayload, error)
 	// report identity_proofing_present=true so the PDP origination deny-rule is a no-op.
 	// Only when the switch is ON do we do the real directory lookup for open_account — so a
 	// customer without a verified mDL is denied and challenged to present one.
+	// mDL identity-proofing gate — on the PAYMENT, not origination. Opening an account is free;
+	// money may only move INTO an account once THAT destination account holds a verified
+	// identity-proofing activity (an mDL presentation) in the directory. Per-account: we resolve
+	// the proofing for the payment's DESTINATION (to_account) to a plain boolean here (the
+	// embedded PDP can't call the directory), mirroring the rar_*_ok precompute. Always set
+	// (true when not a payment, or when the gate SWITCH is OFF) so the policy never sees a missing
+	// attribute — origination and every non-payment action report true, so the payment deny-rule
+	// is the only place the gate bites. Fails CLOSED for a payment when the directory is
+	// unreachable (proofingPresent returns false): an un-proofed destination must not slip through.
 	proofed := true
 	actLower := strings.ToLower(attrStr("actionName"))
 	resLower := strings.ToLower(attrStr("resourceId"))
 	if proofingGateEnabled() &&
-		(strings.Contains(actLower, "open_account") || strings.Contains(resLower, "open_account")) {
+		(strings.Contains(actLower, "make_payment") || strings.Contains(resLower, "make_payment") ||
+			strings.Contains(actLower, "transfer")) {
 		subj := attrStr("onBehalfOf")
 		if subj == "" {
 			subj = evalRequest.Subject.ID
 		}
-		// The account being originated: the COAZ mapping carries it both as the
-		// account_type resource property and encoded in the resource id ("new:<type>").
-		account := strings.ToLower(attrStr("account_type"))
-		if account == "" && strings.HasPrefix(resLower, "new:") {
-			account = strings.TrimPrefix(resLower, "new:")
-		}
+		// The destination account the payment credits — it must be identity-proofed.
+		account := strings.ToLower(attrStr("to_account"))
 		proofed = proofingPresent(subj, account)
 	}
 	pdpPayload.Attributes["identity_proofing_present"] = strconv.FormatBool(proofed)
@@ -834,6 +840,30 @@ func makeAuthorizationDecisionRequest(pdpPayload *PdpPayload) ([]EvaluationRespo
 			}
 		}
 	}
+	// Payment identity-proofing gate (INTERIM adapter-side enforcement). The equivalent PDP
+	// policy rule belongs in the banking package (a make_payment deny-rule keyed on
+	// identity_proofing_present, mirroring the origination rule), but is applied here for now.
+	// buildPdpDecisionPayload sets identity_proofing_present="false" only for a make_payment whose
+	// DESTINATION account (to_account) has no verified mDL proofing on record (and only when the
+	// gate switch is on). When so, override to DENY and surface identity-proofing-required so the
+	// gateway drives an OID4VP mDL presentation for that account, exactly as the policy rule would —
+	// same obligation the origination gate uses. Money may not move into an un-proofed account.
+	if proofingGateEnabled() &&
+		fmt.Sprintf("%v", pdpPayload.Attributes["identity_proofing_present"]) == "false" {
+		act := strings.ToLower(fmt.Sprintf("%v", pdpPayload.Attributes["actionName"]))
+		res := strings.ToLower(fmt.Sprintf("%v", pdpPayload.Attributes["resourceId"]))
+		if strings.Contains(act, "make_payment") || strings.Contains(res, "make_payment") ||
+			strings.Contains(act, "transfer") {
+			evalResponse.Decision = false
+			ctx["identity_proofing_required"] = true
+			ctx["identity_proofing_doctype"] = "org.iso.18013.5.1.mDL"
+			if _, ok := ctx["reason"]; !ok {
+				ctx["reason"] = "Present your mobile Driver's Licence (mDL) to move money into this account."
+			}
+			log.Printf("payment DENIED: destination account not identity-proofed (make_payment)")
+		}
+	}
+
 	if len(ctx) > 0 {
 		evalResponse.Context = &ctx
 	}

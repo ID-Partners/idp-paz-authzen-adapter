@@ -1575,10 +1575,12 @@ async function streamRun(prompt, spin){
            <div>${esc(ev.detail||'')}</div>`));
         (async () => {
           let begin;
-          // Scope the proofing to the SPECIFIC account being originated — the challenge
-          // carries the open_account arguments. The record written on verification is
-          // account-scoped, and the PDP gate only honours a proofing for THIS account.
-          const acct = (ev.account && (ev.account.account_type||ev.account.type)) || 'savings';
+          // Scope the proofing to the SPECIFIC account being challenged. For an
+          // origination that's the account_type from open_account's arguments; for a
+          // payment it's the DESTINATION account id (to_account) — the policy denies
+          // payments into an account with no identity-proofing record, so the mDL
+          // presentation must bind to exactly that account for the retry to pass.
+          const acct = (ev.account && (ev.account.to_account||ev.account.account_type||ev.account.type)) || 'savings';
           try { begin = await fetch('/proofing/begin', {method:'POST',
                   headers:{'content-type':'application/json'},
                   body: JSON.stringify({account_type: acct})}).then(r=>r.json()); }

@@ -201,8 +201,8 @@ async def a2a(request: Request):
             "type": "identity_stepup", "role": AGENT_ROLE, "agent_label": CFG["label"],
             "doctype": doctype, "pep": outcome.get("pep"),
             "detail": f"The gateway rejected {operation} with identity_verification_required: "
-                      f"the customer must present a verified {doctype} before an account can "
-                      f"be opened. Identity proofing required."})
+                      f"the customer must present a verified {doctype} for the account this "
+                      f"operation touches. Identity proofing required."})
         return JSONResponse(status_code=200, content={
             "jsonrpc": "2.0", "id": rpc_id, "result": {
                 "message": {"role": "agent", "parts": [{"kind": "data",
@@ -210,8 +210,8 @@ async def a2a(request: Request):
                 "metadata": {"agent": CFG["id"], "agent_label": CFG["label"], "role": AGENT_ROLE,
                              "steps": steps,
                              "identity_challenge": {"doctype": doctype, "pep": outcome.get("pep"),
-                                 "detail": "Account opening needs a verified mobile Driver's "
-                                           "Licence (mDL) presentation."}}}})
+                                 "detail": "This operation's account needs a verified mobile "
+                                           "Driver's Licence (mDL) presentation."}}}})
 
     # The gateway needs a scope the signed-in user hasn't consented to yet
     # (e.g. banking:payments:transfer). Relay a scope step-up so the app can send
