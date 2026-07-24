@@ -146,6 +146,10 @@ def _binding(p: dict) -> str:
 # the trigger, the rich consent screen is an out-of-band fetch. The code doubles as the
 # binding_message so it also shows on the push banner.
 _CONSENTS: dict[str, dict] = {}
+# Optional shared secret for POST /consent (server-to-server from the BFF). Unset = open,
+# which matches the rest of this demo's posture but means anyone who can reach this service
+# can queue an approval prompt on a paired phone. Set REGISTER_SECRET in staging.
+REGISTER_SECRET = os.environ.get("REGISTER_SECRET", "")
 _CONSENT_TTL = 600  # seconds a pending consent stays fetchable
 
 
@@ -165,8 +169,10 @@ def _register_consent(pid: str, payment: dict, owner: str = "alice") -> str:
     for k in [k for k, v in _CONSENTS.items() if now - v.get("ts", 0) > _CONSENT_TTL]:
         _CONSENTS.pop(k, None)
     code = _consent_code(payment)
+    txn = "txn_" + uuid.uuid4().hex[:12]
     _CONSENTS[code] = {
         "code": code, "paymentId": pid, "status": "pending", "ts": now,
+        "transactionId": txn,
         "amount": float(payment.get("amount", 0) or 0),
         "currency": payment.get("currency", "AUD"),
         "debtorAccount": payment.get("from", ""),
@@ -176,13 +182,52 @@ def _register_consent(pid: str, payment: dict, owner: str = "alice") -> str:
         "requestedBy": "Autonomous Agent (staff-authorized)",
         "approver": BOB_USERNAME,
     }
+    _persist_consent(_CONSENTS[code], "requested")
     return code
+
+
+CONSENT_DIRECTORY_URL = os.environ.get(
+    "CONSENT_DIRECTORY_URL",
+    os.environ.get("PROOFING_DIRECTORY_URL",
+                   "http://proofing-directory.railway.internal:8075")).rstrip("/")
+
+
+def _persist_consent(c: dict, status: str) -> None:
+    """Persist Bob's staff-approval consent to the consent directory (best-effort,
+    fire-and-forget): same store + transaction-id scheme as Alice's RAR step-up
+    consents, channel ciba-staff."""
+    async def _post() -> None:
+        try:
+            async with httpx.AsyncClient(timeout=6.0) as hc:
+                if status == "requested":
+                    await hc.post(f"{CONSENT_DIRECTORY_URL}/consents", json={
+                        "transaction_id": c.get("transactionId"),
+                        "subject": c.get("accountOwner") or "alice",
+                        "actor": c.get("approver") or "bob",
+                        "channel": "ciba-staff", "status": "requested",
+                        "amount": c.get("amount"), "currency": c.get("currency"),
+                        "debtor_account": c.get("debtorAccount"),
+                        "creditor_account": c.get("creditorAccount"),
+                        "code": c.get("code"),
+                        "authorization_details": c.get("authorization_details") or []})
+                else:
+                    await hc.patch(
+                        f"{CONSENT_DIRECTORY_URL}/consents/{c.get('transactionId')}",
+                        json={"status": status})
+        except Exception:  # noqa: BLE001 — persistence never blocks the approval flow
+            pass
+    try:
+        asyncio.get_running_loop().create_task(_post())
+    except RuntimeError:  # no running loop (sync caller at import/startup)
+        pass
 
 
 def _resolve_consent(code: str, status: str) -> None:
     c = _CONSENTS.get(code)
     if c:
         c["status"] = status
+        # approved/declined from the phone → advance the directory record too.
+        _persist_consent(c, "authorized" if status == "approved" else status)
 
 
 def _latest_pending_consent() -> dict | None:
@@ -477,31 +522,103 @@ def ping() -> dict:
             "concierge": CONCIERGE_URL, "pf_token_url": PF_TOKEN_URL}
 
 
+# ── device authorization ────────────────────────────────────────────────────────────
+# The approver app is de-privileged: it holds a device token (a BFF-signed JWT scoping it to
+# ONE user), minted when that user's pairing QR was generated and sent as a Bearer on every
+# call. We verify it here with the SHARED DEVICE_TOKEN_SECRET so a phone can only read/report
+# consents whose approver is ITS user — never another principal's.
+DEVICE_TOKEN_SECRET = os.environ.get("DEVICE_TOKEN_SECRET", "")
+
+
+def _device_user(request: Request) -> str | None:
+    auth = request.headers.get("authorization", "")
+    if not auth.lower().startswith("bearer ") or not DEVICE_TOKEN_SECRET:
+        return None
+    try:
+        claims = jwt.decode(auth.split(" ", 1)[1].strip(), DEVICE_TOKEN_SECRET, algorithms=["HS256"])
+    except Exception:  # noqa: BLE001
+        return None
+    if claims.get("typ") != "device":
+        return None
+    return (claims.get("device_sub") or "").lower() or None
+
+
 # ── consent detail (Bob's approver app pulls the full authorization up by code) ──────
 # The CIBA push carries only a short reference code (binding_message). The approver app
-# resolves it to the full consent here. `/consent` (no code) returns the latest pending one
-# — a demo convenience so the app can fetch even if it can't parse the code from the push.
-# NOTE (demo): unauthenticated + code-guarded. The code is short-lived and unguessable
-# enough for a demo; a production build would bind this to the approver's own token.
+# resolves it to the full consent here — device-token scoped: only the consent's own approver's
+# phone may read it. `/consent` (no code) returns that phone's latest pending consent.
 def _consent_view(c: dict) -> dict:
-    return {k: c[k] for k in ("code", "paymentId", "status", "amount", "currency",
+    return {k: c[k] for k in ("code", "paymentId", "status", "authzType", "amount", "currency",
                               "debtorAccount", "creditorAccount", "accountOwner",
                               "authorization_details", "requestedBy", "approver") if k in c}
 
 
+# The INTERACTIVE payment step-up (northwind-app) pushes to the same approver app, which
+# resolves any pushed code against THIS service's consent store. So the BFF registers its
+# pending resource authorisation here. Without it the phone gets the push, finds no consent
+# for the code, and renders an empty approval.
+#
+# TYPE: a payment is a RESOURCE AUTHORISATION (RFC 9396 RAR) — fine-grained, one specific
+# protected resource — not a coarse "consent". The endpoint keeps its historical name; the
+# record carries the type explicitly.
+@app.post("/consent")
+async def consent_register(request: Request) -> JSONResponse:
+    """Register a pending resource authorisation so the paired device can resolve its code."""
+    if REGISTER_SECRET and request.headers.get("X-Register-Secret") != REGISTER_SECRET:
+        return JSONResponse({"error": "forbidden"}, status_code=403)
+    try:
+        b = await request.json()
+    except Exception:  # noqa: BLE001
+        return JSONResponse({"error": "bad_request"}, status_code=400)
+    code = str(b.get("code") or "").strip()
+    approver = str(b.get("approver") or "").strip().lower()
+    if not code or not approver:
+        return JSONResponse({"error": "code and approver required"}, status_code=400)
+    now = time.time()
+    for k in [k for k, v in _CONSENTS.items() if now - v.get("ts", 0) > _CONSENT_TTL]:
+        _CONSENTS.pop(k, None)
+    _CONSENTS[code] = {
+        "code": code, "paymentId": str(b.get("paymentId") or code),
+        "status": "pending", "ts": now,
+        "transactionId": str(b.get("transactionId") or ""),
+        "authzType": "resource_authorisation",
+        "amount": float(b.get("amount", 0) or 0),
+        "currency": b.get("currency") or "AUD",
+        "debtorAccount": b.get("debtorAccount") or "",
+        "creditorAccount": b.get("creditorAccount") or "",
+        "accountOwner": approver,
+        "authorization_details": b.get("authorization_details") or [],
+        "requestedBy": str(b.get("requestedBy") or "Demo Bank (interactive step-up)"),
+        # The approver is WHOEVER is being asked — never a fixed demo user. The device-token
+        # scope on the read path then ensures only that person's phone can resolve it.
+        "approver": approver,
+    }
+    log.info("registered resource authorisation code=%s approver=%s amount=%s",
+             code, approver, b.get("amount"))
+    return JSONResponse({"ok": True, "code": code})
+
+
 @app.get("/consent")
-def consent_latest() -> dict:
+def consent_latest(request: Request) -> dict:
+    du = _device_user(request)
+    if not du:
+        return JSONResponse({"error": "device_auth_required"}, status_code=401)
     c = _latest_pending_consent()
-    if not c:
+    if not c or (c.get("approver") or "").lower() != du:
         return JSONResponse({"error": "no pending consent"}, status_code=404)
     return _consent_view(c)
 
 
 @app.get("/consent/{code}")
-def consent_by_code(code: str) -> dict:
+def consent_by_code(code: str, request: Request) -> dict:
+    du = _device_user(request)
+    if not du:
+        return JSONResponse({"error": "device_auth_required"}, status_code=401)
     c = _CONSENTS.get(code)
     if not c:
         return JSONResponse({"error": "unknown or expired code"}, status_code=404)
+    if (c.get("approver") or "").lower() != du:
+        return JSONResponse({"error": "forbidden_for_user"}, status_code=403)
     return _consent_view(c)
 
 
@@ -509,7 +626,9 @@ def consent_by_code(code: str) -> dict:
 async def phone_log(request: Request) -> JSONResponse:
     """Lifecycle breadcrumbs from Bob's approver app (push received, SDK ready, screen shown,
     tap, biometric, SDK result) — independent of any consent code, so we can see exactly how far
-    the phone got even when nothing else fires."""
+    the phone got even when nothing else fires. Requires a valid device token."""
+    if not _device_user(request):
+        return JSONResponse({"error": "device_auth_required"}, status_code=401)
     try:
         body = await request.json()
     except Exception:  # noqa: BLE001
@@ -527,12 +646,17 @@ async def phone_log(request: Request) -> JSONResponse:
 async def consent_report(code: str, request: Request) -> JSONResponse:
     """Bob's approver app reports back what happened when he tapped — the SDK decision, any
     error, and PingOne's device-requirements verdict. Gives the dashboard (and us) eyes on the
-    phone side, independent of PF's poll."""
+    phone side, independent of PF's poll. Device-token scoped to the consent's approver."""
+    du = _device_user(request)
+    if not du:
+        return JSONResponse({"error": "device_auth_required"}, status_code=401)
     try:
         body = await request.json()
     except Exception:  # noqa: BLE001
         body = {}
     c = _CONSENTS.get(code)
+    if c and (c.get("approver") or "").lower() != du:
+        return JSONResponse({"error": "forbidden_for_user"}, status_code=403)
     pid = (c or {}).get("paymentId", code)
     decision = str(body.get("decision", "?"))
     err = body.get("error")

@@ -2,18 +2,26 @@
 # Used via RAILWAY_DOCKERFILE_PATH=demo/pingauthorize/Dockerfile.railway — the
 # build context is the git root, so COPY paths are repo-root-relative.
 #
-# The license is injected at runtime from the PING_LICENSE env var by
-# entrypoint-license.sh (never in git or image layers).
-#
-# No 11.1.0.0 image is published; newest is 11.0.0.2. A license versioned
-# 11.1.0.0 is newer than the server, which Ping accepts (license >= server).
-FROM pingidentity/pingauthorize:11.0.0.2-latest
+# LICENSING: DevOps-licensed — NO PingAuthorize.lic is baked and NO custom entrypoint
+# writes one. The stock image's startup hook (17-check-license.sh) fetches a fresh 30-day
+# eval license when PING_IDENTITY_DEVOPS_USER / PING_IDENTITY_DEVOPS_KEY
+# (+ PING_IDENTITY_ACCEPT_EULA=YES) are set as Railway service vars and no license file
+# exists. Every restart re-fetches, so licenses never expire (mirrors demo/pingfederate).
+# The old entrypoint-license.sh execed /opt/bootstrap.sh directly, which SKIPPED the stock
+# license hook and caused a setup crash-loop once the static PING_LICENSE expired. We rely on
+# the stock entrypoint instead. Do NOT re-add a static-license entrypoint or a COPY *.lic
+# line: an existing license file takes precedence and disables the DevOps fetch.
+# VERSION: must match the PAP that exports banking.deploymentpackage (pingauthorize-pap,
+# 11.1.0.0). On 11.0.0.2 this server REFUSED TO BOOT on any PAP-11.1 package containing a
+# RESTFUL service (HTTP PIP): "Unrecognized field 'responseHandling' (RestSettings)" ->
+# FATAL "Policy engine cannot be initialized" -> shutdown. The package is digest-sealed, so
+# the field cannot be stripped by hand ("Computed digest does not match declared digest").
+# Keep this pinned in lockstep with the PAP version.
+FROM pingidentity/pingauthorize:11.1.0.0-latest
 
 ENV PING_IDENTITY_ACCEPT_EULA=YES
-ENV LICENSE_DIR=/opt/in/instance
 ENV MAX_HEAP_SIZE=1g
 
-COPY --chmod=0755 demo/pingauthorize/entrypoint-license.sh /opt/entrypoint-license.sh
 # Server profile: dsconfig batch applied at setup — configures EMBEDDED PDP mode
 # with the baked-in banking deployment package (self-contained, stable).
 COPY --chown=9031:0 demo/pingauthorize/pd.profile /opt/in/pd.profile
@@ -22,5 +30,4 @@ COPY --chown=9031:0 demo/pingauthorize/pd.profile /opt/in/pd.profile
 COPY --chown=9031:0 demo/pingauthorize/banking.deploymentpackage /opt/in/banking.deploymentpackage
 
 EXPOSE 1443
-ENTRYPOINT ["/opt/entrypoint-license.sh"]
 CMD ["start-server"]

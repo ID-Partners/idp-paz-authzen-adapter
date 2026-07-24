@@ -337,11 +337,31 @@ func (s *server) check(ctx context.Context, conf pepConfig, method, path string,
 		"context":  m.ctx,
 	}
 
-	decision, reason, stepUp, stepUpScope, err := s.evaluate(ctx, authzenReq)
+	out, err := s.evaluate(ctx, authzenReq)
 	if err != nil {
 		log.Printf("[%s] PDP call failed: %v", pep, err)
 		return denySimple(pep, typev3.StatusCode_ServiceUnavailable, codes.Unavailable,
 			"Authorization service unreachable; denying (fail-closed).", nil)
+	}
+	decision, reason, stepUp, stepUpScope := out.Decision, out.Reason, out.StepUp, out.StepUpScope
+
+	// mDL identity-proofing obligation (account origination): the customer has no
+	// verified identity-proofing activity yet. Challenge for an mDL presentation —
+	// the app pushes the customer's phone (CIBA) and the wallet presents app2app.
+	if out.IdentityReq {
+		doctype := out.IdentityDoctype
+		if doctype == "" {
+			doctype = "org.iso.18013.5.1.mDL"
+		}
+		log.Printf("[%s] 401 identity proofing required (%s) %s %s", pep, doctype, m.action, m.rid)
+		return deny(typev3.StatusCode_Unauthorized, codes.Unauthenticated, map[string]any{
+			"error":   "identity_verification_required",
+			"doctype": doctype,
+			"pep":     pep,
+			"reason":  reason,
+		}, map[string]string{
+			"WWW-Authenticate": `Bearer error="identity_verification_required", doctype="` + doctype + `"`,
+		})
 	}
 
 	// Step-up obligation from the policy: this payment is over the threshold and
@@ -473,34 +493,48 @@ func consentedPayment(ad any) (float64, string, bool) {
 // evaluate POSTs a single AuthZEN evaluation request to the PDP. It returns the
 // decision, a human reason, and the step-up obligation (whether the policy asks
 // for a step-up challenge, and the scope to challenge for).
-func (s *server) evaluate(ctx context.Context, authzenReq map[string]any) (bool, string, bool, string, error) {
+// pepOutcome carries the PDP decision plus challenge advice: RFC 9470 scope step-up
+// (payments) and/or the mDL identity-proofing requirement (account origination).
+type pepOutcome struct {
+	Decision        bool
+	Reason          string
+	StepUp          bool
+	StepUpScope     string
+	IdentityReq     bool
+	IdentityDoctype string
+}
+
+func (s *server) evaluate(ctx context.Context, authzenReq map[string]any) (pepOutcome, error) {
+	var out pepOutcome
 	payload, _ := json.Marshal(authzenReq)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		s.authzenURL+"/access/v1/evaluation", bytes.NewReader(payload))
 	if err != nil {
-		return false, "", false, "", err
+		return out, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+s.authzenAPIKey)
 	resp, err := s.httpc.Do(req)
 	if err != nil {
-		return false, "", false, "", err
+		return out, err
 	}
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if err != nil {
-		return false, "", false, "", err
+		return out, err
 	}
 	var data struct {
 		Decision bool `json:"decision"`
 		Context  struct {
-			Reason         string `json:"reason"`
-			StepUpRequired bool   `json:"step_up_required"`
-			StepUpScope    string `json:"step_up_scope"`
+			Reason           string `json:"reason"`
+			StepUpRequired   bool   `json:"step_up_required"`
+			StepUpScope      string `json:"step_up_scope"`
+			IdentityRequired bool   `json:"identity_proofing_required"`
+			IdentityDoctype  string `json:"identity_proofing_doctype"`
 		} `json:"context"`
 	}
 	if err := json.Unmarshal(raw, &data); err != nil {
-		return false, "", false, "", fmt.Errorf("bad PDP response (%d): %w", resp.StatusCode, err)
+		return out, fmt.Errorf("bad PDP response (%d): %w", resp.StatusCode, err)
 	}
 	reason := data.Context.Reason
 	if reason == "" {
@@ -510,5 +544,7 @@ func (s *server) evaluate(ctx context.Context, authzenReq map[string]any) (bool,
 			reason = "Denied by policy."
 		}
 	}
-	return data.Decision, reason, data.Context.StepUpRequired, data.Context.StepUpScope, nil
+	return pepOutcome{Decision: data.Decision, Reason: reason,
+		StepUp: data.Context.StepUpRequired, StepUpScope: data.Context.StepUpScope,
+		IdentityReq: data.Context.IdentityRequired, IdentityDoctype: data.Context.IdentityDoctype}, nil
 }

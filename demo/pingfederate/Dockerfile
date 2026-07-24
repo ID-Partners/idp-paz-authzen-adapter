@@ -26,6 +26,19 @@ COPY --chown=9031:0 jose4j-0.9.6.jar /opt/in/instance/server/default/deploy/jose
 # it resolves on the plugin's own classloader regardless of PF's per-deploy-jar
 # isolation (separate jackson jars in deploy/ did not link).
 COPY --chown=9031:0 pf.plugins.pf-rar-paz-plugin.jar /opt/in/instance/server/default/deploy/pf.plugins.pf-rar-paz-plugin.jar
+# Grant Evaluation API (idp-gm-api servlet) + its MCP add-on, at /gm-api and /gm-api/mcp.
+# PF's PFWebAppProvider deploys WARs out of this directory and the WAR name becomes the
+# context path — the same mechanism that serves PF's own /pf-ws. In-process on purpose: it
+# reads the grant store directly (AccessGrantManagerAccessor) and verifies bearer tokens
+# against this server's own signing keys, so there is no service account, no Basic auth to
+# /pf-ws/rest/oauth, and no JWKS_URL that can disagree with the issuer.
+#
+# It lets an agent ask "does Alice's consent still cover this?" BEFORE exchanging for a
+# token. A valid token does not mean the consent still covers the act: effective access is
+# what the client was granted (scopes + RAR, which PF owns) INTERSECTED with what the
+# subject actually holds (which only the bank knows) — so the PDP below decides the second
+# half. Needs AUTHZEN_BASE_URL (PDP) and GM_AUDIENCE set as service vars.
+COPY --chown=9031:0 gm-api.war /opt/in/instance/server/default/deploy/gm-api.war
 COPY --chown=9031:0 oidf-mock-attesters.json /opt/in/instance/server/default/conf/oidf-mock-attesters.json
 # PingOne MFA Integration Kit v4.0 (Ping Marketplace, gated download — kept out of git,
 # uploaded to the build via `railway up --no-gitignore`). Provides the PingOne MFA CIBA

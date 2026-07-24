@@ -1,18 +1,17 @@
 # Railway build of the PingAuthorize Policy Editor (PAP).
-# Used via RAILWAY_DOCKERFILE_PATH=demo/pingauthorize-pap/Dockerfile.railway —
-# build context is the git root, so COPY paths are repo-root-relative.
+# Used via RAILWAY_DOCKERFILE_PATH=demo/pingauthorize-pap/Dockerfile.railway.
 #
-# The PAP is where the demo's banking policy is authored/managed. PingAuthorize
-# runs in EXTERNAL PDP mode pointing at this editor, so policy changes made here
-# apply to decisions immediately. Same license as the server, injected at
-# runtime from the PING_LICENSE env var by entrypoint-license.sh.
+# LICENSING: DevOps-licensed — NO PingAuthorize.lic is baked and NO custom entrypoint
+# writes one. The stock image's startup hooks fetch a fresh 30-day eval license when
+# PING_IDENTITY_DEVOPS_USER / PING_IDENTITY_DEVOPS_KEY (+ PING_IDENTITY_ACCEPT_EULA=YES)
+# are set as Railway service vars and NO license file exists. Every restart re-fetches, so
+# licenses never expire (mirrors demo/pingfederate). The old entrypoint-license.sh execed
+# /opt/bootstrap.sh directly, which SKIPPED the stock license-fetch hook — so we rely on the
+# stock entrypoint instead. Do NOT re-add a static-license entrypoint or a COPY *.lic line:
+# an existing license file takes precedence and disables the DevOps fetch.
 FROM pingidentity/pingauthorizepap:11.0.0.2-latest
 
 ENV PING_IDENTITY_ACCEPT_EULA=YES
-ENV LICENSE_DIR=/opt/in/instance
-
-COPY --chmod=0755 demo/pingauthorize-pap/entrypoint-license.sh /opt/entrypoint-license.sh
 
 EXPOSE 1443
-ENTRYPOINT ["/opt/entrypoint-license.sh"]
 CMD ["start-server"]

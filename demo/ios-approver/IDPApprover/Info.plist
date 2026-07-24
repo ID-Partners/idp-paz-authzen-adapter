@@ -18,8 +18,21 @@
 	<string>1.0</string>
 	<key>CFBundleVersion</key>
 	<string>1</string>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>info.makefish.idpapprover</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>idpapprover</string>
+			</array>
+		</dict>
+	</array>
 	<key>NSFaceIDUsageDescription</key>
 	<string>Approve payments with Face ID</string>
+	<key>NSCameraUsageDescription</key>
+	<string>Scan the QR code shown by the bank website to pair this device</string>
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>remote-notification</string>
