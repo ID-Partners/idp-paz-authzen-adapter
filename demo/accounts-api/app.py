@@ -197,6 +197,42 @@ def list_accounts(customer_id: str,
     }
 
 
+@app.get("/customers/{customer_id}/entitlement")
+def check_entitlement(customer_id: str, account: str = "", action: str = ""):
+    """Entitlement source for the Grant Evaluation PDP. Answers the one thing the grant itself
+    cannot: does this customer STILL HOLD this account, and is it OPEN? The Ping Authorize
+    'AccountHoldings' PIP calls this (keyed on the authenticated subject + the resource account)
+    and reads {held_open}. Read-only, no auth header — the query subject IS the lookup key,
+    mirroring the proofing-directory /consents/check PIP. The bank is system-of-record for
+    holdings; scopes/RAR are the AS's. Never held, or since closed -> held_open false (fail
+    closed), which the AS servlet renders as 'subject_not_entitled' (re-consent won't help)."""
+    subject = (customer_id or "").strip()
+    acct_id = (account or "").strip()
+    match = None
+    if store.get_customer(subject) is not None:
+        match = next((a for a in store.list_accounts(subject) if a.id == acct_id), None)
+    held = match is not None
+    is_open = bool(match and (match.status or "").lower() == "open")
+    held_open = held and is_open
+    logger.info("entitlement check subject=%s account=%s action=%s -> held=%s open=%s held_open=%s",
+                subject, acct_id, action, held, is_open, held_open)
+    return {"subject": subject, "account": acct_id, "action": action,
+            "held": held, "open": is_open, "held_open": held_open,
+            "reason": None if held_open else "subject_not_entitled"}
+
+
+@app.post("/admin/accounts/{account_id}/close")
+def admin_close_account(account_id: str):
+    """Demo convenience: mark an account CLOSED so the grant-evaluation flow can show a customer
+    who HELD an account and no longer does (held_open -> false). Not a real banking operation."""
+    acct = store.get_account(account_id)
+    if acct is None:
+        return JSONResponse(status_code=404, content={"error": f"Account {account_id} not found"})
+    acct.status = "closed"
+    logger.info("admin closed account %s (customer=%s)", account_id, acct.customer_id)
+    return {"account_id": account_id, "status": acct.status, "customer_id": acct.customer_id}
+
+
 @app.get("/accounts/{account_id}/balance")
 def get_balance(account_id: str,
                 x_auth_principal: str | None = Header(default=None),

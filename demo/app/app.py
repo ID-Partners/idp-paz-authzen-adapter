@@ -62,9 +62,14 @@ SESSION_TTL = int(os.environ.get("SESSION_TTL", "28800"))  # 8h
 # Everyday scopes Alice consents to at first login. The sensitive
 # banking:payments:transfer is NOT here — it requires a step-up (re-auth).
 DEFAULT_SCOPES = os.environ.get("DEFAULT_SCOPES",
-                                "openid banking:accounts:list banking:accounts:originate")
+                                "openid banking:accounts:list banking:accounts:originate "
+                                "grant_management_evaluate")
 SESSION_COOKIE = "nw_session"
 STEPUP_COOKIE = "nw_stepup"  # short-lived: carries the requested step-up scope across the passkey ceremony
+# RFC 8707 resource for the Grant Management API. Requesting it on the broker exchange
+# selects the gmJwtATM, which mints a token AUDIENCED for the GM API (aud=this value) from
+# the SAME login grant — so agid/sub/client_id are preserved but aud satisfies the servlet.
+GM_RESOURCE = os.environ.get("GM_RESOURCE", "https://gm-api.demo/grants")
 
 
 def _b64u(b: bytes) -> str:
@@ -1759,7 +1764,7 @@ def _mint_passkey_jwt(user: str) -> str:
         pem, algorithm="ES256", headers={"kid": BFF_PASSKEY_KID})
 
 
-async def _broker_passkey_to_pf(user: str, extra_scope: str = "") -> str:
+async def _broker_passkey_to_pf(user: str, extra_scope: str = "", resource: str = "") -> str:
     """Exchange the BFF-signed passkey JWT at PF (signupTE) for a PF user access token.
 
     extra_scope elevates the token for a step-up: the passkey ceremony IS the step-up
@@ -1771,14 +1776,23 @@ async def _broker_passkey_to_pf(user: str, extra_scope: str = "") -> str:
         return ""
     assertion = _mint_passkey_jwt(user)
     scope = DEFAULT_SCOPES + ((" " + extra_scope) if extra_scope.strip() else "")
+    form = {
+        "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+        "subject_token": assertion,
+        "subject_token_type": "urn:ietf:params:oauth:token-type:id_token",
+        "client_id": OIDC_CLIENT_ID, "client_secret": OIDC_CLIENT_SECRET,
+        "scope": scope}
+    # RFC 8707: request a specific resource → PF selects the ATM whose resource_uris match
+    # (e.g. gmJwtATM for the GM API), setting the token's audience accordingly. Empirically
+    # PF 13's resource matching lost to the client's default ATM here, so we ALSO pass PF's
+    # explicit access_token_manager_id selector (highest precedence) for the GM resource.
+    if resource.strip():
+        form["resource"] = resource.strip()
+        if resource.strip() == GM_RESOURCE:
+            form["access_token_manager_id"] = os.environ.get("GM_ATM_ID", "gmJwtATM")
     try:
         async with httpx.AsyncClient(timeout=20.0, verify=False) as c:
-            r = await c.post(PF_TOKEN, data={
-                "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
-                "subject_token": assertion,
-                "subject_token_type": "urn:ietf:params:oauth:token-type:id_token",
-                "client_id": OIDC_CLIENT_ID, "client_secret": OIDC_CLIENT_SECRET,
-                "scope": scope})
+            r = await c.post(PF_TOKEN, data=form)
             if r.status_code == 200:
                 return r.json().get("access_token", "")
             logger.warning("passkey PF broker failed %s: %s", r.status_code, r.text[:200])
@@ -2202,6 +2216,22 @@ def _forward_headers(s: dict) -> dict:
             "X-User-Token": s.get("pf_at", "")}
 
 
+async def _forward_headers_gm(s: dict) -> dict:
+    """As _forward_headers, plus X-GM-Token: a token re-audienced for the Grant Management
+    API (aud=GM_RESOURCE), minted on demand from the SAME login grant via RFC 8707. The
+    session token is aud-less and the GM servlet would reject it; this one satisfies its
+    audience check while keeping sub/client_id/agid. Best-effort — absent if the mint fails."""
+    h = _forward_headers(s)
+    if s.get("pf_at") and s.get("sub"):
+        try:
+            gm = await _broker_passkey_to_pf(s["sub"], resource=GM_RESOURCE)
+            if gm:
+                h["X-GM-Token"] = gm
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("gm-token mint failed: %s", exc)
+    return h
+
+
 @app.post("/invocations")
 async def invocations(request: Request):
     # Not gated at the app: a logged-out request is allowed through so the GATEWAY
@@ -2209,10 +2239,11 @@ async def invocations(request: Request):
     # only when Alice has a session.
     s = _session(request) or {}
     body = await request.body()
+    hdrs = await _forward_headers_gm(s)
     try:
         async with httpx.AsyncClient(timeout=180.0) as c:
             r = await c.post(PRINCIPAL_AGENT_URL + "/invocations",
-                             content=body, headers=_forward_headers(s))
+                             content=body, headers=hdrs)
             return JSONResponse(status_code=r.status_code, content=r.json())
     except Exception as exc:  # noqa: BLE001
         return JSONResponse(status_code=502, content={"error": str(exc)})
@@ -2223,11 +2254,12 @@ async def stream(request: Request):
     # See /invocations: the gateway, not the app, enforces the login challenge.
     s = _session(request) or {}
     body = await request.body()
+    hdrs = await _forward_headers_gm(s)
 
     async def gen():
         async with httpx.AsyncClient(timeout=180.0) as c:
             async with c.stream("POST", PRINCIPAL_AGENT_URL + "/stream",
-                                content=body, headers=_forward_headers(s)) as r:
+                                content=body, headers=hdrs) as r:
                 async for chunk in r.aiter_raw():
                     yield chunk
 

@@ -210,6 +210,7 @@
               padding:2px 8px; border-radius:20px; }
   .decision.allow { color:var(--ok); background:rgba(63,185,80,.12); }
   .decision.deny { color:var(--deny); background:rgba(248,81,73,.12); }
+  .decision.warn { color:#d29922; background:rgba(210,153,34,.14); }
   .pep { font-size:11px; color:var(--muted); margin-left:6px; }
   .reason { color:var(--muted); font-size:13px; margin-top:6px; }
   .hops { display:flex; gap:6px; flex-wrap:wrap; margin-top:6px; font-size:11px; color:var(--muted); }
@@ -244,7 +245,8 @@
   .wblock pre { margin:0; background:#06090d; border-radius:6px; padding:8px 10px;
                 overflow:auto; font-size:11.5px; color:#c9d1d9; line-height:1.45; }
   .wire-http { font-family:ui-monospace,Menlo,monospace; font-size:11.5px; color:#7ee787;
-               background:#06090d; border-radius:6px 6px 0 0; padding:8px 10px; }
+               background:#06090d; border-radius:6px 6px 0 0; padding:8px 10px;
+               white-space:pre-wrap; overflow-x:auto; word-break:break-all; }
   /* components reference */
   .components { width:100%; border-collapse:collapse; font-size:12.5px; }
   .components th, .components td { text-align:left; padding:7px 10px; border-bottom:1px solid var(--border); vertical-align:top; }
@@ -1382,6 +1384,69 @@ function render(steps) {
         `<div class="label">🪪 Identity proofing ← ${esc(s.agent_label||'agent')}</div>
          <span class="decision deny">✘ identity_verification_required</span>${s.pep?`<span class="pep">at ${esc(s.pep)}</span>`:''}
          <div class="reason">${esc(s.detail||('Present '+(s.doctype||'your mDL')))}</div>`));
+    } else if (s.type === 'entitlements_list') {
+      // The concierge asked the AS which accounts it may act on AT ALL — the permitted set,
+      // computed by the PDP from the customer's live holdings. This is the answer the agent
+      // is required to use instead of recalling an account from earlier in the conversation.
+      const list = Array.isArray(s.permitted) ? s.permitted : [];
+      const undecided = s.error && !list.length;
+      const badge = undecided
+        ? '<span class="decision warn">⚠ couldn’t verify</span>'
+        : `<span class="decision ${list.length ? 'allow' : 'deny'}">${list.length} permitted</span>`;
+      const chips = list.length
+        ? `<div class="chips">${list.map(a => `<span class="chip">${esc(a)}</span>`).join('')}</div>`
+        : '';
+      const g = s.guidance ? `<div class="reason">${esc(s.guidance)}</div>` : '';
+      let wireL = '';
+      if (s.wire) {
+        wireL = wireDetails('wire detail — Entitlement search (concierge → AS)', [
+          { label:'curl', desc:'the literal call, bearer = the GM-audienced token',
+            http: s.wire.curl },
+          { label:'JSON-RPC request', desc:'MCP tools/call → list_entitlements; an AuthZEN resource search WITHOUT a subject — the AS infers it from the token',
+            json: s.wire.request },
+          { label:'Response', desc:'the permitted set, from PingAuthorize\'s native AuthZEN resource search',
+            json: s.response || {} },
+        ]);
+      }
+      if (!undecided) setNode('pdp', list.length ? 'permit' : 'deny', list.length ? 'PERMIT' : 'NONE');
+      out.appendChild(el('step tool_result convo',
+        `<div class="label">🗂 Entitlements — accounts the authorization server says you may use</div>
+         <div>${esc(s.detail || '')}</div>${badge}${chips}${g}${wireL}`));
+    } else if (s.type === 'entitlements_check') {
+      // The concierge asked the Authorization Server's Grant Evaluation API whether the
+      // customer's grant still permits an action on a specific account, BEFORE acting.
+      // Three outcomes — the AS permitted, the AS denied, or the AS could not decide
+      // (token rejected / unreachable). An undecided check must NOT read as a denial.
+      const undecided = s.error && s.permitted !== true && s.permitted !== false;
+      const ok = s.permitted === true;
+      const badge = undecided
+        ? '<span class="decision warn">⚠ couldn’t verify</span>'
+        : (ok ? '<span class="decision allow">✔ permitted</span>'
+              : '<span class="decision deny">✘ not permitted</span>');
+      const g = s.guidance ? `<div class="reason">${esc(s.guidance)}</div>` : '';
+      const help = (s.permitted === false)
+        ? `<div class="reason">${s.consent_would_help
+             ? 'Re-consent would help — the customer can approve this.'
+             : 'Re-consent will NOT help — the customer no longer holds this access.'}</div>`
+        : '';
+      if (undecided) setNode('pdp', 'wait', 'no decision');
+      else setNode('pdp', ok ? 'permit' : 'deny', ok ? 'PERMIT' : 'DENY');
+      // The literal wire call: the exact curl the concierge issued against the AS's Grant
+      // Management API (MCP), plus the JSON-RPC request and the decision that came back.
+      let wire = '';
+      if (s.wire) {
+        wire = wireDetails('wire detail — Grant Evaluation call (concierge → AS)', [
+          { label:'curl', desc:'the literal call, bearer = the GM-audienced token (aud=https://gm-api.demo/grants)',
+            http: s.wire.curl },
+          { label:'JSON-RPC request', desc:'MCP tools/call → evaluate_grant on the gm-api',
+            json: s.wire.request },
+          { label:'Decision response', desc:'the AS intersected the grant with the customer\'s live holdings via Ping Authorize',
+            json: s.response || {} },
+        ]);
+      }
+      out.appendChild(el('step tool_result convo',
+        `<div class="label">🔎 Grant evaluation — asked the authorization server</div>
+         <div>${esc(s.detail || '')}</div>${badge}${s.reason ? `<span class="pep">${esc(s.reason)}</span>` : ''}${g}${help}${wire}`));
     } else if (s.type === 'scope_stepup') {
       // Display-only: the task agent reporting PEP #2's insufficient_scope. The
       // redirect itself is driven by the concierge's 'scope_challenge' event.

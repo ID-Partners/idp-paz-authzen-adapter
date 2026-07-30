@@ -1,0 +1,59 @@
+# Register the AuthZEN Authorization API 1.0 servlet extension (installed from
+# server-sdk-extensions/authzen-adapter-1.0.0.zip) and expose it on the HTTPS connection
+# handler. It serves AuthZEN IN-PROCESS and calls this same server's governance engine over
+# localhost — so the Grant Management API on PingFederate talks AuthZEN to PingAuthorize
+# directly, with no Go adapter in the path.
+#
+# Endpoints published: POST /access/v1/evaluation, /evaluations,
+# /access/v1/search/{subject,resource,action}, GET /.well-known/authzen-configuration.
+#
+# The decision envelope (domain/service/action) and attribute prefix match what the Go
+# adapter has been sending in production, so the policy sees an identical request.
+#
+# flat-tuple=true: ALSO send the tuple's scalars as flat, dot-free attributes
+# (actionName / agentId / resourceType / resourceId). The banking policy binds request
+# attributes directly — a PingAuthorize attribute name cannot contain a dot, so
+# 'AuthZEN.subject' is only reachable via json-path — and every rule keys off the flat
+# names. Without this the rules would silently never bind. The JSON attributes are still
+# sent alongside, so a policy can use either shape.
+#
+# pdp-secret is deliberately NOT set: this demo's governance-engine JSON API does not
+# enforce a shared secret (the Go adapter has run with a placeholder value throughout). A
+# real deployment must set it, alongside the matching decision-service configuration.
+#
+# api-key: inbound AuthZEN callers must present 'Authorization: Bearer <api-key>'. Same
+# demo value the Go adapter used, so the GM API servlet's existing pdpToken keeps working.
+
+dsconfig create-http-servlet-extension \
+    --extension-name "AuthZEN Adapter" \
+    --type third-party \
+    --set "extension-class:com.idpartners.authzen.AuthZenServletExtension" \
+    --set "extension-argument:pdp-url=https://localhost:1443/governance-engine" \
+    --set "extension-argument:query-url=https://localhost:1443/governance-engine/query" \
+    --set "extension-argument:pdp-secret-header=CLIENT_TOKEN" \
+    --set "extension-argument:pdp-service=AuthZEN" \
+    --set "extension-argument:pdp-action=authorize" \
+    --set "extension-argument:attribute-prefix=AuthZEN" \
+    --set "extension-argument:domain-prefix=idpartners" \
+    --set "extension-argument:flat-tuple=true" \
+    --set "extension-argument:trust-any-server-cert=true" \
+    --set "extension-argument:api-key=Password1"
+
+dsconfig set-connection-handler-prop \
+    --handler-name "HTTPS Connection Handler" \
+    --add "http-servlet-extension:AuthZEN Adapter"
+
+# Also serve AuthZEN over PLAINTEXT on 1080, reachable only on Railway's private network.
+# The callers (the GM API on PingFederate, and the gateways later) would otherwise have to
+# trust this server's self-signed cert — and the honest alternatives are worse: shipping a
+# trust-all socket factory inside an authorization component, or pinning a cert that rotates
+# with every redeploy. Plaintext on a private interface is the lesser evil for a demo.
+#
+# The servlet list is SET, not added to: this handler exposes ONLY the AuthZEN Adapter, so
+# the admin Configuration and Directory REST servlets are NOT published on it. Port 1080
+# (not 80) so it binds as the non-root server user.
+dsconfig set-connection-handler-prop \
+    --handler-name "HTTP Connection Handler" \
+    --set enabled:true \
+    --set listen-port:1080 \
+    --set "http-servlet-extension:AuthZEN Adapter"
