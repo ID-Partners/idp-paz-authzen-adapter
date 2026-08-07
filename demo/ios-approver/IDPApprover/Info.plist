@@ -2,6 +2,10 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+	<key>BGTaskSchedulerPermittedIdentifiers</key>
+	<array>
+		<string>com.idpartners.bankapprover</string>
+	</array>
 	<key>CFBundleDevelopmentRegion</key>
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleExecutable</key>
@@ -16,8 +20,6 @@
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
 	<string>1.0</string>
-	<key>CFBundleVersion</key>
-	<string>1</string>
 	<key>CFBundleURLTypes</key>
 	<array>
 		<dict>
@@ -29,13 +31,24 @@
 			</array>
 		</dict>
 	</array>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>NSCameraUsageDescription</key>
+	<string>Scan the pairing QR code shown by the bank, and verify your face when approving a payment</string>
 	<key>NSFaceIDUsageDescription</key>
 	<string>Approve payments with Face ID</string>
-	<key>NSCameraUsageDescription</key>
-	<string>Scan the QR code shown by the bank website to pair this device</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Used during face verification to check you are physically present</string>
+	<key>RecognizeApiKey</key>
+	<string>$(RECOGNIZE_API_KEY)</string>
+	<key>RecognizeHosts</key>
+	<string>$(RECOGNIZE_HOSTS)</string>
+	<key>RecognizeJwtAudience</key>
+	<string>$(RECOGNIZE_JWT_AUDIENCE)</string>
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>remote-notification</string>
+		<string>processing</string>
 	</array>
 </dict>
 </plist>

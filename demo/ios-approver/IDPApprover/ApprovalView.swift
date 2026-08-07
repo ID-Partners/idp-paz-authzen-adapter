@@ -31,7 +31,6 @@ struct ApprovalView: View {
         VStack(spacing: 0) {
             HStack {
                 IDPWordmark(size: 20)
-                Text("Bank").font(.system(size: 15, weight: .semibold)).foregroundColor(Brand.ink)
                     .padding(.leading, 2)
                 Spacer()
             }

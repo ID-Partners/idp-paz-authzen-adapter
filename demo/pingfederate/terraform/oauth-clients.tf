@@ -41,6 +41,13 @@ resource "pingfederate_oauth_client" "northwind_webapp" {
     id = "userJwtATM"
   }
 
+  # Allow the BFF to select a NON-default ATM on a token exchange. Needed for the Recognize
+  # first-factor token (recognizeUserAuthATM, see recognize-user-auth.tf), which is chosen by
+  # resource = authentication-service. With the default (true) PF refuses any ATM other than
+  # userJwtATM and the exchange fails `invalid_target`.
+  # This only WIDENS what the BFF may ask for; every mapping still governs what it actually gets.
+  restrict_to_default_access_token_manager = false
+
   oidc_policy = {
     id_token_signing_algorithm = "RS256"
     policy_group = {

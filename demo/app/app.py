@@ -18,6 +18,7 @@ that a real user is logged in (RFC 9470 step-up challenge — see Phase 3).
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import json
@@ -27,6 +28,8 @@ import re
 import secrets
 import time
 import urllib.parse
+from collections import deque
+from datetime import datetime, timezone
 
 import httpx
 import jwt  # PyJWT
@@ -41,6 +44,13 @@ app = FastAPI(title="Northwind Web App (BFF)")
 # escaped and 500'd /signin/passkey/finish AFTER a perfectly good passkey ceremony. The browser
 # then showed Safari's JSON.parse message ("The string did not match the expected pattern")
 # because it tried to r.json() the HTML 500 — a server crash disguised as a WebAuthn error.
+# Without basicConfig the root logger has no handler, so logging falls back to the WARNING-level
+# handler of last resort and every logger.info() in this file is silently discarded. That is not
+# cosmetic: it made a fail-closed Recognize verdict indistinguishable from "the code never ran"
+# and cost several debugging rounds. The sibling service (autonomous-agent) has always done this,
+# which is why only ITS logs were ever visible.
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("northwind-app")
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 
@@ -62,9 +72,14 @@ SESSION_TTL = int(os.environ.get("SESSION_TTL", "28800"))  # 8h
 # Everyday scopes Alice consents to at first login. The sensitive
 # banking:payments:transfer is NOT here — it requires a step-up (re-auth).
 DEFAULT_SCOPES = os.environ.get("DEFAULT_SCOPES",
-                                "openid banking:accounts:list banking:accounts:originate")
+                                "openid banking:accounts:list banking:accounts:originate "
+                                "grant_management_evaluate")
 SESSION_COOKIE = "nw_session"
 STEPUP_COOKIE = "nw_stepup"  # short-lived: carries the requested step-up scope across the passkey ceremony
+# RFC 8707 resource for the Grant Management API. Requesting it on the broker exchange
+# selects the gmJwtATM, which mints a token AUDIENCED for the GM API (aud=this value) from
+# the SAME login grant — so agid/sub/client_id are preserved but aud satisfies the servlet.
+GM_RESOURCE = os.environ.get("GM_RESOURCE", "https://gm-api.demo/grants")
 
 
 def _b64u(b: bytes) -> str:
@@ -160,31 +175,35 @@ AUTHZEN_ADAPTER_URL = os.environ.get(
 
 @app.get("/proofing/gate")
 async def proofing_gate_get():
-    """Read the mDL identity-proofing gate switch state (proxies the adapter)."""
+    """Read the mDL origination-gate switch (proxies the proofing directory).
+
+    Moved off the Go authzen-adapter's /admin/proofing-gate on 2026-08-08 when the
+    adapter left the wire path: the switch now lives in the proofing directory, the
+    PDP reads it via a ProofingGate REST PIP, and this proxy only serves the UI."""
     try:
         async with httpx.AsyncClient(timeout=8.0) as c:
-            r = await c.get(f"{AUTHZEN_ADAPTER_URL}/admin/proofing-gate")
+            r = await c.get(f"{PROOFING_DIRECTORY_URL}/gate")
             return r.json()
     except Exception as e:
         return JSONResponse(status_code=502,
-                            content={"error": "adapter_unreachable", "detail": str(e)})
+                            content={"error": "directory_unreachable", "detail": str(e)})
 
 
 @app.post("/proofing/gate")
 async def proofing_gate_set(request: Request):
-    """Flip the mDL identity-proofing gate on/off (proxies the adapter). Demo control plane."""
+    """Flip the mDL origination gate on/off (proxies the proofing directory)."""
     try:
         body = await request.json()
     except Exception:
         body = {}
     try:
         async with httpx.AsyncClient(timeout=8.0) as c:
-            r = await c.post(f"{AUTHZEN_ADAPTER_URL}/admin/proofing-gate",
+            r = await c.post(f"{PROOFING_DIRECTORY_URL}/gate",
                              json={"enabled": bool(body.get("enabled"))})
             return r.json()
     except Exception as e:
         return JSONResponse(status_code=502,
-                            content={"error": "adapter_unreachable", "detail": str(e)})
+                            content={"error": "directory_unreachable", "detail": str(e)})
 
 
 @app.post("/proofing/start")
@@ -492,6 +511,12 @@ async def _record_stepup_consent(su: dict, subject: str) -> str:
         amt = float(su.get("amount") or 0)
     except (TypeError, ValueError):
         amt = 0.0
+    # Carry the assurance ACTUALLY achieved on this path. Before Recognize this was never
+    # written here at all (only the paired-device /stepup/approve path wrote it), so the
+    # directory's consent-check always fell back to "app-asserted" for every passkey-stepup
+    # consent — correct for a plain passkey, but silently flattened a Recognize-verified
+    # no-device approval down to the SAME level as an unverified one. See stepup_consent_finish.
+    assurance = su.get("assurance") or ASSURANCE_APP_ASSERTED
     try:
         async with httpx.AsyncClient(timeout=8.0) as c:
             await c.post(f"{PROOFING_DIRECTORY_URL}/consents", json={
@@ -505,9 +530,10 @@ async def _record_stepup_consent(su: dict, subject: str) -> str:
                 "amount": amt, "currency": su.get("currency") or "AUD",
                 "debtor_account": su.get("debtor") or "",
                 "creditor_account": su.get("creditor") or "",
-                "status": "authorized"})
-        logger.info("recorded passkey-stepup consent txn=%s subject=%s amount=%s creditor=%s",
-                    txn, subject, amt, su.get("creditor"))
+                "status": "authorized",
+                "authorization_details": [{"type": "payment_initiation", "assurance": assurance}]})
+        logger.info("recorded passkey-stepup consent txn=%s subject=%s amount=%s creditor=%s assurance=%s",
+                    txn, subject, amt, su.get("creditor"), assurance)
     except Exception as exc:  # noqa: BLE001 — must never block the passkey sign-in
         logger.warning("stepup consent record failed: %s", exc)
     return txn
@@ -536,23 +562,46 @@ async def _record_consent_decision(su: dict, subject: str, status: str) -> None:
         logger.warning("consent decision record failed: %s", exc)
 
 
-async def _project_delegation_grant(subject: str, scope: str, consent_txn: str) -> None:
+async def _project_delegation_grant(subject: str, scope: str, consent_txn: str,
+                                    assurance: str | None = None) -> None:
     """Project the delegation grant into the identity store when the step-up authorises the agent
     to act for the principal. oauthGrant + agentDelegation (principal=subject, agent=concierge),
     linked to the consent that authorised it — the consent→grant→token→action chain, now held in
     the Identity Object Model. Idempotent per (principal, agent): one grant relationship, upserted.
-    Best-effort; never blocks the sign-in."""
+    Best-effort; never blocks the sign-in.
+
+    A STANDING delegation (an agent trusted to act for this principal across future requests,
+    not just this one payment) is a materially bigger grant of authority than a single-payment
+    step-up — so the FIRST time a (subject, agent) grant is created, it requires the top of the
+    assurance ladder: a Recognize-verified human, not merely a device tap or an app-asserted
+    passkey. Once the grant exists, later step-ups keep refreshing/upserting it as before (an
+    already-standing delegation doesn't need re-approving on every payment — Phase 1's
+    Recognize check on the payment itself is what gates THAT). See demo/TRANSACTION-AUTHORIZATION.md
+    for why 'a device tapped approve' and 'a person was biometrically confirmed' are not the
+    same evidence."""
+    assurance = assurance or ASSURANCE_APP_ASSERTED
     if not PROOFING_DIRECTORY_URL:
         return
     agent = "urn:agent:northwind-concierge:v1"
+    guid = f"g_{subject}:{agent}"
     try:
         async with httpx.AsyncClient(timeout=8.0) as c:
+            existing = await c.get(f"{PROOFING_DIRECTORY_URL}/grants/{guid}")
+            is_new = existing.status_code == 404
+            if is_new and assurance != ASSURANCE_RECOGNIZE_VERIFIED:
+                logger.info("standing delegation grant NOT created for %s -> %s: assurance=%s "
+                            "insufficient for a first-time grant (need recognize-verified)",
+                            subject, agent, assurance)
+                return
             await c.post(f"{PROOFING_DIRECTORY_URL}/grants", json={
-                "grant_guid": f"g_{subject}:{agent}",   # one grant per delegation relationship
+                "grant_guid": guid,   # one grant per delegation relationship
                 "principal_id": subject, "agent_id": agent,
                 "client_id": OIDC_CLIENT_ID, "agent_operator_id": OIDC_CLIENT_ID,
                 "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
                 "scope": scope, "consent_ref": consent_txn})
+            if is_new:
+                logger.info("standing delegation grant CREATED for %s -> %s (recognize-verified)",
+                            subject, agent)
     except Exception as exc:  # noqa: BLE001
         logger.warning("grant projection failed: %s", exc)
 
@@ -597,6 +646,239 @@ AUTHZ_TYPE_PROOFING = "identity_proofing"        # VC/VP presentation request
 ASSURANCE_APP_ASSERTED = "app-asserted"    # local passkey; signature does NOT cover the payment
 ASSURANCE_DEVICE_APPROVED = "device-approved"  # paired device approved, but sent no signature
 ASSURANCE_DEVICE_SIGNED = "device-signed"      # paired device signed over the transaction hash
+# PingOne Recognize verified the PERSON (liveness + face match), not just the device or a
+# signature. Ranked top of the ladder: it is evidence about WHO is present, which the other
+# rungs (device possession, device signature) do not give you on their own. See
+# demo/pingfederate/README.md's Recognize integration note for how a verdict gets here.
+ASSURANCE_RECOGNIZE_VERIFIED = "recognize-verified"
+
+# PingOne Recognize / Keyless integration. SIMULATE (default) accepts a client-asserted
+# {"recognizeVerified": true} — the Keyless DaVinci connector / Recognize Mobile SDK aren't
+# wired to a real tenant yet, so this lets the whole assurance→PDP pipeline be built and
+# demoed today. REAL (RECOGNIZE_SIMULATE=0) requires recognizeAssertion: a JWT signed by the
+# Recognize/Keyless tenant, verified against RECOGNIZE_JWKS_URL before the verdict is trusted.
+# Mirrors the SIMULATE convention already used for Bob's phone tap (demo/autonomous-agent/agent.py).
+RECOGNIZE_SIMULATE = os.environ.get("RECOGNIZE_SIMULATE", "1").lower() not in ("0", "false", "no")
+RECOGNIZE_JWKS_URL = os.environ.get("RECOGNIZE_JWKS_URL", "")
+# Audience we require on the Recognize assertion. Must equal the iOS build's
+# RECOGNIZE_JWT_AUDIENCE. Unset = no audience check (the old, weaker behaviour) — so this is
+# additive and safe to roll out before the phone starts stamping it.
+RECOGNIZE_JWT_AUDIENCE = os.environ.get("RECOGNIZE_JWT_AUDIENCE", "")
+RECOGNIZE_ISSUER = os.environ.get("RECOGNIZE_ISSUER", "")
+
+# The REAL Keyless/Recognize Web SDK. These two values are provisioned by Keyless when the tenant
+# is created and are NOT discoverable from the customer dashboard or the public docs — the docs
+# list them as things you must already have ("CUSTOMER_NAME to define the customer,
+# KEYLESS_AUTHENTICATION_SERVICE_URL to establish a connection"). Until both are set the demo
+# serves the simulated screen instead, so an unprovisioned environment still runs end to end.
+#
+# The contract below was read off the SDK's own published TypeScript definitions
+# (@keyless/sdk-web@3.0.0 index.d.ts) rather than guessed:
+#   KeylessOptions { customer:{name}, service:{url}, username, transaction?:{data}, ... }
+# and the web component mirrors it as the attributes customer / service-url / username /
+# transaction-data. The SDK posts to <service.url>/v2/sessions to open a session, and on success
+# emits a `success` event whose detail carries a signed **jwt** — that JWT is what
+# _recognize_verdict() verifies in REAL mode, which is why RECOGNIZE_JWKS_URL exists.
+RECOGNIZE_CUSTOMER_NAME = os.environ.get("RECOGNIZE_CUSTOMER_NAME", "")
+RECOGNIZE_SERVICE_URL = os.environ.get("RECOGNIZE_SERVICE_URL", "").rstrip("/")
+RECOGNIZE_SDK_URL = os.environ.get(
+    "RECOGNIZE_SDK_URL",
+    "https://d3hz8ozgrmhn4r.cloudfront.net/sdk-web-components/3.0.0/index.js")
+
+# Keyless runs ONE authentication service per region; a tenant lives in exactly one of them, and
+# the dashboard does not say which. All of these answer `POST /v2/sessions` with 201 for ANY
+# customer name, so the region cannot be identified by probing — only by getting far enough into
+# the encrypted exchange for the tenant lookup to succeed or fail. Hence the ?region= override on
+# /recognize/enrol: it lets us try each one against a real camera without a redeploy per attempt.
+# Naming convention: authentication-service.eks.core-production.<region>.keyless.technology
+RECOGNIZE_REGIONS = {
+    "us": "https://authentication-service.eks.core-production.saas-us-east.keyless.technology",
+    "eu": "https://authentication-service.eks.core-production.keyless.technology",
+    "latam": "https://authentication-service.eks.core-production.latam.keyless.technology",
+    "sandbox": "https://authentication-service-sandbox.eks.core-production.keyless.technology",
+    "staging": "https://authentication-service.eks.core-staging.keyless.technology",
+}
+
+# ── Recognize "User Authorization" — the first factor, minted by PingFederate ─────────────────
+# Recognize can require an integrator-supplied JWT before it will run ANY biometric processing:
+# sub = the username handed to the SDK, aud = "authentication-service", short-lived, single-use.
+# Keyless validates it against a JWKS we publish (tenant config User Authorization Type =
+# RemoteJWKSet, which only Keyless staff can set), so it is a genuine first factor rather than a
+# client-side claim: it stops someone driving the Keyless service directly with a username that
+# was never authenticated here.
+#
+# PF mints it (recognizeUserAuthATM, see pingfederate/terraform/recognize-user-auth.tf) off the
+# SAME BFF assertion + signupTE exchange the passkey path already uses — which is what makes it
+# work at SIGN-ON, where there is no session yet to exchange. The RESOURCE below is an internal
+# ATM-selection key only; PF rejects a non-absolute resource URI, so it is a URN and is never
+# dialed. The token's audience is set by the ATM, not by this value.
+RECOGNIZE_USERAUTH_RESOURCE = os.environ.get(
+    "RECOGNIZE_USERAUTH_RESOURCE", "urn:northwind:recognize:authentication-service")
+# Off by default: sending an authorization token to a tenant that is NOT configured for
+# RemoteJWKSet is harmless, but minting one costs a PF round-trip per page load. Turn on when
+# Keyless confirms the tenant setting.
+RECOGNIZE_USERAUTH_ENABLED = os.environ.get(
+    "RECOGNIZE_USERAUTH_ENABLED", "0").lower() not in ("0", "false", "no", "")
+
+
+def recognize_real_configured() -> bool:
+    """True when a real Keyless tenant is wired up. Both values are required: a customer name
+    without a service URL (or vice versa) cannot open a session, and silently falling back to
+    'simulated' while claiming a real biometric check is exactly the overstatement this demo's
+    assurance ladder exists to prevent."""
+    return bool(RECOGNIZE_CUSTOMER_NAME and RECOGNIZE_SERVICE_URL)
+
+
+def _td_amount(v) -> str:
+    """Normalise an amount for comparison: '"AUD 9,000.00"' / '9000' / 9000.0 -> '9000.00'."""
+    s = re.sub(r"[^0-9.]", "", str(v or ""))
+    if not s:
+        return ""
+    try:
+        return f"{float(s):.2f}"
+    except ValueError:
+        return ""
+
+
+def _td_flatten(td) -> dict:
+    """The `td` claim reaches us in more than one shape and both are legitimate:
+      - Mobile SDK: the array-of-single-pair-objects Recognize mandates for display, e.g.
+        [{"Amount":"AUD 9000.00"},{"To":"ACME"},{"From":"Alice"},{"Reference":"NW-1"}]
+      - Web SDK: whatever object was passed as transaction-data, e.g.
+        {"amount":"9000","currency":"AUD","creditor":"ACME","debtor":"Alice"}
+    Either may arrive as a JSON *string* (JwtSigningInfo takes a String). Flatten to one
+    lower-cased dict so the comparison below does not care which surface produced it."""
+    if isinstance(td, str):
+        try:
+            td = json.loads(td)
+        except Exception:  # noqa: BLE001 — a non-JSON td simply yields no comparable fields
+            return {}
+    out: dict = {}
+    if isinstance(td, list):
+        for item in td:
+            if isinstance(item, dict):
+                for k, v in item.items():
+                    out[str(k).strip().lower()] = v
+    elif isinstance(td, dict):
+        out = {str(k).strip().lower(): v for k, v in td.items()}
+    return out
+
+
+def _td_matches(td, su: dict) -> bool:
+    """Is the SIGNED transaction data the payment we are actually approving?
+
+    This is the dynamic-linking check, and it is the difference between "a real person passed a
+    face match" and "a real person approved THIS payment". Without it a valid assertion captured
+    for a $10 coffee would authorise a $9,000 transfer — the assertion is genuine, it is simply
+    not *about* this instruction. PSD2 RTS Art. 5 requires the binding to cover the **amount and
+    the payee**, so those are the two fields enforced here; reference/debtor are display detail
+    and deliberately not required to match.
+
+    Fails CLOSED: an absent, unparseable, or non-matching `td` is not a verdict for this payment.
+    """
+    flat = _td_flatten(td)
+    if not flat:
+        logger.warning("recognize td missing/unparseable — refusing to treat as bound")
+        return False
+
+    want_amt = _td_amount(su.get("amount"))
+    got_amt = _td_amount(next((flat[k] for k in ("amount", "amt", "value") if k in flat), ""))
+    if want_amt and got_amt != want_amt:
+        logger.warning("recognize td AMOUNT mismatch: signed=%r expected=%r", got_amt, want_amt)
+        return False
+
+    want_payee = str(su.get("creditor") or "").strip().lower()
+    got_payee = str(next((flat[k] for k in ("to", "payee", "creditor") if k in flat), "")).strip().lower()
+    if want_payee and got_payee and want_payee not in got_payee and got_payee not in want_payee:
+        logger.warning("recognize td PAYEE mismatch: signed=%r expected=%r", got_payee, want_payee)
+        return False
+    if want_payee and not got_payee:
+        logger.warning("recognize td carries no payee — refusing to treat as bound")
+        return False
+
+    logger.info("recognize td BOUND to this payment: amount=%s payee=%s", got_amt, got_payee)
+    return True
+
+
+def _recognize_verdict(body: dict, expected: dict | None = None) -> bool:
+    """True if `body` carries evidence of a completed Recognize verification. In SIMULATE
+    mode any client-asserted `recognizeVerified: true` is accepted — good enough to prove out
+    the assurance→PDP wiring, NOT non-repudiable (the client could lie). In REAL mode a signed
+    `recognizeAssertion` JWT is required and verified against the tenant's JWKS; an unverifiable
+    or absent assertion is NOT a verified verdict, full stop — this must fail closed."""
+    if RECOGNIZE_SIMULATE:
+        return bool(body.get("recognizeVerified"))
+    token = str(body.get("recognizeAssertion") or "")
+    if not (token and RECOGNIZE_JWKS_URL):
+        # Was silent, which made a fail-closed look identical to "never called" in the logs and
+        # cost a whole debugging round. Say WHICH half is missing: a client that reports
+        # recognizeVerified:true with no assertion is the interesting case — the biometric ran
+        # on the device but produced nothing a server can check.
+        logger.warning(
+            "recognize REAL mode refused: assertion=%s jwks_url=%s client_claimed_verified=%s",
+            "present" if token else "MISSING",
+            "set" if RECOGNIZE_JWKS_URL else "MISSING",
+            bool(body.get("recognizeVerified")))
+        return False
+    try:
+        jwks_client = jwt.PyJWKClient(RECOGNIZE_JWKS_URL)
+        key = jwks_client.get_signing_key_from_jwt(token)
+        # Verify `aud` when we have pinned one. Without it (verify_aud False) an assertion
+        # minted for a DIFFERENT relying party on the same tenant verifies here perfectly well —
+        # right signature, right issuer, wrong audience. The phone stamps this via
+        # JwtSigningInfo(audience:); the two values must match exactly.
+        claims = jwt.decode(token, key.key, algorithms=["RS256", "ES256"],
+                            issuer=RECOGNIZE_ISSUER or None,
+                            audience=RECOGNIZE_JWT_AUDIENCE or None,
+                            options={"verify_aud": bool(RECOGNIZE_JWT_AUDIENCE)})
+    except Exception as exc:  # noqa: BLE001 — an unverifiable assertion is simply not a verdict
+        logger.warning("recognize assertion verification failed: %s", exc)
+        return False
+
+    # THE SIGNATURE IS THE VERDICT. Recognize mints this JWT only on a successful match, so a
+    # token that verifies against the tenant's JWKS *is* the evidence — there is no boolean to
+    # read. The real claim set is {iat, td, version, sub, external_user_id} (mobile) with kid
+    # PIN|FACE; earlier code here looked for a `verified`/`result` claim that Recognize has never
+    # emitted, which made REAL mode fail closed on every genuine assertion.
+    #
+    # Honour an explicit negative if a future/other issuer ever emits one, but never REQUIRE it.
+    if claims.get("verified") is False or claims.get("result") in ("fail", "failed"):
+        return False
+
+    # DYNAMIC LINKING. When there is a specific instruction in flight, the signed `td` must BE
+    # that instruction — a valid assertion about some other payment is not authorisation for this
+    # one. Only enforced when `expected` describes a payment, so sign-on (nothing to bind to) is
+    # unaffected. See demo/TRANSACTION-AUTHORIZATION.md for why this is the whole argument for
+    # Recognize over a browser passkey.
+    if expected and expected.get("amount"):
+        if not _td_matches(claims.get("td"), expected):
+            return False
+        logger.info("recognize assertion verified AND bound: sub=%s", claims.get("sub"))
+    else:
+        logger.info("recognize assertion verified (nothing to bind to): sub=%s", claims.get("sub"))
+    return True
+
+
+def _deep_recognize_field(o) -> bool:
+    """Scan a DaVinci flow's (nested, shape-varies-by-node) success response for a captured
+    `recognizeVerified` form field that reads true. Used for the widget-embedded flows (payment
+    consent, sign-on) — unlike _recognize_verdict, which reads a flat client-posted body, a
+    flow's success payload nests captured fields under whichever node produced them, so a
+    fixed-shape lookup misses it (see stepup_consent_finish's original comment on why _decision
+    needed the same treatment for buttonValue)."""
+    if isinstance(o, dict):
+        for k, v in o.items():
+            if k.lower() in ("recognizeverified", "recognize_verified") and (
+                    v is True or (isinstance(v, str) and v.lower() in ("true", "1", "pass", "passed"))):
+                return True
+            if _deep_recognize_field(v):
+                return True
+    elif isinstance(o, list):
+        for v in o:
+            if _deep_recognize_field(v):
+                return True
+    return False
+
 
 # In-flight step-ups keyed by the ≤20-char code that rides the CIBA binding_message.
 _STEPUPS: dict[str, dict] = {}
@@ -830,7 +1112,10 @@ async def stepup_code(code: str, request: Request):
 @app.post("/stepup/approve")
 async def stepup_approve(request: Request):
     """The paired device approves. A signature over `hash` is what makes this binding;
-    without one the approval is recorded at the WEAKER device-approved level."""
+    without one the approval is recorded at the WEAKER device-approved level. A Recognize
+    verdict (recognizeVerified / recognizeAssertion — see _recognize_verdict) OUTRANKS both:
+    it is evidence of WHO approved, not just that a paired device did, and takes the top
+    rung of the ladder regardless of whether a signature also came along."""
     user = _device_user(request)
     if not user:
         return JSONResponse(status_code=401, content={"error": "device token required"})
@@ -842,9 +1127,17 @@ async def stepup_approve(request: Request):
         return JSONResponse(status_code=403, content={"error": "not your step-up"})
 
     signature = str(body.get("signature") or "")
+    # Pass the step-up record so the assertion is checked against THIS payment, not merely
+    # verified as genuine. `su` is the server's own copy (from the CIBA push) — never anything
+    # the approving device supplied, or the binding would be self-attested and worthless.
+    recognized = _recognize_verdict(body, expected=su)
     su["status"] = "approved"
-    su["assurance"] = ASSURANCE_DEVICE_SIGNED if signature else ASSURANCE_DEVICE_APPROVED
+    if recognized:
+        su["assurance"] = ASSURANCE_RECOGNIZE_VERIFIED
+    else:
+        su["assurance"] = ASSURANCE_DEVICE_SIGNED if signature else ASSURANCE_DEVICE_APPROVED
     su["signature"] = signature
+    su["recognize_verified"] = recognized
     su["approved_at"] = int(time.time())
 
     # Retain the ARTEFACT, not a boolean: the dispute layer needs what was signed.
@@ -1027,15 +1320,30 @@ async def stepup_consent_finish(request: Request):
         return ""
     decision = _decision(body)
     approved = decision == "approve"
-    logger.info("davinci consent decision=%r approved=%s subject=%s | raw=%s",
-                decision or "unknown", approved, su.get("subject"), json.dumps(body)[:400])
+
+    # Was there ALSO a Recognize verification screen in this flow, and did it pass? This is
+    # additive to the button decision — Recognize failing does not itself imply "decline";
+    # the flow's own screen decides whether a failed check blocks the Approve button at all.
+    recognized = _deep_recognize_field(body)
+
+    logger.info("davinci consent decision=%r approved=%s recognized=%s subject=%s | raw=%s",
+                decision or "unknown", approved, recognized, su.get("subject"), json.dumps(body)[:400])
     if not approved:
         # A DECLINE is a real decision and belongs in the directory. Recording only
         # approvals leaves a record that cannot distinguish "refused" from "never asked".
         await _record_consent_decision(su, su.get("subject", ""), "declined")
         return {"ok": False, "decision": "declined", "next": "/"}
     hint = "?stepup=1" + (("&u=" + urllib.parse.quote(su.get("subject", ""))) if su.get("subject") else "")
-    return {"ok": True, "decision": "approved", "next": "/signup" + hint}
+    resp = JSONResponse({"ok": True, "decision": "approved", "next": "/signup" + hint})
+    if recognized:
+        # Carry the verdict forward on the SAME cookie the passkey ceremony reads (su, +600s
+        # TTL matching the original set_cookie calls) so _record_stepup_consent — which runs
+        # after the ceremony, not here — writes recognize-verified instead of defaulting to
+        # app-asserted. Without this, a passed Recognize check on the no-device path would be
+        # thrown away the moment the flow handed off to the passkey ceremony.
+        resp.set_cookie(STEPUP_COOKIE, _sign({**su, "assurance": ASSURANCE_RECOGNIZE_VERIFIED}, 600),
+                        httponly=True, secure=True, samesite="lax", max_age=600)
+    return resp
 
 
 @app.get("/stepup/complete")
@@ -1050,7 +1358,8 @@ async def stepup_complete(code: str = ""):
     if su.get("status") != "approved":
         return JSONResponse(status_code=409, content={"error": "not approved yet"})
     user = su["subject"]
-    await _project_delegation_grant(user, su["scope"], su["txn"])
+    await _project_delegation_grant(user, su["scope"], su["txn"],
+                                    assurance=su.get("assurance", ASSURANCE_APP_ASSERTED))
     pf_at = await _broker_passkey_to_pf(user, extra_scope=su["scope"])
     logger.info("stepup complete via device: subject=%s txn=%s assurance=%s",
                 user, su["txn"], su.get("assurance"))
@@ -1241,6 +1550,15 @@ DAVINCI_POLICY_ID = os.environ.get("DAVINCI_POLICY_ID", "")
 DAVINCI_API_ROOT = os.environ.get("DAVINCI_API_ROOT", "https://auth.pingone.asia").rstrip("/")
 DAVINCI_ASSETS_ROOT = os.environ.get("DAVINCI_ASSETS_ROOT", "https://assets.pingone.asia").rstrip("/")
 
+# Third sign-on option: PingOne Recognize (biometric), via the "Recognize Sign-On (simulated)"
+# DaVinci flow — same widget-embed mechanism as the passkey-via-DaVinci option above, pointed at
+# a different flow policy. Unlike that option, PingOne is NOT what's authenticating here (there's
+# no real Recognize tenant yet — see RECOGNIZE_SIMULATE); the flow only carries the verification
+# UX, and /signup/recognize/finish (below) still requires the named user to already exist and
+# have a passkey before brokering a session, so a Recognize pass alone can't sign in as anyone.
+DAVINCI_RECOGNIZE_SIGNIN_POLICY_ID = os.environ.get(
+    "DAVINCI_RECOGNIZE_SIGNIN_POLICY_ID", "8376b8aadec32fcdaa4ccdb2911b6c4c")
+
 
 async def _davinci_sdktoken() -> str:
     """Mint a DaVinci sdkToken (usage=startSpecificFlowOrPolicyNonUserContext) with the SK API
@@ -1310,6 +1628,230 @@ run();
 </script></body></html>"""
 
 
+# PingOne Recognize sign-in widget. Same skRenderScreen embed mechanism as _DAVINCI_HTML, pointed
+# at DAVINCI_RECOGNIZE_SIGNIN_POLICY_ID instead. The username is rendered SERVER-SIDE (like
+# _payment_summary_html does for the payment amount) rather than passed into the flow itself —
+# the widget's runFlow config has no `parameters` key (DaVinci rejects unknown keys in the runFlow
+# body), so per-request personalisation has to happen on this wrapper page, not inside the flow.
+_RECOGNIZE_SIGNIN_HTML = """<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Sign in with Recognize — Demo Bank</title>
+<style>body{font-family:-apple-system,system-ui,sans-serif;background:#101418;color:#e8e8e8;
+display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}
+.card{background:#1a2027;border:1px solid #2a323c;border-radius:14px;padding:28px;width:400px}
+.brand{font-size:20px;font-weight:700;margin:0 0 4px}
+.sub{color:#9aa5b1;font-size:13px;margin:0 0 18px}.sub b{color:#e8e8e8}
+#widget{min-height:120px}
+#msg{font-size:13px;margin-top:12px;min-height:18px;color:#ff8b7b}
+.vendor{margin-top:18px;padding-top:14px;border-top:1px solid #2a323c;color:#9aa5b1;
+font-size:11px;display:flex;align-items:center;justify-content:center;gap:7px}.vendor img{height:18px}
+a.alt{color:#7fb0ff;font-size:12px;text-decoration:none;display:block;margin-top:10px;text-align:center}</style>
+</head><body>
+<div class="card">
+  <div class="brand">🏦 Demo Bank</div>
+  <div class="sub">Signing in as <b>__USER__</b> — verified by <b>PingOne Recognize</b>.</div>
+  <div id="widget"></div>
+  <div id="msg"></div>
+  <a class="alt" href="/signup">Use a passkey instead →</a>
+  <div class="vendor">Powered by <img src="/static/idp-wordmark.svg" alt="ID Partners"></div>
+</div>
+<script src="__ASSETS__/davinci/latest/davinci.js"></script>
+<script>
+const msg = t => { document.getElementById('msg').textContent = t || ''; };
+const username = "__USER__";
+async function run(){
+  let cfg;
+  try { cfg = await fetch('/signup/recognize/token').then(r=>r.json()); }
+  catch(e){ msg('Could not reach the flow service.'); return; }
+  if(cfg.error){ msg('Recognize sign-in is not configured for this environment.'); return; }
+  if(!window.davinci || !window.davinci.skRenderScreen){ msg('Widget SDK failed to load.'); return; }
+  window.davinci.skRenderScreen(document.getElementById('widget'), {
+    config: { method:'runFlow', apiRoot: cfg.apiRoot, accessToken: cfg.accessToken,
+              companyId: cfg.companyId, policyId: cfg.policyId },
+    useModal: false,
+    successCallback: async function(response){
+      try {
+        const r = await fetch('/signup/recognize/finish', {method:'POST',
+          headers:{'content-type':'application/json'},
+          body: JSON.stringify({response: response||{}, username})}).then(r=>r.json());
+        if(r.ok){ msg('✓ Signed in…'); setTimeout(()=>location.href=(r.next||'/'), 400); }
+        else { msg((r.detail||r.error||'Sign-in failed')); }
+      } catch(e){ msg('Broker failed: '+e.message); }
+    },
+    errorCallback: function(e){ msg('Flow error: '+(e && e.message ? e.message : JSON.stringify(e))); }
+  });
+}
+run();
+</script></body></html>"""
+
+
+# The REAL PingOne Recognize screen: the actual Keyless Web SDK doing a live face match, not a
+# DaVinci stand-in. Served only when recognize_real_configured() (see above); otherwise the
+# simulated DaVinci screen above is used.
+#
+# `transaction-data` is the PSD2 dynamic-linking hook: the SDK binds the biometric check to THIS
+# instruction, so the resulting JWT attests to what was approved rather than merely that someone
+# passed a face match at some point. That is the property demo/TRANSACTION-AUTHORIZATION.md says
+# the browser-passkey path can never have, so it is passed whenever a payment is in flight.
+_RECOGNIZE_REAL_HTML = """<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Verify it's you — Demo Bank</title>
+<style>body{font-family:-apple-system,system-ui,sans-serif;background:#101418;color:#e8e8e8;
+display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}
+.card{background:#1a2027;border:1px solid #2a323c;border-radius:14px;padding:28px;width:430px}
+.brand{font-size:20px;font-weight:700;margin:0 0 4px}
+.sub{color:#9aa5b1;font-size:13px;margin:0 0 16px}.sub b{color:#e8e8e8}
+.txn{background:#101418;border:1px solid #2a323c;border-left:3px solid #f26a1b;border-radius:10px;
+padding:14px 16px;margin:0 0 16px}
+.txn .amt{font-size:22px;font-weight:700;color:#fff;letter-spacing:-.5px}
+.txn .row{display:flex;justify-content:space-between;font-size:12.5px;color:#9aa5b1;margin-top:7px}
+.txn .row b{color:#e8e8e8;font-weight:600}
+#widget{min-height:320px}
+#msg{font-size:13px;margin-top:12px;min-height:18px;color:#ff8b7b}
+.vendor{margin-top:18px;padding-top:14px;border-top:1px solid #2a323c;color:#9aa5b1;
+font-size:11px;display:flex;align-items:center;justify-content:center;gap:7px}.vendor img{height:18px}
+a.alt{color:#7fb0ff;font-size:12px;text-decoration:none;display:block;margin-top:10px;text-align:center}</style>
+</head><body>
+<div class="card">
+  <div class="brand">🏦 Demo Bank</div>
+  <div class="sub">Verifying <b>__USER__</b> with <b>PingOne Recognize</b> — a live face match.</div>
+  __TXN__
+  <kl-auth id="klauth" customer="__CUSTOMER__" service-url="__SERVICEURL__"
+           username="__USER__" __TXNATTR__ __TOKENATTR__ enable-close-button></kl-auth>
+  <div id="msg"></div>
+  <a class="alt" href="/signup">Use a passkey instead →</a>
+  <div class="vendor">Powered by <img src="/static/idp-wordmark.svg" alt="ID Partners"></div>
+</div>
+<script type="module" src="__SDK__"></script>
+<script>
+const msg = t => { document.getElementById('msg').textContent = t || ''; };
+const el = document.getElementById('klauth');
+// The SDK emits `success` with detail.jwt — a token signed by the Recognize tenant. We send the
+// JWT itself, never a bare boolean: the server verifies it against RECOGNIZE_JWKS_URL, so a
+// tampered client cannot assert a pass it did not earn (see _recognize_verdict, REAL mode).
+el.addEventListener('success', async (e) => {
+  const jwt = (e.detail && e.detail.jwt) || '';
+  if (!jwt) { msg('Verification returned no assertion — cannot proceed.'); return; }
+  msg('✓ Verified — signing you in…');
+  try {
+    const r = await fetch('/signup/recognize/finish', {method:'POST',
+      headers:{'content-type':'application/json'},
+      body: JSON.stringify({ username: "__USER__", recognizeAssertion: jwt })}).then(r=>r.json());
+    if (r.ok) { location.href = r.next || '/'; }
+    else { msg(r.detail || r.error || 'Sign-in failed'); }
+  } catch (err) { msg('Could not complete sign-in: ' + err.message); }
+});
+el.addEventListener('error', (e) => {
+  const d = e.detail || {};
+  const detail = JSON.stringify(d || {});
+  // A user who has never enrolled has no template to match against, and the service reports that
+  // as a generic internal error — which reads like an outage rather than "you need to enrol".
+  // Offer the enrolment path instead of leaving them on a dead end.
+  const looksUnenrolled = /SERVER_INTERNAL_ERROR|NOT_FOUND|NO_USER/i.test(detail);
+  msg('Verification failed: ' + (d.message || d.reason || 'unknown error'));
+  if (looksUnenrolled) {
+    const a = document.createElement('a');
+    a.className = 'alt';
+    a.href = '/recognize/enrol?user=' + encodeURIComponent("__USER__");
+    a.textContent = 'Not enrolled yet? Enrol your face first →';
+    document.getElementById('msg').after(a);
+  }
+});
+el.addEventListener('close', () => { location.href = '/signup'; });
+</script></body></html>"""
+
+
+# Enrolment — the step that has to happen ONCE before any face match can succeed. Authenticating
+# a user who has never enrolled fails with SERVER_INTERNAL_ERROR from the Recognize service (it
+# has no template to match against), which is a confusing way to learn this, hence a first-class
+# page for it. Same component contract as kl-auth (KeylessEnrollElement extends the same
+# RootElement), just the enrolling tag.
+_RECOGNIZE_ENROL_HTML = """<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Enrol your face — Demo Bank</title>
+<style>body{font-family:-apple-system,system-ui,sans-serif;background:#101418;color:#e8e8e8;
+display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}
+.card{background:#1a2027;border:1px solid #2a323c;border-radius:14px;padding:28px;width:430px}
+.brand{font-size:20px;font-weight:700;margin:0 0 4px}
+.sub{color:#9aa5b1;font-size:13px;margin:0 0 16px}.sub b{color:#e8e8e8}
+.note{background:#141a22;border:1px solid #2a323c;border-radius:8px;padding:12px 14px;
+margin:0 0 16px;font-size:12.5px;color:#9aa5b1;line-height:1.45}
+#widget{min-height:320px}
+#msg{font-size:13px;margin-top:12px;min-height:18px;color:#ff8b7b}
+#msg.ok{color:#5fd08a}
+.vendor{margin-top:18px;padding-top:14px;border-top:1px solid #2a323c;color:#9aa5b1;
+font-size:11px;display:flex;align-items:center;justify-content:center;gap:7px}.vendor img{height:18px}
+a.alt{color:#7fb0ff;font-size:12px;text-decoration:none;display:block;margin-top:10px;text-align:center}</style>
+</head><body>
+<div class="card">
+  <div class="brand">🏦 Demo Bank</div>
+  <div class="sub">Enrolling <b>__USER__</b> with <b>PingOne Recognize</b>.</div>
+  <div class="note">This registers your face once so it can be matched later. Recognize stores a
+    privacy-preserving representation, not a photograph. You need to do this before
+    "Sign in with Recognize" can work for this username.</div>
+  <kl-enroll id="klenroll" customer="__CUSTOMER__" service-url="__SERVICEURL__"
+             username="__USER__" __TOKENATTR__ enable-close-button></kl-enroll>
+  <div class="note" style="margin-top:10px">Target: <b>__SERVICEURL__</b> · customer <b>__CUSTOMER__</b></div>
+  <div id="msg"></div>
+  <a class="alt" href="/signup?recognize=1&amp;user=__USER__">Already enrolled? Sign in →</a>
+  <div class="vendor">Powered by <img src="/static/idp-wordmark.svg" alt="ID Partners"></div>
+</div>
+<!-- Diagnostic capture. A classic inline script runs BEFORE a deferred module script, so this
+     wraps fetch before the SDK grabs its own reference — the only way to see the SDK's real
+     request/response. Read it from window.__klnet. Harmless to leave: it only records calls to
+     the Recognize host and never alters them. -->
+<script>
+window.__klnet = [];
+(function () {
+  var OF = window.fetch;
+  window.fetch = function (u, o) {
+    var url = String(u && u.url ? u.url : u);
+    if (url.indexOf('keyless') === -1) return OF.apply(this, arguments);
+    var h = {};
+    try { if (o && o.headers) new Headers(o.headers).forEach(function (v, k) { h[k] = v; }); } catch (e) {}
+    var rec = { url: url, method: (o && o.method) || 'GET', headers: h,
+                body: o && o.body ? String(o.body).slice(0, 1200) : null };
+    window.__klnet.push(rec);
+    return OF.apply(this, arguments).then(function (r) {
+      rec.status = r.status;
+      r.clone().text().then(function (t) { rec.resp = t.slice(0, 1200); }).catch(function () {});
+      return r;
+    }).catch(function (e) { rec.err = String(e); throw e; });
+  };
+})();
+</script>
+<script type="module" src="__SDK__"></script>
+<script>
+const m = document.getElementById('msg');
+const say = (t, ok) => { m.textContent = t || ''; m.className = ok ? 'ok' : ''; };
+const el = document.getElementById('klenroll');
+el.addEventListener('success', () => {
+  say('✓ Enrolled. You can now sign in with Recognize.', true);
+  setTimeout(() => { location.href = '/signup?recognize=1&user=' + encodeURIComponent("__USER__"); }, 1600);
+});
+el.addEventListener('error', (e) => {
+  const d = e.detail || {};
+  say('Enrolment failed: ' + (d.message || d.reason || d.code || 'unknown error'));
+  // Dump EVERYTHING. The Keyless payloads are end-to-end encrypted, so the decrypted client-side
+  // error object is the only place the real reason can surface — a one-line summary throws away
+  // exactly the fields (code/httpStatus/details) that distinguish "wrong tenant" from "wrong
+  // region" from "missing authorization token".
+  const dump = { detail: null, calls: (window.__klnet || []).map(r => ({
+                   path: (r.url.split('keyless.technology')[1] || r.url), method: r.method,
+                   status: r.status, err: r.err })) };
+  try { dump.detail = JSON.parse(JSON.stringify(d, Object.getOwnPropertyNames(d))); }
+  catch (_) { dump.detail = String(d); }
+  const pre = document.createElement('pre');
+  pre.style.cssText = 'white-space:pre-wrap;word-break:break-all;background:#0d1117;border:1px solid #2a323c;'
+    + 'border-radius:8px;padding:10px;margin-top:10px;font-size:11px;color:#9aa5b1;max-height:280px;overflow:auto';
+  pre.textContent = JSON.stringify(dump, null, 1);
+  document.getElementById('msg').after(pre);
+  window.__enrolError = dump;   // also readable programmatically
+});
+el.addEventListener('close', () => { location.href = '/signup'; });
+</script></body></html>"""
+
+
 _SIGNUP_HTML = """<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Sign up — Demo Bank</title>
@@ -1367,6 +1909,7 @@ border-radius:10px;padding:14px 16px;margin:12px 0 4px}
     <input id="su" placeholder="username (optional)" autocomplete="username webauthn"
            autocapitalize="none">
     <button class="primary" id="signinBtn">Sign in with passkey</button>
+    __RECOGNIZEBTN__
     <button class="ghost" data-to="choose">← Back</button>
   </div>
 
@@ -1476,6 +2019,14 @@ $('signinBtn').onclick = async () => {
   try { await doSignin(u); } catch(e){ msg('Sign-in cancelled or failed: '+e.message, 'err'); }
   $('signinBtn').disabled = false;
 };
+// Recognize sign-in needs to know WHO to verify (unlike discoverable-passkey sign-in, a face
+// match has nothing to look up a username by), so — unlike the passkey button — this one
+// requires the field to be filled in before it will proceed.
+if ($('recognizeBtn')) $('recognizeBtn').onclick = () => {
+  const u = $('su').value.trim().toLowerCase();
+  if(!u || !valid(u)){ msg('Enter your username first, then Sign in with Recognize.', 'err'); return; }
+  location.href = '/signup?recognize=1&user=' + encodeURIComponent(u);
+};
 
 // Step-up: /login?stepup=1&u=<user> sent an ALREADY signed-in user here to approve a payment.
 // Skip the create/choose screen (they have an account) and go straight to a pre-filled passkey
@@ -1524,7 +2075,7 @@ def _payment_summary_html(request: Request) -> str:
 
 
 @app.get("/signup")
-async def signup(request: Request, user: str = "", davinci: str = ""):
+async def signup(request: Request, user: str = "", davinci: str = "", recognize: str = ""):
     """Front door = PASSWORDLESS passkey / security-key (WebAuthn on this BFF). Create an
     account or sign in with a passkey or YubiKey — no password anywhere. The whole ceremony
     runs on this origin so the browser's WebAuthn works directly (Safari Face ID + save-to-
@@ -1534,14 +2085,77 @@ async def signup(request: Request, user: str = "", davinci: str = ""):
     signupTE. No DaVinci, no hosted password page.
 
     ?davinci=1 serves the DaVinci WIDGET variant instead: PingOne (not the BFF) verifies the
-    passkey, via the embedded flow. Gated so the native front door above is untouched."""
+    passkey, via the embedded flow. Gated so the native front door above is untouched.
+
+    ?recognize=1&user=<username> serves the PingOne Recognize sign-in variant — but ONLY when a
+    real browser-usable tenant is configured (recognize_real_configured()). Otherwise it falls
+    through to the normal passkey page and the Recognize button is not rendered at all: this
+    tenant's face matching lives on the paired phone via the Mobile SDK, and a simulated browser
+    screen on the login path would look like a security control without being one.
+    When it IS served, /signup/recognize/finish still requires that named user to already exist
+    with a passkey before brokering a session — the username must be supplied up front (there's
+    no discoverable-credential equivalent for a face match)."""
+    # Only when Recognize is genuinely usable in a BROWSER. There used to be an
+    # `or DAVINCI_SK_API_KEY` fallback here that served a DaVinci screen which merely
+    # SIMULATED a face match — on the normal login path that is worse than not offering it:
+    # it looks like a security control and is not one. The real face match is on the paired
+    # phone (Mobile SDK); this browser surface needs an Authentication Service the tenant
+    # does not have, so the honest behaviour is to fall through to passkey sign-in.
+    if recognize == "1" and recognize_real_configured():
+        u = (user or "").strip().lower()
+        if not u or not re.match(r"^[a-z0-9._-]{2,30}$", u):
+            return HTMLResponse("<p>Missing or invalid username for Recognize sign-in. "
+                                "<a href='/signup'>Back</a></p>", status_code=400)
+        esc = lambda s: (str(s or "").replace("&", "&amp;").replace("<", "&lt;")
+                         .replace(">", "&gt;").replace('"', "&quot;"))
+        esc_u = esc(u)
+        if recognize_real_configured():
+            # Bind the check to the payment when one is in flight (PSD2 dynamic linking). The
+            # step-up cookie is the authoritative source for what is being approved — never a
+            # query param, which the user could edit to have the biometric attest to a payment
+            # different from the one the PDP will actually see.
+            su = _verify(request.cookies.get(STEPUP_COOKIE)) or {}
+            txn_html, txn_attr = "", ""
+            if su.get("amount"):
+                txn_data = json.dumps({"amount": su.get("amount", ""),
+                                       "currency": su.get("currency", "AUD"),
+                                       "creditor": su.get("creditor", ""),
+                                       "debtor": su.get("debtor", "")}, separators=(",", ":"))
+                txn_attr = 'transaction-data="' + esc(txn_data) + '"'
+                txn_html = ('<div class="txn"><div class="amt">' + esc(su.get("currency") or "AUD")
+                            + " " + esc(su.get("amount")) + "</div>"
+                            + '<div class="row"><span>To</span><b>' + (esc(su.get("creditor")) or "—") + "</b></div>"
+                            + '<div class="row"><span>From</span><b>' + (esc(su.get("debtor")) or "—") + "</b></div></div>")
+            # First factor: a PF-minted, 5-minute, single-use assertion binding this session to
+            # THIS username. Empty when the tenant does not enforce it (see the helper) — the
+            # attribute is then simply absent, which is what an unenforced tenant expects.
+            ua_tok = await _mint_recognize_user_authorization(u)
+            tok_attr = ('authorization-token="' + esc(ua_tok) + '"') if ua_tok else ""
+            return HTMLResponse(_RECOGNIZE_REAL_HTML
+                                .replace("__SDK__", RECOGNIZE_SDK_URL)
+                                .replace("__CUSTOMER__", esc(RECOGNIZE_CUSTOMER_NAME))
+                                .replace("__SERVICEURL__", esc(RECOGNIZE_SERVICE_URL))
+                                .replace("__TXNATTR__", txn_attr)
+                                .replace("__TOKENATTR__", tok_attr)
+                                .replace("__TXN__", txn_html)
+                                .replace("__USER__", esc_u))
+        return HTMLResponse(_RECOGNIZE_SIGNIN_HTML
+                            .replace("__ASSETS__", DAVINCI_ASSETS_ROOT)
+                            .replace("__USER__", esc_u))
     if davinci == "1" and DAVINCI_SK_API_KEY:
         return HTMLResponse(_DAVINCI_HTML
                             .replace("__ASSETS__", DAVINCI_ASSETS_ROOT)
                             .replace("__APIROOT__", DAVINCI_API_ROOT)
                             .replace("__COMPANY__", DAVINCI_COMPANY_ID)
                             .replace("__POLICY__", DAVINCI_POLICY_ID))
-    return HTMLResponse(_SIGNUP_HTML.replace("__PAYMENT__", _payment_summary_html(request)))
+    # Offer the Recognize button ONLY when it would do something real. Otherwise it is omitted
+    # entirely rather than rendered-and-disabled: a greyed-out "Sign in with Recognize" still
+    # implies the capability exists here, and it does not — it lives on the paired phone.
+    recognize_btn = ('<button class="secondary" id="recognizeBtn">👤 Sign in with Recognize</button>'
+                     if recognize_real_configured() else "")
+    return HTMLResponse(_SIGNUP_HTML
+                        .replace("__RECOGNIZEBTN__", recognize_btn)
+                        .replace("__PAYMENT__", _payment_summary_html(request)))
 
 
 @app.get("/signup/davinci/token")
@@ -1571,6 +2185,327 @@ async def davinci_finish(request: Request):
                             "detail": "flow success payload carried no usable username"})
     pf_at = await _broker_passkey_to_pf(user)
     return _passkey_session_response(user, pf_at, new_signup=True)
+
+
+@app.get("/recognize/enrol")
+async def recognize_enrol(user: str = "", region: str = "", customer: str = "", token: str = ""):
+    """One-time face enrolment. Only meaningful with a real tenant — there is nothing to enrol
+    into in simulate mode, so rather than render a fake 'enrolled!' screen (which would leave
+    someone believing a biometric exists when it does not), this says so plainly.
+
+    ?region= / ?customer= / ?token= are DIAGNOSTIC overrides. Keyless does not tell you which
+    regional service holds your tenant, and every region answers session-creation identically,
+    so the only way to find out is to try each one against a real camera. Overriding by query
+    param makes that a page reload instead of an env change + redeploy per attempt.
+    ?token= sets the SDK's authorization token, to test whether enrolment needs one."""
+    u = (user or "").strip().lower()
+    if not u or not re.match(r"^[a-z0-9._-]{2,30}$", u):
+        return HTMLResponse("<p>Pass a username, e.g. <code>/recognize/enrol?user=alice</code></p>",
+                            status_code=400)
+    svc = RECOGNIZE_REGIONS.get((region or "").strip().lower(), "") or RECOGNIZE_SERVICE_URL
+    cust = (customer or "").strip() or RECOGNIZE_CUSTOMER_NAME
+    if not (svc and cust):
+        return HTMLResponse(
+            "<p>Recognize enrolment needs a real tenant: set <code>RECOGNIZE_CUSTOMER_NAME</code> "
+            "and <code>RECOGNIZE_SERVICE_URL</code>, or pass <code>?region=us|eu|latam|sandbox|"
+            "staging</code>. <a href='/signup'>Back</a></p>", status_code=503)
+    esc = lambda s: (str(s or "").replace("&", "&amp;").replace("<", "&lt;")
+                     .replace(">", "&gt;").replace('"', "&quot;"))
+    # ?token= stays a manual DIAGNOSTIC override and wins outright — the point of that knob is to
+    # test a token we chose. With no override, mint the real first factor (empty when the tenant
+    # does not enforce it, in which case the attribute is simply omitted).
+    ua_tok = token or await _mint_recognize_user_authorization(u)
+    tok_attr = ('authorization-token="' + esc(ua_tok) + '"') if ua_tok else ""
+    return HTMLResponse(_RECOGNIZE_ENROL_HTML
+                        .replace("__SDK__", RECOGNIZE_SDK_URL)
+                        .replace("__CUSTOMER__", esc(cust))
+                        .replace("__SERVICEURL__", esc(svc))
+                        .replace("__TOKENATTR__", tok_attr)
+                        .replace("__USER__", esc(u)))
+
+
+RECOGNIZE_SECRET_API_KEY = os.environ.get("RECOGNIZE_SECRET_API_KEY", "")
+# Server API (operations plane) — NOT the node host the SDK talks to. Different service, and
+# a different key: X-Api-Key + the SECRET key here, vs X-Keyless-Apikey + the MOBILE key on the node.
+RECOGNIZE_SERVER_API = os.environ.get(
+    "RECOGNIZE_SERVER_API", "https://api.sg.keyless.technology").rstrip("/")
+
+
+@app.post("/recognize/bind")
+async def recognize_bind(request: Request):
+    """Bind a freshly enrolled Recognize user to this device's bank identity.
+
+    The Mobile SDK enrols a *biometric*, not an account: it returns a `keylessId` and knows
+    nothing about "alice". Nothing ties the two together until this call. (Web-SDK tenants get
+    that mapping free because the Authentication Service keys on username — the mobile/node path
+    has no username at all, so we do it explicitly.)
+
+    Runs SERVER-side on purpose. Binding needs the Secret API Key, which is a backend credential:
+    a phone holding it could re-point any keylessId at any account. The device proves who it is
+    with its own device token, and the username comes from THAT — never from the request body,
+    or a paired phone could enrol a face against someone else's identity."""
+    user = _device_user(request)
+    if not user:
+        return JSONResponse(status_code=401, content={"error": "device token required"})
+    if not RECOGNIZE_SECRET_API_KEY:
+        return JSONResponse(status_code=503, content={"error": "recognize_server_api_unconfigured"})
+    body = await request.json()
+    keyless_id = str(body.get("keylessId") or "").strip()
+    # The Server API documents userId as an uppercase HEX string; reject anything else rather
+    # than forwarding junk into a path segment.
+    if not re.fullmatch(r"[0-9A-Fa-f]{8,128}", keyless_id):
+        return JSONResponse(status_code=400, content={"error": "invalid keylessId"})
+    try:
+        async with httpx.AsyncClient(timeout=20.0) as c:
+            r = await c.post(
+                f"{RECOGNIZE_SERVER_API}/v2/users/{keyless_id}/external-user",
+                headers={"X-Api-Key": RECOGNIZE_SECRET_API_KEY,
+                         "Content-Type": "application/json"},
+                json={"externalUserId": user})
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("recognize bind error for %s: %s", user, exc)
+        return JSONResponse(status_code=502, content={"error": "bind_failed"})
+    # Recovery material, if the ceremony produced it. Stored server-side ON PURPOSE: the whole
+    # point is that it survives the loss of the phone that generated it. Best-effort — a storage
+    # failure must not fail an otherwise-good enrolment, it only costs the ability to recover
+    # onto a new device later, which is recoverable by re-enrolling.
+    client_state = str(body.get("clientState") or "")
+    if client_state and PROOFING_DIRECTORY_URL:
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as c:
+                cr = await c.post(f"{PROOFING_DIRECTORY_URL}/recognize-recovery/{user}",
+                                  json={"keylessId": keyless_id, "clientState": client_state})
+            logger.info("recognize recovery material stored for %s (%s bytes, http %s)",
+                        user, len(client_state), cr.status_code)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("recognize recovery store failed for %s: %s", user, exc)
+    elif not client_state:
+        logger.info("recognize enrolment for %s carried NO client state — "
+                    "new-device recovery will not be possible for this enrolment", user)
+
+    if r.status_code in (200, 201):
+        logger.info("recognize BOUND keylessId=%s -> %s", keyless_id[:8] + "…", user)
+        return {"ok": True, "user": user, "recoverable": bool(client_state)}
+    # 409 = this user already has an external id bound; treat as success so a re-enrol is idempotent.
+    if r.status_code == 409:
+        logger.info("recognize bind: already bound (%s)", user)
+        return {"ok": True, "user": user, "note": "already bound"}
+    logger.warning("recognize bind failed %s: %s", r.status_code, r.text[:200])
+    return JSONResponse(status_code=502,
+                        content={"error": "bind_rejected", "status": r.status_code})
+
+
+# Enrolment hand-off screen. The browser never touches a camera here — it explains, deep-links to
+# the approver app, and polls until the TENANT confirms a bound enrolment. Deliberately has no
+# "mark me as done" affordance: the only thing that advances this screen is server-side truth.
+_RECOGNIZE_HANDOFF_HTML = """<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Set up face verification — Demo Bank</title>
+<style>body{font-family:-apple-system,system-ui,sans-serif;background:#101418;color:#e8e8e8;
+display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}
+.card{background:#1a2027;border:1px solid #2a323c;border-radius:14px;padding:28px;width:430px}
+.brand{font-size:20px;font-weight:700;margin:0 0 4px}
+.sub{color:#9aa5b1;font-size:13px;margin:0 0 18px}.sub b{color:#e8e8e8}
+ol{margin:0 0 18px;padding-left:20px;color:#cfd6de;font-size:13.5px;line-height:1.7}
+.btn{display:block;text-align:center;background:#f26a1b;color:#fff;text-decoration:none;
+font-weight:600;padding:12px;border-radius:9px;margin:0 0 12px}
+#msg{font-size:13px;min-height:20px;color:#9aa5b1;text-align:center}
+#msg.ok{color:#5ad18b}#msg.err{color:#ff8b7b}
+a.alt{color:#7fb0ff;font-size:12px;text-decoration:none;display:block;margin-top:12px;text-align:center}
+.why{margin-top:16px;padding-top:14px;border-top:1px solid #2a323c;color:#7b8794;font-size:11.5px;line-height:1.6}
+</style></head><body>
+<div class="card">
+  <div class="brand">🏦 Demo Bank</div>
+  <div class="sub">Set up face verification for <b>__USER__</b></div>
+  <ol>
+    <li>Open the <b>Demo Bank Approver</b> app on your phone</li>
+    <li>Tap the <b>profile icon</b>, then <b>Face verification</b></li>
+    <li>Tap <b>Enrol my face</b></li>
+  </ol>
+  <a class="btn" href="idpapprover://enrol?user=__USER__">Open the app on this phone</a>
+  <div id="msg">Waiting for your enrolment…</div>
+  <a class="alt" href="__NEXT__">Skip for now →</a>
+  <div class="why">Your face is captured on your phone, never in this browser. The bank stores no
+  image — only a public key. This page advances when the biometric service confirms your
+  enrolment, not when you say it is done.</div>
+</div>
+<script>
+const msg = document.getElementById('msg');
+let tries = 0;
+async function poll() {
+  tries++;
+  try {
+    const r = await fetch('/recognize/status?user=' + encodeURIComponent("__USER__"),
+                          {headers:{'accept':'application/json'}});
+    if (r.status === 401) { msg.textContent = 'Session expired — sign in again.'; msg.className='err'; return; }
+    const j = await r.json();
+    if (j.enrolled) {
+      msg.textContent = '✓ Face enrolled. Continuing…'; msg.className = 'ok';
+      setTimeout(() => { location.href = "__NEXT__"; }, 1200);
+      return;
+    }
+  } catch (e) { /* transient — keep polling rather than failing the onboarding */ }
+  // Give up politely after ~5 minutes rather than hammering the tenant forever.
+  if (tries > 100) { msg.textContent = 'Still waiting. Finish on your phone, then reload.'; return; }
+  setTimeout(poll, 3000);
+}
+poll();
+</script></body></html>"""
+
+
+@app.get("/recognize/enrol-start")
+async def recognize_enrol_start(request: Request, user: str = "", next: str = "/"):
+    """Onboarding hand-off: the browser asks for a face enrolment, the PHONE performs it.
+
+    This is the honest shape of enrolment for this tenant. A browser step cannot capture a face
+    here (no regional Authentication Service), so rather than simulate one, the page deep-links
+    into the approver app and waits for the tenant to report a real, bound enrolment via
+    /recognize/status. The user is never shown a 'verified' state the server cannot corroborate."""
+    caller = (_session(request) or {}).get("sub") or _device_user(request)
+    if not caller:
+        return HTMLResponse("<p>Sign in first. <a href='/signup'>Back</a></p>", status_code=401)
+    u = (user or caller).strip().lower()
+    if not re.match(r"^[a-z0-9._-]{2,30}$", u):
+        return HTMLResponse("<p>Invalid username.</p>", status_code=400)
+    esc = lambda s: (str(s or "").replace("&", "&amp;").replace("<", "&lt;")
+                     .replace(">", "&gt;").replace('"', "&quot;"))
+    return HTMLResponse(_RECOGNIZE_HANDOFF_HTML
+                        .replace("__USER__", esc(u))
+                        .replace("__NEXT__", esc(next if next.startswith("/") else "/")))
+
+
+@app.post("/recognize/unenrol")
+async def recognize_unenrol(request: Request):
+    """Destroy this user's Recognize enrolment(s) SERVER-side.
+
+    Needed because the SDK's own deEnroll only works while the DEVICE still holds state: sign out
+    (which clears local state) and the tenant-side template becomes unreachable from the phone —
+    it survives, invisible, and a later re-enrolment silently creates a SECOND template for the
+    same person. Two templates for one face is ambiguous: an authenticate may match either, and
+    only one carries recovery material.
+
+    Deletes EVERY user bound to this username, not just the newest, because that duplication is
+    exactly the mess this exists to clean up. Also drops the stored recovery material — keeping
+    recovery state for a template that no longer exists would just fail confusingly later."""
+    caller = (_session(request) or {}).get("sub") or _device_user(request)
+    if not caller:
+        return JSONResponse(status_code=401, content={"error": "session or device token required"})
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        pass
+    # Only ever your own enrolment. A device token scopes to one identity; letting the body pick
+    # the target would let a paired phone delete someone else's biometric.
+    user = caller.strip().lower()
+    if not RECOGNIZE_SECRET_API_KEY:
+        return JSONResponse(status_code=503, content={"error": "recognize_server_api_unconfigured"})
+    deleted, failed = [], []
+    try:
+        async with httpx.AsyncClient(timeout=25.0) as c:
+            hdr = {"X-Api-Key": RECOGNIZE_SECRET_API_KEY}
+            lr = await c.get(f"{RECOGNIZE_SERVER_API}/v2/external-users/{user}/users", headers=hdr)
+            users = lr.json() if lr.status_code == 200 and isinstance(lr.json(), list) else []
+            for u in users:
+                uid = u.get("userId") or ""
+                if not uid:
+                    continue
+                dr = await c.delete(f"{RECOGNIZE_SERVER_API}/v2/users/{uid}", headers=hdr)
+                (deleted if dr.status_code in (200, 202, 204) else failed).append(
+                    {"userId": uid, "status": dr.status_code})
+            if PROOFING_DIRECTORY_URL:
+                try:
+                    await c.post(f"{PROOFING_DIRECTORY_URL}/recognize-recovery/{user}",
+                                 json={"keylessId": None, "clientState": None})
+                except Exception:  # noqa: BLE001 — best effort; the templates are what matter
+                    pass
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("recognize unenrol error for %s: %s", user, exc)
+        return JSONResponse(status_code=502, content={"error": "unenrol_failed"})
+    logger.info("recognize UNENROLLED %s: deleted=%s failed=%s", user, deleted, failed)
+    return {"ok": not failed, "user": user, "deleted": deleted, "failed": failed}
+
+
+@app.get("/recognize/status")
+async def recognize_status(request: Request, user: str = ""):
+    """Has this user completed a face enrolment, and is it bound to their bank identity?
+
+    The onboarding flow polls this while the customer enrols on their PHONE — the browser
+    cannot capture a face for this tenant (no regional Authentication Service), so the web
+    orchestrates and the device does the biometric.
+
+    Truth comes from the Recognize Server API, never from anything the client asserts: an
+    enrolment the tenant has no record of is not an enrolment. Requires a session or a device
+    token — an unauthenticated 'is <username> enrolled?' oracle is a user-enumeration vector,
+    and this is exactly the sort of endpoint that quietly becomes one."""
+    caller = (_session(request) or {}).get("sub") or _device_user(request)
+    if not caller:
+        return JSONResponse(status_code=401, content={"error": "session or device token required"})
+    u = (user or caller).strip().lower()
+    if not re.match(r"^[a-z0-9._-]{2,30}$", u):
+        return JSONResponse(status_code=400, content={"error": "invalid username"})
+    if not RECOGNIZE_SECRET_API_KEY:
+        return JSONResponse(status_code=503, content={"error": "recognize_server_api_unconfigured"})
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as c:
+            r = await c.get(f"{RECOGNIZE_SERVER_API}/v2/external-users/{u}/users",
+                            headers={"X-Api-Key": RECOGNIZE_SECRET_API_KEY})
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("recognize status error for %s: %s", u, exc)
+        return JSONResponse(status_code=502, content={"error": "status_unavailable"})
+    if r.status_code != 200:
+        logger.warning("recognize status %s for %s: %s", r.status_code, u, r.text[:150])
+        return JSONResponse(status_code=502, content={"error": "status_unavailable"})
+    users = r.json() if isinstance(r.json(), list) else []
+    enrolled = bool(users)
+    logger.info("recognize status user=%s enrolled=%s", u, enrolled)
+    # Deliberately NOT returning the keylessId: the flow only needs to know whether to advance,
+    # and the internal id is not something a browser page has any use for.
+    return {"user": u, "enrolled": enrolled,
+            "enrolledAt": (users[0].get("createdAt") if enrolled else None)}
+
+
+@app.get("/signup/recognize/token")
+async def recognize_signin_token():
+    """Server-mint a fresh DaVinci sdkToken for the Recognize sign-in widget."""
+    if not DAVINCI_RECOGNIZE_SIGNIN_POLICY_ID:
+        return JSONResponse(status_code=502, content={"error": "recognize_unconfigured"})
+    tok = await _davinci_sdktoken()
+    if not tok:
+        return JSONResponse(status_code=502, content={"error": "davinci_unconfigured"})
+    return {"accessToken": tok, "companyId": DAVINCI_COMPANY_ID,
+            "policyId": DAVINCI_RECOGNIZE_SIGNIN_POLICY_ID, "apiRoot": DAVINCI_API_ROOT + "/"}
+
+
+@app.post("/signup/recognize/finish")
+async def recognize_signin_finish(request: Request):
+    """The Recognize flow (real or simulated — see RECOGNIZE_SIMULATE) reported a verdict for
+    the username the BROWSER supplied — unlike davinci_finish, PingOne itself never asserted
+    who this is, so this endpoint must independently confirm the named user is real and already
+    has a passkey before brokering a session. Without that check, a 'pass' verdict for an
+    arbitrary typed username would sign in as anyone; requiring an existing passkey-enrolled
+    account means Recognize is an additional factor here, not a bypass for account creation."""
+    body = await request.json()
+    user = str(body.get("username") or "").strip().lower()
+    if not user or not re.match(r"^[a-z0-9._-]{2,30}$", user):
+        return JSONResponse(status_code=400, content={"error": "username required"})
+    if not _deep_recognize_field(body.get("response") or {}):
+        return JSONResponse(status_code=401, content={"error": "recognize_verification_failed"})
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as c:
+            tok = await _p1_token(c)
+            r = await c.get(f"{P1_API}/v1/environments/{P1_ENV}/users",
+                            headers={"Authorization": f"Bearer {tok}"},
+                            params={"filter": f'username eq "{user}"'})
+            exists = bool((r.json().get("_embedded") or {}).get("users"))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("recognize signin user lookup failed for %s: %s", user, exc)
+        exists = False
+    if not exists:
+        return JSONResponse(status_code=404, content={"error": "unknown_user",
+                            "detail": "no account with that username"})
+    pf_at = await _broker_passkey_to_pf(user)
+    return _passkey_session_response(user, pf_at)
 
 
 # WebAuthn RP id = this BFF's host (the passkey binds to it; the browser ceremony must run
@@ -1749,17 +2684,22 @@ def passkey_jwks():
                       "y": os.environ.get("BFF_PASSKEY_Y", "")}]}
 
 
-def _mint_passkey_jwt(user: str) -> str:
+def _mint_passkey_jwt(user: str, acr: str = "urn:northwind:loa:passkey") -> str:
+    """`acr` is overridable because not every caller has actually seen a passkey ceremony.
+    The Recognize first factor (below) mints the same assertion shape BEFORE any authentication
+    has happened, so it must not claim the passkey LoA — it asserts only that this BFF started a
+    session for this username. Stamping passkey there would put a false authentication strength
+    into a token PF will happily believe."""
     pem = os.environ.get("BFF_PASSKEY_KEY_PEM", "")
     now = int(time.time())
     return jwt.encode(
         {"iss": BFF_ISSUER, "sub": user, "preferred_username": user,
          "aud": SIGNUP_CLIENT_ID or "0ce9dbdf-7d86-461a-b531-0a4afcb508d0",
-         "iat": now, "exp": now + 120, "acr": "urn:northwind:loa:passkey"},
+         "iat": now, "exp": now + 120, "acr": acr},
         pem, algorithm="ES256", headers={"kid": BFF_PASSKEY_KID})
 
 
-async def _broker_passkey_to_pf(user: str, extra_scope: str = "") -> str:
+async def _broker_passkey_to_pf(user: str, extra_scope: str = "", resource: str = "") -> str:
     """Exchange the BFF-signed passkey JWT at PF (signupTE) for a PF user access token.
 
     extra_scope elevates the token for a step-up: the passkey ceremony IS the step-up
@@ -1771,19 +2711,74 @@ async def _broker_passkey_to_pf(user: str, extra_scope: str = "") -> str:
         return ""
     assertion = _mint_passkey_jwt(user)
     scope = DEFAULT_SCOPES + ((" " + extra_scope) if extra_scope.strip() else "")
+    form = {
+        "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+        "subject_token": assertion,
+        "subject_token_type": "urn:ietf:params:oauth:token-type:id_token",
+        "client_id": OIDC_CLIENT_ID, "client_secret": OIDC_CLIENT_SECRET,
+        "scope": scope}
+    # RFC 8707: request a specific resource → PF selects the ATM whose resource_uris match
+    # (e.g. gmJwtATM for the GM API), setting the token's audience accordingly. Empirically
+    # PF 13's resource matching lost to the client's default ATM here, so we ALSO pass PF's
+    # explicit access_token_manager_id selector (highest precedence) for the GM resource.
+    if resource.strip():
+        form["resource"] = resource.strip()
+        if resource.strip() == GM_RESOURCE:
+            form["access_token_manager_id"] = os.environ.get("GM_ATM_ID", "gmJwtATM")
     try:
         async with httpx.AsyncClient(timeout=20.0, verify=False) as c:
-            r = await c.post(PF_TOKEN, data={
-                "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
-                "subject_token": assertion,
-                "subject_token_type": "urn:ietf:params:oauth:token-type:id_token",
-                "client_id": OIDC_CLIENT_ID, "client_secret": OIDC_CLIENT_SECRET,
-                "scope": scope})
+            r = await c.post(PF_TOKEN, data=form)
             if r.status_code == 200:
                 return r.json().get("access_token", "")
             logger.warning("passkey PF broker failed %s: %s", r.status_code, r.text[:200])
     except Exception as exc:  # noqa: BLE001
         logger.warning("passkey PF broker error: %s", exc)
+    return ""
+
+
+async def _mint_recognize_user_authorization(user: str) -> str:
+    """Mint the Recognize "User Authorization" first-factor JWT at PingFederate.
+
+    Returns "" when unavailable — the caller then simply omits the SDK attribute, which is the
+    correct behaviour for a tenant that does not enforce the factor. It is deliberately NOT an
+    error path: enforcement is a tenant setting only Keyless staff can change, so the demo has to
+    work either way.
+
+    The exchange goes through signupTE (not userToAgentTE) so it works with NO existing session —
+    at sign-on the user is by definition not authenticated yet, which is the whole point of the
+    factor. PF selects recognizeUserAuthATM via the `resource` URN and stamps
+    aud=authentication-service, iat/exp (5 min), and sub = preferred_username.
+
+    ⚠ `sub` MUST equal the username handed to the SDK. Both come from the one normalised `user`
+    argument here, and the callers pass that same value into the kl-auth/kl-enroll `username`
+    attribute. Do not let those two drift: a mismatch is rejected as SERVER_FORBIDDEN before any
+    biometric processing, and the wire cannot tell you why (the bodies are end-to-end encrypted).
+    """
+    if not RECOGNIZE_USERAUTH_ENABLED:
+        return ""
+    if not (BFF_PASSKEY_KID and os.environ.get("BFF_PASSKEY_KEY_PEM")):
+        logger.warning("recognize user-authorization: BFF signing key not configured")
+        return ""
+    assertion = _mint_passkey_jwt(user, acr="urn:northwind:loa:app-asserted")
+    form = {
+        "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+        "subject_token": assertion,
+        "subject_token_type": "urn:ietf:params:oauth:token-type:id_token",
+        "client_id": OIDC_CLIENT_ID, "client_secret": OIDC_CLIENT_SECRET,
+        # Selects recognizeUserAuthATM. PF 13 IGNORED access_token_manager_id on this exchange
+        # (verified — it returned the client's default userJwtATM instead), so the resource URN
+        # is what actually does the work here, not a belt-and-braces extra.
+        "resource": RECOGNIZE_USERAUTH_RESOURCE,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=15.0, verify=False) as c:
+            r = await c.post(PF_TOKEN, data=form)
+            if r.status_code == 200:
+                return r.json().get("access_token", "")
+            logger.warning("recognize user-authorization mint failed %s: %s",
+                           r.status_code, r.text[:200])
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("recognize user-authorization mint error: %s", exc)
     return ""
 
 
@@ -1817,6 +2812,17 @@ async def passkey_complete(t: str = ""):
         return RedirectResponse("/?passkey=expired", status_code=302)
     session, _, new_signup = entry
     dest = "/?signedup=1" if new_signup else "/"
+    # NEW USER → face enrolment hand-off. Deliberately here rather than as a node inside the
+    # DaVinci registration flow: BOTH new-user paths (the DaVinci flow and the native passkey
+    # ceremony) funnel through this one line, so one change covers both, and it avoids surgery on
+    # a live 174-node out-of-the-box flow with six subflows. The journey is identical either way —
+    # the browser cannot capture a face for this tenant regardless, so a DaVinci node could only
+    # ever have redirected here too.
+    # Gated on the Server API key because the hand-off page polls /recognize/status; without it
+    # the page could never advance and would strand a new user on a dead screen.
+    if new_signup and RECOGNIZE_SECRET_API_KEY:
+        dest = ("/recognize/enrol-start?user=" + urllib.parse.quote(session["sub"])
+                + "&next=" + urllib.parse.quote("/?signedup=1"))
     resp = RedirectResponse(dest, status_code=302)
     resp.set_cookie(SESSION_COOKIE, _sign(session, SESSION_TTL),
                     httponly=True, secure=True, samesite="lax", max_age=SESSION_TTL)
@@ -1910,7 +2916,8 @@ async def signin_finish(request: Request):
     stepup = (su or {}).get("scope", "")
     if stepup and (su or {}).get("amount"):
         txn = await _record_stepup_consent(su, u)
-        await _project_delegation_grant(u, stepup, txn)
+        await _project_delegation_grant(u, stepup, txn,
+                                        assurance=(su or {}).get("assurance", ASSURANCE_APP_ASSERTED))
     pf_at = await _broker_passkey_to_pf(u, extra_scope=stepup)
     resp = _passkey_session_response(u, pf_at)
     if stepup:
@@ -2202,6 +3209,22 @@ def _forward_headers(s: dict) -> dict:
             "X-User-Token": s.get("pf_at", "")}
 
 
+async def _forward_headers_gm(s: dict) -> dict:
+    """As _forward_headers, plus X-GM-Token: a token re-audienced for the Grant Management
+    API (aud=GM_RESOURCE), minted on demand from the SAME login grant via RFC 8707. The
+    session token is aud-less and the GM servlet would reject it; this one satisfies its
+    audience check while keeping sub/client_id/agid. Best-effort — absent if the mint fails."""
+    h = _forward_headers(s)
+    if s.get("pf_at") and s.get("sub"):
+        try:
+            gm = await _broker_passkey_to_pf(s["sub"], resource=GM_RESOURCE)
+            if gm:
+                h["X-GM-Token"] = gm
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("gm-token mint failed: %s", exc)
+    return h
+
+
 @app.post("/invocations")
 async def invocations(request: Request):
     # Not gated at the app: a logged-out request is allowed through so the GATEWAY
@@ -2209,10 +3232,11 @@ async def invocations(request: Request):
     # only when Alice has a session.
     s = _session(request) or {}
     body = await request.body()
+    hdrs = await _forward_headers_gm(s)
     try:
         async with httpx.AsyncClient(timeout=180.0) as c:
             r = await c.post(PRINCIPAL_AGENT_URL + "/invocations",
-                             content=body, headers=_forward_headers(s))
+                             content=body, headers=hdrs)
             return JSONResponse(status_code=r.status_code, content=r.json())
     except Exception as exc:  # noqa: BLE001
         return JSONResponse(status_code=502, content={"error": str(exc)})
@@ -2223,11 +3247,12 @@ async def stream(request: Request):
     # See /invocations: the gateway, not the app, enforces the login challenge.
     s = _session(request) or {}
     body = await request.body()
+    hdrs = await _forward_headers_gm(s)
 
     async def gen():
         async with httpx.AsyncClient(timeout=180.0) as c:
             async with c.stream("POST", PRINCIPAL_AGENT_URL + "/stream",
-                                content=body, headers=_forward_headers(s)) as r:
+                                content=body, headers=hdrs) as r:
                 async for chunk in r.aiter_raw():
                     yield chunk
 
@@ -2418,11 +3443,108 @@ GATEWAY_LABEL = os.environ.get("GATEWAY_LABEL", "Kong")
 MCP_TOOLS_URL = os.environ.get("MCP_TOOLS_URL",
                                "http://bank-mcp.railway.internal:8090/mcp")
 
-# The AuthZEN PDP adapter (the front door to Ping Authorize's governance engine).
-# Its /pdp/events SSE stream feeds the UI's live "PDP decisions" sidebar so you can
-# watch each PERMIT / DENY / step-up as the demo runs.
-ADAPTER_URL = os.environ.get("ADAPTER_URL",
-                             "http://authzen-adapter.railway.internal:8080").rstrip("/")
+# --- PDP decisions sidebar, fed by an OpenID Shared Signals Framework (SSF) 1.0 stream ---
+#
+# PingAuthorize's native AuthZEN servlet is itself an SSF Transmitter: it publishes one
+# Security Event Token (RFC 8417) per decision, over every PEP that calls it (Kong,
+# coaz-pep, the Grant Management API) — no Go adapter, and no bespoke feed protocol,
+# in this path. This app is the (only) SSF Receiver: it registers a push stream on
+# startup, accepts the pushed SETs at /ssf/receiver, and rebroadcasts the decisions to
+# the browser over the SAME SSE shape the sidebar already rendered, so only the
+# transport underneath changed.
+PDP_URL = os.environ.get("PDP_URL", "http://pingauthorize.railway.internal:1080").rstrip("/")
+PDP_API_KEY = os.environ.get("PDP_API_KEY", "Password1")
+SSF_SHARED_SECRET = os.environ.get("SSF_SHARED_SECRET", "")
+SSF_EVENT_TYPE = "https://schemas.idpartners.com.au/ssf/authzen-decision"
+SSF_RECEIVER_URL = os.environ.get(
+    "SSF_RECEIVER_URL",
+    "http://{host}:{port}/ssf/receiver".format(
+        host=os.environ.get("RAILWAY_PRIVATE_DOMAIN", "localhost"),
+        port=os.environ.get("PORT", "8090")))
+
+_PDP_FEED_RING_SIZE = 200
+_pdp_ring: deque = deque(maxlen=_PDP_FEED_RING_SIZE)
+_pdp_seq = 0
+_pdp_subscribers: set = set()
+
+
+def _pdp_publish(event: dict) -> None:
+    """Appends to the ring and fans out to live SSE subscribers. Never raises — a bad
+    subscriber queue is dropped from, never lets a slow browser tab back up the feed."""
+    global _pdp_seq
+    _pdp_seq += 1
+    event = {**event, "seq": _pdp_seq}
+    _pdp_ring.append(event)
+    for q in list(_pdp_subscribers):
+        try:
+            q.put_nowait(event)
+        except asyncio.QueueFull:
+            pass
+
+
+@app.on_event("startup")
+async def _register_ssf_stream():
+    """Registers this app as the PDP's one SSF Receiver (SSF 1.0 section 8.1.1). Without
+    SSF_SHARED_SECRET the PDP's SSF surface does not exist at all, so there is nothing to
+    register against — the sidebar simply stays empty rather than erroring."""
+    if not SSF_SHARED_SECRET:
+        logger.info("SSF_SHARED_SECRET not set; the PDP-decisions sidebar will stay empty")
+        return
+    body = {
+        "aud": SSF_RECEIVER_URL,
+        "events_requested": [SSF_EVENT_TYPE],
+        "delivery": {"method": "urn:ietf:rfc:8935", "endpoint_url": SSF_RECEIVER_URL},
+    }
+    try:
+        async with httpx.AsyncClient(timeout=8) as c:
+            r = await c.post(PDP_URL + "/ssf/stream", json=body,
+                             headers={"Authorization": f"Bearer {PDP_API_KEY}"})
+            r.raise_for_status()
+            logger.info("SSF stream registered: stream_id=%s", r.json().get("stream_id"))
+    except Exception as exc:  # noqa: BLE001 - the sidebar is informational, never fatal to boot
+        logger.warning("SSF stream registration failed (sidebar will stay empty): %s", exc)
+
+
+@app.post("/ssf/receiver")
+async def ssf_receiver(request: Request):
+    """SSF push delivery endpoint (RFC 8935): the PDP POSTs one Security Event Token per
+    decision here. Verifies the HS256 signature against the shared secret, unwraps the one
+    event type this demo cares about, and republishes it to the SSE sidebar. A malformed
+    or unverifiable token is rejected (400) rather than silently dropped, so a genuine
+    wiring problem is visible in the logs instead of just an empty sidebar."""
+    if not SSF_SHARED_SECRET:
+        return JSONResponse({"error": "ssf_disabled"}, status_code=404)
+    raw = (await request.body()).decode("utf-8")
+    try:
+        claims = jwt.decode(raw, SSF_SHARED_SECRET, algorithms=["HS256"],
+                            audience=SSF_RECEIVER_URL,
+                            options={"require": ["iss", "iat", "aud", "events"]})
+    except jwt.PyJWTError as exc:
+        return JSONResponse({"error": "invalid_set", "detail": str(exc)}, status_code=400)
+
+    event = claims.get("events", {}).get(SSF_EVENT_TYPE)
+    if not isinstance(event, dict):
+        # A well-formed SET carrying some OTHER event type — not an error, just nothing
+        # this Receiver asked for.
+        return JSONResponse({"status": "ignored"}, status_code=202)
+
+    try:
+        ts = datetime.fromtimestamp(claims.get("iat", time.time()), tz=timezone.utc).isoformat()
+    except (TypeError, ValueError, OSError):
+        ts = datetime.now(tz=timezone.utc).isoformat()
+
+    _pdp_publish({
+        "ts": ts,
+        "action": event.get("action"),
+        "resource": event.get("resource"),
+        "subject": event.get("subject"),
+        "decision": event.get("decision"),
+        "step_up": bool(event.get("step_up_required")),
+        "scope": event.get("step_up_scope"),
+        "reason": event.get("reason"),
+        "attrs": event.get("attrs"),
+    })
+    return JSONResponse({"status": "accepted"}, status_code=202)
 
 
 @app.get("/coaz/tools")
@@ -2447,17 +3569,26 @@ async def coaz_tools():
 
 @app.get("/pdp/stream")
 async def pdp_stream():
-    """Proxy the adapter's live decision SSE feed to the browser's PDP sidebar.
-    Each event is one Ping Authorize decision (PERMIT / DENY / step-up)."""
+    """Streams decisions to the browser's PDP sidebar from the local ring buffer that
+    /ssf/receiver fills — the PDP's own SSF Transmitter is the source, not a proxied
+    Go-adapter feed. Replays the recent ring first so a freshly-opened sidebar is not
+    empty, then pushes live decisions until the client disconnects."""
+    queue: asyncio.Queue = asyncio.Queue(maxsize=64)
+    _pdp_subscribers.add(queue)
+
     async def gen():
         try:
-            async with httpx.AsyncClient(timeout=None) as c:
-                async with c.stream("GET", ADAPTER_URL + "/pdp/events") as r:
-                    async for chunk in r.aiter_raw():
-                        yield chunk
-        except Exception as exc:  # noqa: BLE001 - sidebar is informational
-            yield ("event: error\ndata: " +
-                   json.dumps({"error": str(exc)}) + "\n\n").encode()
+            for event in list(_pdp_ring):
+                yield ("event: decision\ndata: " + json.dumps(event) + "\n\n").encode()
+            yield b": connected\n\n"
+            while True:
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=20)
+                    yield ("event: decision\ndata: " + json.dumps(event) + "\n\n").encode()
+                except asyncio.TimeoutError:
+                    yield b": ping\n\n"
+        finally:
+            _pdp_subscribers.discard(queue)
 
     return StreamingResponse(gen(), media_type="text/event-stream", headers={
         "Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"})
@@ -2466,12 +3597,7 @@ async def pdp_stream():
 @app.get("/pdp/recent")
 async def pdp_recent():
     """One-shot snapshot of recent PDP decisions (polling fallback for the sidebar)."""
-    try:
-        async with httpx.AsyncClient(timeout=8) as c:
-            r = await c.get(ADAPTER_URL + "/pdp/recent")
-        return JSONResponse(r.json())
-    except Exception as exc:  # noqa: BLE001
-        return JSONResponse({"error": str(exc), "events": []}, status_code=502)
+    return JSONResponse({"events": list(_pdp_ring)})
 
 
 @app.get("/")

@@ -210,6 +210,7 @@
               padding:2px 8px; border-radius:20px; }
   .decision.allow { color:var(--ok); background:rgba(63,185,80,.12); }
   .decision.deny { color:var(--deny); background:rgba(248,81,73,.12); }
+  .decision.warn { color:#d29922; background:rgba(210,153,34,.14); }
   .pep { font-size:11px; color:var(--muted); margin-left:6px; }
   .reason { color:var(--muted); font-size:13px; margin-top:6px; }
   .hops { display:flex; gap:6px; flex-wrap:wrap; margin-top:6px; font-size:11px; color:var(--muted); }
@@ -244,7 +245,8 @@
   .wblock pre { margin:0; background:#06090d; border-radius:6px; padding:8px 10px;
                 overflow:auto; font-size:11.5px; color:#c9d1d9; line-height:1.45; }
   .wire-http { font-family:ui-monospace,Menlo,monospace; font-size:11.5px; color:#7ee787;
-               background:#06090d; border-radius:6px 6px 0 0; padding:8px 10px; }
+               background:#06090d; border-radius:6px 6px 0 0; padding:8px 10px;
+               white-space:pre-wrap; overflow-x:auto; word-break:break-all; }
   /* components reference */
   .components { width:100%; border-collapse:collapse; font-size:12.5px; }
   .components th, .components td { text-align:left; padding:7px 10px; border-bottom:1px solid var(--border); vertical-align:top; }
@@ -418,7 +420,7 @@
  <div class="layout">
   <div class="col-left">
   <h2 class="section">How the agents &amp; services interact
-    <span id="gwtoggle" title="Swap the gateway — same architecture (AuthZEN adapter + Ping Authorize), either PEP"><button data-gw="Kong">Kong</button><button data-gw="agentgateway">agentgateway</button></span><button id="coazbtn" title="How MCP tool calls are authorized per the OpenID AuthZEN MCP profile">🧩 MCP·COAZ</button><label id="mdlgate" title="Toggle the mDL identity-proofing gate on account origination — when on, Ping Authorize requires a verified mobile Driver's Licence before an account can be opened"><input type="checkbox" id="mdlgateChk"><span id="mdlgateLbl">🪪 mDL gate: <b>off</b></span></label></h2>
+    <span id="gwtoggle" title="Swap the gateway — same architecture (AuthZEN → Ping Authorize), either PEP"><button data-gw="Kong">Kong</button><button data-gw="agentgateway">agentgateway</button></span><button id="coazbtn" title="How MCP tool calls are authorized per the OpenID AuthZEN MCP profile">🧩 MCP·COAZ</button><label id="mdlgate" title="Toggle the mDL identity-proofing gate on account origination — when on, Ping Authorize requires a verified mobile Driver's Licence before an account can be opened"><input type="checkbox" id="mdlgateChk"><span id="mdlgateLbl">🪪 mDL gate: <b>off</b></span></label></h2>
   <div class="graphwrap">
     <svg id="graph" viewBox="0 0 700 624" preserveAspectRatio="xMinYMin meet" role="img"
          aria-label="Interaction graph: Alice delegates to a principal agent, which delegates to an account agent and a payments agent. Each domain has its OWN vertical stack — a separate MCP server, __GATEWAY__ gateway with two policy enforcement points, and REST service — both backed by Ping Authorize. A payment is authorized at the payments gateway and then debits the accounts system-of-record."></svg>
@@ -440,6 +442,16 @@
     <button data-prompt="I'd like to open a new savings account and move $500 into it from my checking account.">Open savings + fund $500</button>
     <button data-prompt="Please open a savings account and transfer $9,000 from my checking account into it.">Open savings + fund $9,000</button>
     <button data-prompt="What accounts do I have and what are their balances?">List my accounts</button>
+  </div>
+  <!-- Drives the CIBA step-up directly, skipping the agent conversation. Same endpoint the
+       agent redirects to (/login?stepup=…) — this is not a second code path, just a shortcut
+       into the existing one, so what it exercises is exactly what the demo exercises.
+       $9,000 is deliberately over the $500 PAZ threshold so the rule actually engages. -->
+  <div class="examples">
+    <button type="button" id="phoneapprove"
+            title="Pushes a payment approval to the paired phone (face match if enrolled)">
+      📲 Approve $9,000 on my phone
+    </button>
   </div>
 
   <form id="chat">
@@ -469,9 +481,9 @@
               <td><a href="https://modelcontextprotocol.io" target="_blank">MCP</a> (JSON-RPC over streamable HTTP)</td></tr>
           <tr><td class="c1">🏦 Bank API</td><td class="role">Resource Server. Executes the banking operation; records the sub/act delegation chain for audit.</td>
               <td>REST/HTTP · consumes the delegated token</td></tr>
-          <tr><td class="c1">⚖️ AuthZEN adapter</td><td class="role">PDP proxy (Go). Translates AuthZEN eval requests into Ping Authorize decision requests.</td>
+          <tr><td class="c1">⚖️ AuthZEN endpoint</td><td class="role"><b>Retired the Go adapter from the staging wire path (8 Aug 2026).</b> The PEP now speaks the <a href="https://openid.github.io/authzen/" target="_blank">AuthZEN API</a> straight to Ping Authorize's in-process AuthZEN servlet. The enrichment the Go adapter used to pre-compute — the mDL proofing lookup and the RFC 9396 consent-coverage check — moved <em>into the PDP</em>: <code>identity_proofing_present</code> and <code>consent_covered</code> are resolved by ProofingDirectory / ConsentDirectory PIP callouts, and the flat decision inputs (<code>amount</code>, <code>currency</code>, <code>onBehalfOf</code>, <code>to_account</code>…) derive from the raw AuthZEN subject/action/resource/context by json-path. The Go adapter stays deployed as rollback (and still fronts production's Kong path).</td>
               <td><a href="https://openid.github.io/authzen/" target="_blank">AuthZEN Authorization API</a></td></tr>
-          <tr><td class="c1">🧠 Ping Authorize</td><td class="role">Policy Decision Point. Evaluates policy and returns PERMIT/DENY (+ reason).</td>
+          <tr><td class="c1">🧠 Ping Authorize</td><td class="role">Policy Decision Point. Evaluates policy and returns PERMIT/DENY (+ step-up / identity-proofing advice) — and resolves its own decision inputs: REST PIP callouts to the proofing and consent directories, plus json-path attribute resolvers over the AuthZEN request. No proxy pre-computes its booleans any more, so bypassing a PEP can no longer bypass a step-up.</td>
               <td>PingAuthorize JSON PDP API (<code>/governance-engine</code>)</td></tr>
         </tbody>
       </table>
@@ -824,7 +836,24 @@ document.addEventListener('keydown', (e)=>{ if(e.key==='Escape') closeCoaz(); })
 ensureAuth();
 
 document.querySelectorAll('.examples button').forEach(b => {
+  // Guard on data-prompt: this selector also catches the phone-approval button below, which
+  // is an action rather than a prompt and would otherwise stuff "undefined" into the input.
+  if (!b.dataset.prompt) return;
   b.addEventListener('click', () => { input.value = b.dataset.prompt; input.focus(); });
+});
+
+// Push a payment approval straight to the paired phone. Navigates to the SAME /login?stepup=…
+// the agent flow uses, so this exercises the real path (CIBA push → approve on device →
+// /stepup/approve), not a test-only shortcut. Values match the $9,000 example above so the
+// PAZ over-$500 rule engages and, once a face is enrolled, the signed `td` has something to
+// bind to.
+document.getElementById('phoneapprove')?.addEventListener('click', () => {
+  const q = new URLSearchParams({
+    stepup: 'banking:payments:transfer',
+    amount: '9000.00', cur: 'AUD',
+    from: 'Everyday Account', to: 'ACME Pty Ltd',
+  });
+  location.href = '/login?' + q.toString();
 });
 
 function el(cls, html) { const d = document.createElement('div'); d.className = cls; d.innerHTML = html; return d; }
@@ -883,7 +912,7 @@ const GN = {
   pmcp:      {x:520, y:300, ic:'🧰', t:'Payments MCP',    s:'make_payment'},
   ppep2:     {x:520, y:404, ic:'🛡️', t:'Payments PEP #2', s:'__GATEWAY__ · API edge'},
   papi:      {x:520, y:520, ic:'💸', t:'Payments API',    s:'debits accounts (direct)'},
-  adapter:   {x:188, y:486, ic:'🔌', t:'AuthZEN adapter',  s:'ext_authz → AuthZEN'},
+  adapter:   {x:188, y:486, ic:'🔌', t:'AuthZEN endpoint', s:'ext_authz → AuthZEN (in PAZ)'},
   pdp:       {x:30,  y:562, ic:'⚖️', t:'Ping Authorize',  s:'policy decision point'},
   eventsink: {x:186, y:562, ic:'📮', t:'Event sink',      s:'flattened token · aud=events'},
 };
@@ -956,8 +985,8 @@ const GMETA = {
               cfg:'owns make_payment · holds no account state · debits the accounts system-of-record directly (the payment was already authorized at the payments gateway)',
               sdks:['<code>fastapi</code> + <code>uvicorn</code>', '<code>httpx</code> — calls the Accounts API /transfers'],
               links:[HUB_PY, ['source · demo/payments-api', REPO+'/payments-api']]},
-  adapter:   {sw:'AuthZEN adapter — ext_authz → PingAuthorize',
-              cfg:'translates the AuthZEN Authorization API → PingAuthorize governance-engine · maps subject/action/resource/context · fails closed if the PDP is unreachable'},
+  adapter:   {sw:'AuthZEN endpoint — ext_authz → PingAuthorize',
+              cfg:'translates the AuthZEN Authorization API → PingAuthorize governance-engine · maps subject/action/resource/context · fails closed if the PDP is unreachable. Since 8 Aug 2026 this is PingAuthorize’s own in-process AuthZEN servlet: the PDP resolves its own inputs (ProofingDirectory and ConsentDirectory PIP callouts, json-path derivation of the flat attributes from the AuthZEN request), so no proxy pre-computes decision inputs and bypassing a hop cannot drop a step-up. The old Go authzen-adapter remains deployed, out of the path, as rollback.'},
   pdp:       {sw:'PingAuthorize 11.0.0.2 (Symphonic)', img:'pingidentity/pingauthorize:11.0.0.2-latest',
               cfg:'Policy Decision Point · Trust Framework policy · make_payment: ≤ AUD 500 permit · > AUD 500 to 2,000 requires step-up (banking:payments:transfer, RFC 9470) · > 2,000 deny · governs BOTH token issuance (RAR) and the gateway calls (AuthZEN)',
               links:[['Docker Hub · pingauthorize','https://hub.docker.com/r/pingidentity/pingauthorize'], ['policy repo · idp-paz-simplifid-policy','https://github.com/dphhyland/idp-paz-simplifid-policy']]},
@@ -966,7 +995,7 @@ const GMETA = {
               sdks:['<code>fastapi</code> + <code>uvicorn</code>', 'validates the flattened at+jwt (aud/sub/no-act)'],
               links:[['source · demo/event-sink', REPO+'/event-sink'], ['flatten deep-dive','/static/docs-act-flatten.html']]},
 };
-// Gateway-dependent image + links for the two PEPs and the AuthZEN adapter node.
+// Gateway-dependent image + links for the two PEPs and the AuthZEN endpoint node.
 const GW_META = {
   Kong: {
     pep:     {img:'kong:3.7', links:[['Docker Hub · kong','https://hub.docker.com/_/kong']]},
@@ -975,8 +1004,12 @@ const GW_META = {
   },
   agentgateway: {
     pep:     {img:'ghcr.io/agentgateway/agentgateway:v1.3.1', links:[['agentgateway (GitHub)','https://github.com/agentgateway/agentgateway']]},
-    adapter: {sw:'Go coaz-pep — Envoy ext_authz → AuthZEN (MCP profile)', img:'golang:1.26-alpine → alpine:3.20',
-              links:[['source · demo/coaz-pep', REPO+'/coaz-pep'], AUTHZEN_SPEC]},
+    adapter: {sw:'Go coaz-pep (Envoy ext_authz) → PingAuthorize AuthZEN servlet (in-process with the PDP)',
+              img:'golang:1.26-alpine → pingauthorize:11.1',
+              cfg:'coaz-pep speaks AuthZEN directly to PingAuthorize’s AuthZEN servlet on /access/v1/evaluation — the Go authzen-adapter was retired from this path on 8 Aug 2026. Its enrichment moved into the PDP: identity_proofing_present and consent_covered resolve via ProofingDirectory/ConsentDirectory PIP callouts, and the flat decision inputs derive from the AuthZEN subject/action/resource/context by json-path (the rar_*_ok booleans were removed from policy outright). The adapter remains deployed, out of the wire path, as one-env-var rollback.',
+              links:[['source · demo/coaz-pep', REPO+'/coaz-pep'],
+                     ['source · authzen servlet', 'https://github.com/dphhyland/idp-authzen-paz-servlet'],
+                     AUTHZEN_SPEC]},
   },
 };
 const GE = [
@@ -1070,12 +1103,15 @@ function stackOf(s){
 
 // ---- gateway toggle (Kong ⇄ agentgateway; same architecture, either PEP) ----
 // The deployed default is injected server-side; the toggle is a presentation aid showing the
-// architecture is gateway-agnostic — the AuthZEN adapter + Ping Authorize are identical either way.
+// architecture is gateway-agnostic — the AuthZEN endpoint + Ping Authorize are identical either way.
 let gateway = "__GATEWAY__";
 function applyGateway(g){
   gateway = g;
   GN.apep1.s = g + ' · MCP edge'; GN.apep2.s = g + ' · API edge';
   GN.ppep1.s = g + ' · MCP edge'; GN.ppep2.s = g + ' · API edge';
+  // Kong: the adapter is a Lua plugin in-process in Kong.
+  // agentgateway: the adapter is a servlet INSIDE PingAuthorize — ext_authz calls the
+  // PDP's own AuthZEN endpoint directly, with no standalone proxy container between them.
   GN.adapter.s = (g === 'Kong') ? 'Lua plugin → AuthZEN' : 'ext_authz → AuthZEN';
   document.querySelectorAll('.gw-name').forEach(e => e.textContent = g);
   document.querySelectorAll('#gwtoggle button').forEach(b => b.classList.toggle('on', b.dataset.gw === g));
@@ -1339,7 +1375,7 @@ function render(steps) {
           json:{ headers:{ Authorization: p.authorization || 'DPoP <token>', DPoP: p.dpop_proof || '<proof>' },
                  body:{ jsonrpc:'2.0', id:0, method:'initialize',
                         params:{ protocolVersion:'2025-11-25', capabilities:{}, clientInfo:{ name:'bank-agent', version:'1' } } } } },
-        { label:'2 · AuthZEN evaluation @ PEP #1', desc:gateway+' → AuthZEN adapter asks Ping Authorize: may this agent open an MCP session?',
+        { label:'2 · AuthZEN evaluation @ PEP #1', desc:gateway+' → AuthZEN endpoint asks Ping Authorize: may this agent open an MCP session?',
           http:'POST /access/v1/evaluation', json: authzenRequest('access_mcp','mcp-service','northwind-bank') },
         { label:'3 · PDP decision', desc:'the session opened, so Ping Authorize returned PERMIT for access_mcp',
           json:{ decision:true } },
@@ -1347,7 +1383,7 @@ function render(steps) {
       out.appendChild(el('step connect',
         `<div class="label">③ Gateway connect · PEP #1 (MCP edge)${s.agent_label ? ' · ' + esc(s.agent_label) : ''}</div>${esc(s.detail)}
          ${presentedChip(p)}
-         <div class="explain">${gateway} authenticated the real DPoP-bound token and (via the AuthZEN adapter) asked the PDP to permit MCP access before the session opened.</div>${wire}`));
+         <div class="explain">${gateway} authenticated the real DPoP-bound token and (via the AuthZEN endpoint) asked the PDP to permit MCP access before the session opened.</div>${wire}`));
     } else if (s.type === 'connect_error') {
       { const d = stackOf(s); setNode(d+'pep1','deny','deny'); } setNode('pdp','deny','DENY');
       out.appendChild(el('step tool_result',
@@ -1366,7 +1402,7 @@ function render(steps) {
           http:`POST ${url}`,
           json:{ headers:{ Authorization: p.authorization || 'DPoP <token>', DPoP: p.dpop_proof || '<proof>' },
                  body:{ jsonrpc:'2.0', id:1, method:'tools/call', params:{ name:s.name, arguments:s.input } } } },
-        { label:'2 · AuthZEN evaluation @ PEP #2', desc:gateway+' maps the Bank API call to an AuthZEN request (via the adapter) for the PDP',
+        { label:'2 · AuthZEN evaluation @ PEP #2', desc:gateway+' maps the Bank API call to an AuthZEN request for the PDP',
           http:'POST /access/v1/evaluation', json: toolToAuthzen(s.name, s.input) },
       ]);
       out.appendChild(el('step tool_call',
@@ -1382,6 +1418,69 @@ function render(steps) {
         `<div class="label">🪪 Identity proofing ← ${esc(s.agent_label||'agent')}</div>
          <span class="decision deny">✘ identity_verification_required</span>${s.pep?`<span class="pep">at ${esc(s.pep)}</span>`:''}
          <div class="reason">${esc(s.detail||('Present '+(s.doctype||'your mDL')))}</div>`));
+    } else if (s.type === 'entitlements_list') {
+      // The concierge asked the AS which accounts it may act on AT ALL — the permitted set,
+      // computed by the PDP from the customer's live holdings. This is the answer the agent
+      // is required to use instead of recalling an account from earlier in the conversation.
+      const list = Array.isArray(s.permitted) ? s.permitted : [];
+      const undecided = s.error && !list.length;
+      const badge = undecided
+        ? '<span class="decision warn">⚠ couldn’t verify</span>'
+        : `<span class="decision ${list.length ? 'allow' : 'deny'}">${list.length} permitted</span>`;
+      const chips = list.length
+        ? `<div class="chips">${list.map(a => `<span class="chip">${esc(a)}</span>`).join('')}</div>`
+        : '';
+      const g = s.guidance ? `<div class="reason">${esc(s.guidance)}</div>` : '';
+      let wireL = '';
+      if (s.wire) {
+        wireL = wireDetails('wire detail — Entitlement search (concierge → AS)', [
+          { label:'curl', desc:'the literal call, bearer = the GM-audienced token',
+            http: s.wire.curl },
+          { label:'JSON-RPC request', desc:'MCP tools/call → list_entitlements; an AuthZEN resource search WITHOUT a subject — the AS infers it from the token',
+            json: s.wire.request },
+          { label:'Response', desc:'the permitted set, from PingAuthorize\'s native AuthZEN resource search',
+            json: s.response || {} },
+        ]);
+      }
+      if (!undecided) setNode('pdp', list.length ? 'permit' : 'deny', list.length ? 'PERMIT' : 'NONE');
+      out.appendChild(el('step tool_result convo',
+        `<div class="label">🗂 Entitlements — accounts the authorization server says you may use</div>
+         <div>${esc(s.detail || '')}</div>${badge}${chips}${g}${wireL}`));
+    } else if (s.type === 'entitlements_check') {
+      // The concierge asked the Authorization Server's Grant Evaluation API whether the
+      // customer's grant still permits an action on a specific account, BEFORE acting.
+      // Three outcomes — the AS permitted, the AS denied, or the AS could not decide
+      // (token rejected / unreachable). An undecided check must NOT read as a denial.
+      const undecided = s.error && s.permitted !== true && s.permitted !== false;
+      const ok = s.permitted === true;
+      const badge = undecided
+        ? '<span class="decision warn">⚠ couldn’t verify</span>'
+        : (ok ? '<span class="decision allow">✔ permitted</span>'
+              : '<span class="decision deny">✘ not permitted</span>');
+      const g = s.guidance ? `<div class="reason">${esc(s.guidance)}</div>` : '';
+      const help = (s.permitted === false)
+        ? `<div class="reason">${s.consent_would_help
+             ? 'Re-consent would help — the customer can approve this.'
+             : 'Re-consent will NOT help — the customer no longer holds this access.'}</div>`
+        : '';
+      if (undecided) setNode('pdp', 'wait', 'no decision');
+      else setNode('pdp', ok ? 'permit' : 'deny', ok ? 'PERMIT' : 'DENY');
+      // The literal wire call: the exact curl the concierge issued against the AS's Grant
+      // Management API (MCP), plus the JSON-RPC request and the decision that came back.
+      let wire = '';
+      if (s.wire) {
+        wire = wireDetails('wire detail — Grant Evaluation call (concierge → AS)', [
+          { label:'curl', desc:'the literal call, bearer = the GM-audienced token (aud=https://gm-api.demo/grants)',
+            http: s.wire.curl },
+          { label:'JSON-RPC request', desc:'MCP tools/call → evaluate_grant on the gm-api',
+            json: s.wire.request },
+          { label:'Decision response', desc:'the AS intersected the grant with the customer\'s live holdings via Ping Authorize',
+            json: s.response || {} },
+        ]);
+      }
+      out.appendChild(el('step tool_result convo',
+        `<div class="label">🔎 Grant evaluation — asked the authorization server</div>
+         <div>${esc(s.detail || '')}</div>${badge}${s.reason ? `<span class="pep">${esc(s.reason)}</span>` : ''}${g}${help}${wire}`));
     } else if (s.type === 'scope_stepup') {
       // Display-only: the task agent reporting PEP #2's insufficient_scope. The
       // redirect itself is driven by the concierge's 'scope_challenge' event.
@@ -1399,7 +1498,7 @@ function render(steps) {
       else if (allowed === false) { badge = `<span class="decision deny">✘ DENY</span>${pep}`; setNode(_d+'pep2','deny','deny'); setNode('pdp','deny','DENY'); }
       const reason = s.policy_reason ? `<div class="reason">Policy reason: ${esc(s.policy_reason)}</div>` : '';
       const wire = (allowed === true || allowed === false) ? wireDetails('wire detail — PDP decision', [
-        { label:'AuthZEN decision response', desc:'from Ping Authorize via the AuthZEN adapter; '+gateway+' enforces it',
+        { label:'AuthZEN decision response', desc:'from Ping Authorize via the AuthZEN endpoint; '+gateway+' enforces it',
           json:{ decision: allowed, context:{ reason: s.policy_reason || (allowed ? 'Permitted by policy.' : 'Denied by policy.') } } },
         { label:'Gateway headers', desc:'surfaced by '+gateway+' on the proxied response',
           json:{ 'X-PDP-PEP': s.pep || '', 'X-PDP-Decision': allowed ? 'PERMIT' : 'DENY', 'X-PDP-Action': s.pep_action || '' } },

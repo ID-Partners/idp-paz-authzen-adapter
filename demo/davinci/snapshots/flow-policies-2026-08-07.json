@@ -1,0 +1,12 @@
+{
+  "_comment": "Flow-policy snapshot taken BEFORE editing the registration flow. GET /apps (NOT the single-app read, which reports policies:[] and is how a policy was lost here before). Secrets deliberately omitted.",
+  "takenAt": "2026-08-07T02:19:59Z",
+  "appId": "74e432a9f7c4aaa657332b1a10282b61",
+  "appName": "PingOne SSO Connection",
+  "policies": [
+    {"name": "Bank Signup Passkey Registration", "policyId": "5eccfe79c581a8890d07cb7a217b25bd", "flowId": "21d1edd60400b6a2ad87b398fe65f3e0", "status": "enabled"},
+    {"name": "Bank Signup Passkey Live",         "policyId": "f0245209d0fed91c282fb1396f06fd2e", "flowId": "774001f77c9b2e470fa0b6bce9fe3931", "status": "enabled"},
+    {"name": "Payment Consent (RAR)",            "policyId": "122354553b1301f114619a576c4e57fc", "flowId": "e58cea11d8a5c6239060b1d2f7e0ab6f", "status": "enabled"},
+    {"name": "Recognize Sign-On (simulated)",    "policyId": "8376b8aadec32fcdaa4ccdb2911b6c4c", "flowId": "dde392a8046c8787211f886afe44e848", "status": "enabled"}
+  ]
+}

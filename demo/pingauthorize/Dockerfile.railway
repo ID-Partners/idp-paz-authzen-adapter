@@ -29,5 +29,27 @@ COPY --chown=9031:0 demo/pingauthorize/pd.profile /opt/in/pd.profile
 # loads it locally in embedded mode. Regenerate when the policy changes.
 COPY --chown=9031:0 demo/pingauthorize/banking.deploymentpackage /opt/in/banking.deploymentpackage
 
+# The AuthZEN Authorization API 1.0 servlet extension (Server SDK HTTPServletExtension),
+# so PingAuthorize speaks AuthZEN natively and the Grant Management API on PingFederate
+# needs no Go adapter in the path.
+#
+# Installed HERE, into the pristine product bits at /opt/server, NOT shipped in the server
+# profile's server-sdk-extensions/ dir. On 11.1 the profile route fails: `manage-profile
+# setup` installs profile extensions and then its own setup step aborts with "Server
+# Already Configured". Installing at build time sidesteps that entirely — hook
+# 06-copy-product-bits.sh copies the extension into the runtime instance, and setup runs
+# untouched. (The extension must be built with -Ppaz11: 11.x's Server SDK is
+# jakarta.servlet, and a javax-compiled bundle is rejected as an unsupported extension
+# type. See idp-pingauthorize/authzen-servlet.)
+USER root
+COPY --chown=9031:0 demo/pingauthorize/extension/authzen-adapter-1.0.0.zip /tmp/authzen-adapter.zip
+# chown the WHOLE product tree afterwards, not just extensions/ and lib/: manage-extension
+# also writes logs/tools and config as root, and hook 06-copy-product-bits.sh runs `cp -Ru`
+# as uid 9031 — any root-owned file it cannot read fails the copy and the container.
+RUN /opt/server/bin/manage-extension --install /tmp/authzen-adapter.zip --no-prompt --ignoreWarnings \
+    && rm -f /tmp/authzen-adapter.zip \
+    && chown -R 9031:0 /opt/server
+USER 9031:0
+
 EXPOSE 1443
 CMD ["start-server"]

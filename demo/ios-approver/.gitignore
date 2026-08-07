@@ -4,3 +4,14 @@ DerivedData/
 xcuserdata/
 .DS_Store
 *.p8
+
+# xcodebuild -derivedDataPath output (build/, build-sim/, build-device/) — hundreds of MB,
+# includes the resolved KeylessSDK.xcframework. The SDK comes from the Cloudsmith registry
+# (see setup-keyless-sdk.sh); it must never be vendored into git.
+build/
+build-sim/
+build-device/
+KeylessBridge/.build/
+
+# Vendor SDK reference — licensed binaries/source, kept locally only
+vendor-reference/

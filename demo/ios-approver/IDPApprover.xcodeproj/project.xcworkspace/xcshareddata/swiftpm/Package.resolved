@@ -1,6 +1,14 @@
 {
-  "originHash" : "f6d2d7d75c3cf5b7ec4e39a4008cc182726668569e6237811c5919bda25619bd",
+  "originHash" : "be480f84031026a18b295b30c1a002e8b2aff280eb2eb037388f2f560db46c3f",
   "pins" : [
+    {
+      "identity" : "keyless.mobile-sdk",
+      "kind" : "registry",
+      "location" : "",
+      "state" : {
+        "version" : "6.0.1"
+      }
+    },
     {
       "identity" : "pingone-mobile-sdk-ios",
       "kind" : "remoteSourceControl",

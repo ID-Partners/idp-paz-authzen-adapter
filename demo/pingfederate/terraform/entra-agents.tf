@@ -100,14 +100,16 @@ resource "pingfederate_oauth_access_token_manager" "attest_jwt_entra" {
 }
 
 # The exchange mapping for ALL entra clients: sub = the human principal from the
-# subject token (Alice — PF validated its own user token); act = {"sub": <the
-# authenticating client>} DERIVED from ClientId, so the chain names the actual
-# Copilot agent client without per-client mappings. The bridge exchanges Alice's
-# LOGIN token (no inbound act), so the entra hop is always the chain root here.
+# subject token (Alice — PF validated her ENTRA-issued user token, see
+# entra-user-subject.tf; not a PF-native login, there isn't one on this path);
+# act = {"sub": <the authenticating client>} DERIVED from ClientId, so the chain
+# names the actual Copilot agent client without per-client mappings. Alice's
+# Entra token is always the chain root (no inbound act), so the entra hop is
+# always the chain root here.
 resource "pingfederate_oauth_access_token_mapping" "te_entra" {
   context = {
     type        = "TOKEN_EXCHANGE_PROCESSOR_POLICY"
-    context_ref = { id = pingfederate_oauth_token_exchange_processor_policy.user_to_agent.policy_id }
+    context_ref = { id = pingfederate_oauth_token_exchange_processor_policy.entra_user_to_agent.policy_id }
   }
   access_token_manager_ref = { id = pingfederate_oauth_access_token_manager.attest_jwt_entra.manager_id }
 
@@ -166,7 +168,7 @@ resource "pingfederate_oauth_client" "entra_gateway" {
   bypass_approval_page                     = local.entra_client_base.bypass_approval_page
 
   token_exchange_processor_policy_ref = {
-    id = pingfederate_oauth_token_exchange_processor_policy.user_to_agent.policy_id
+    id = pingfederate_oauth_token_exchange_processor_policy.entra_user_to_agent.policy_id
   }
 }
 
@@ -185,6 +187,6 @@ resource "pingfederate_oauth_client" "entra_copilot_demo" {
   bypass_approval_page                     = local.entra_client_base.bypass_approval_page
 
   token_exchange_processor_policy_ref = {
-    id = pingfederate_oauth_token_exchange_processor_policy.user_to_agent.policy_id
+    id = pingfederate_oauth_token_exchange_processor_policy.entra_user_to_agent.policy_id
   }
 }

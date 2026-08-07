@@ -57,6 +57,32 @@ BANK_TOOLS = [
          "to_account": {"type": "string"}, "amount": {"type": "number"},
          "currency": {"type": "string"}, "description": {"type": "string"}},
                       "required": ["customer_id", "from_account", "to_account", "amount"]}},
+    # Concierge-LOCAL tools (not A2A): the agent asks the Authorization Server's Grant
+    # Evaluation API whether the CUSTOMER's grant still permits an operation on a specific
+    # account — BEFORE trying it. The AS intersects the grant (scopes/RAR it owns) with the
+    # customer's live account holdings (the bank owns). Lets the agent reason (proceed /
+    # re-consent / stop) instead of blindly attempting and handling a denial.
+    {"name": "check_grant",
+     "description": "Ask the authorization server whether the customer's grant still permits "
+                    "an action on a specific account, BEFORE acting. Returns permitted + a "
+                    "guidance field: if not permitted and consent_would_help is false, the "
+                    "customer no longer has that access and re-asking won't help — do not retry.",
+     "input_schema": {"type": "object", "properties": {
+         "account_id": {"type": "string", "description": "The account to check, e.g. SAV-1003."},
+         "action": {"type": "string", "description": "read_balance | read_transactions | initiate_payment"}},
+                      "required": ["account_id", "action"]}},
+    {"name": "list_entitlements",
+     "description": "Ask the authorization server WHICH accounts the customer may act on at "
+                    "all. The AS computes the permitted set from the customer's live holdings, "
+                    "so it is the only trustworthy source: an account you saw earlier in this "
+                    "conversation may since have been closed or withdrawn. Call this — never "
+                    "your memory of an earlier answer — when you need to choose an account or "
+                    "the customer asks what they can use.",
+     "input_schema": {"type": "object", "properties": {
+         "action": {"type": "string",
+                    "description": "The action you want the permitted set for. Use "
+                                   "search_accounts for 'which accounts can I use'."}},
+                      "required": ["action"]}},
 ]
 
 # --- conversation memory ------------------------------------------------------
@@ -113,7 +139,109 @@ Rules:
   into it from that account. Never assume an account id — every customer has their
   own (the seeded demo customer's checking is CHK-1001, but a new customer's is not),
   so read it from their account list rather than guessing.
+- NEVER ANSWER AUTHORITY QUESTIONS FROM MEMORY. When the customer asks which accounts
+  they can use, or when YOU need to pick an account to act on, call list_entitlements
+  and use what the authorization server returns. Do NOT answer from accounts mentioned
+  earlier in this conversation, from a previous list_accounts result, or from what you
+  recall — an account you saw before may since have been closed or withdrawn, and only
+  the authorization server knows. If list_entitlements returns an empty set, tell the
+  customer they hold nothing you may act on and stop; do not guess an account id.
+- CHECK YOUR AUTHORITY FIRST, EVERY TIME: before ANY operation that touches a specific
+  account, FIRST call check_grant to ask the authorization server whether the
+  customer's grant still permits it — then act. Concretely: before reading an account,
+  check_grant(account_id, "read_balance"); before a payment, check_grant on the
+  DESTINATION account with action "initiate_payment" (and on the source too if it is
+  not obviously the customer's everyday account). Tell the customer in one short line
+  what you asked and what the authorization server answered, then continue.
+  Reason over the answer: if permitted is true, proceed immediately; if it is false
+  and consent_would_help is true, the customer just needs to approve — proceed and let
+  the normal step-up/consent challenge happen; if it is false and consent_would_help
+  is false, the customer no longer holds that access — tell them plainly and do NOT
+  attempt the operation, retry, or ask them to re-approve. If the check itself errors,
+  say the check was unavailable and continue with the action (the gateway still
+  enforces policy). The check informs and explains; the enforcement stays with the
+  gateway and PDP.
 """
+
+
+GM_MCP_URL = os.environ.get(
+    "GM_MCP_URL", "https://pingfederate-staging.up.railway.app/gm-api/mcp")
+
+
+def _token_claim(token: str | None, claim: str):
+    """Read one claim from a JWT without verifying (display/routing only)."""
+    if not token:
+        return None
+    try:
+        import jwt
+        return jwt.decode(token, options={"verify_signature": False}).get(claim)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+async def _gm_call(user_token: str | None, tool: str, arguments: dict) -> dict:
+    """Call one tool on the AS's Grant Management API over MCP.
+
+    `arguments` is a well-formed AuthZEN request MINUS the subject: the GM API infers the
+    subject from the presented token (its sub, plus the actor chain when delegated) and
+    enriches the PDP request with the grant's scopes and authorization_details. A caller
+    cannot ask about anyone but itself, which is why no subject is sent.
+
+    Presents the GM-audienced token. Returns the tool's JSON plus a `_wire` block (the
+    literal call) for the transcript."""
+    body = {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": tool, "arguments": arguments}}
+    headers = {"Authorization": f"Bearer {user_token}"} if user_token else {}
+    # The literal wire call, for the UI's wire-detail expander (token redacted to a stub
+    # that still shows it IS the GM-audienced token, not the session token).
+    tok_stub = (user_token[:24] + "…" + user_token[-6:]) if user_token else "<none>"
+    wire = {
+        "url": GM_MCP_URL,
+        "request": body,
+        "curl": ("curl -X POST " + GM_MCP_URL + " \\\n"
+                 "  -H 'Content-Type: application/json' \\\n"
+                 f"  -H 'Authorization: Bearer {tok_stub}'  # aud=https://gm-api.demo/grants \\\n"
+                 "  -d '" + json.dumps(body) + "'"),
+    }
+    async def _call() -> dict:
+        try:
+            import httpx
+            async with httpx.AsyncClient(timeout=15.0, verify=False) as c:
+                r = await c.post(GM_MCP_URL, json=body, headers=headers)
+        except Exception as exc:  # noqa: BLE001
+            return {"error": f"grant-management API unreachable: {exc}"}
+        try:
+            d = r.json()
+        except Exception:  # noqa: BLE001
+            return {"error": f"gm-api {r.status_code}", "raw": r.text[:200]}
+        # The gm-api may not return a compliant JSON-RPC object (error HTML→json, a bare
+        # string, a list); coerce anything non-dict to a safe carrier so `.get()` is always valid.
+        if not isinstance(d, dict):
+            return {"error": f"gm-api {r.status_code}", "raw": r.text[:200]}
+        result = d.get("result")
+        if not isinstance(result, dict):
+            result = {}
+        for item in result.get("content") or []:
+            if isinstance(item, dict) and item.get("type") == "text":
+                try:
+                    parsed = json.loads(item["text"])
+                except Exception:  # noqa: BLE001
+                    return {"text": item["text"]}
+                # A well-formed decision is a JSON object; a bare string/array/number
+                # (double-encoded text) must not leak out as `ans` or `.get()` breaks.
+                return parsed if isinstance(parsed, dict) else {"text": item["text"], "result": parsed}
+        err = d.get("error")
+        if isinstance(err, dict):
+            return err
+        if err:
+            return {"error": str(err)}
+        return result or {"raw": r.text[:200]}
+
+    ans = await _call()
+    # Attach the wire call for the UI. Kept under a sentinel key so the dispatch loop can
+    # pop it before the answer is fed back to the model as a tool_result.
+    ans["_wire"] = wire
+    return ans
 
 
 def _token_sub(token: str | None) -> str | None:
@@ -162,6 +290,7 @@ def _extract_text(content_block) -> str:
 
 async def agent_events(prompt: str, session_id: str = "demo",
                        user_token: str | None = None,
+                       gm_token: str | None = None,
                        customer_id: str | None = None) -> AsyncIterator[dict[str, Any]]:
     """Run one agent turn, yielding each transcript step AS IT HAPPENS.
 
@@ -256,7 +385,10 @@ async def agent_events(prompt: str, session_id: str = "demo",
                "detail": f"Discovered {cfg['label']} via its A2A Agent Card at "
                          f"{cfg['url']}/.well-known/agent-card.json ({len(skills)} skills)."}
 
-    tools = [t for t in BANK_TOOLS if t["name"] in skill_route]
+    # A2A-fulfilled tools require a task agent that advertises the skill; check_grant is
+    # concierge-LOCAL (it calls the AS Grant Evaluation API directly), so always offer it.
+    LOCAL_TOOLS = {"check_grant", "list_entitlements"}
+    tools = [t for t in BANK_TOOLS if t["name"] in skill_route or t["name"] in LOCAL_TOOLS]
     agent_texts: list[str] = []
     if not tools:
         yield {"type": "final", "session_id": session_id,
@@ -298,6 +430,61 @@ async def agent_events(prompt: str, session_id: str = "demo",
 
         tool_results = []
         for tu in tool_uses:
+            # Concierge-local: ask the AS whether the customer's grant permits this, before acting.
+            if tu.name == "check_grant":
+                acct = (tu.input or {}).get("account_id", "")
+                action = (tu.input or {}).get("action", "read_balance") or "read_balance"
+                # Present the GM-API-audienced token (aud=https://gm-api.demo/grants) if the
+                # BFF supplied one; fall back to the session token (which the GM API will
+                # reject on audience — surfaced as an honest "couldn't verify", not a denial).
+                # A well-formed AuthZEN request minus the subject — the AS infers that from
+                # the token. Nothing here names a user.
+                ans = await _gm_call(gm_token or user_token, "evaluate_grant", {
+                    "action": {"name": action},
+                    "resource": {"type": "account", "id": acct}})
+                if not isinstance(ans, dict):
+                    ans = {"guidance": str(ans)}
+                # The literal HTTP call, for the transcript's wire-detail expander — popped so
+                # the model's tool_result stays the clean decision JSON.
+                wire = ans.pop("_wire", None)
+                # An `error` means the AS could not decide (token rejected, unreachable) — that is
+                # NOT a policy denial. Surface it as its own state so the UI doesn't paint it "deny".
+                err = ans.get("error")
+                yield {"type": "entitlements_check", "account": acct, "action": action,
+                       "permitted": ans.get("permitted"), "reason": ans.get("reason"),
+                       "error": err, "wire": wire, "response": ans,
+                       "consent_would_help": ans.get("consent_would_help"),
+                       "guidance": (ans.get("guidance") or ans.get("explanation")
+                                    or ans.get("message") or (f"Grant evaluation unavailable ({err})" if err else None)),
+                       "detail": f"Asked the authorization server: may I {action} on {acct or 'this account'}?"}
+                tool_results.append({"type": "tool_result", "tool_use_id": tu.id,
+                                     "content": json.dumps(ans)})
+                continue
+
+            # Concierge-local: ask the AS which accounts the customer may act on AT ALL.
+            # This is the answer the agent must use instead of remembering an earlier one.
+            if tu.name == "list_entitlements":
+                action = (tu.input or {}).get("action", "search_accounts") or "search_accounts"
+                ans = await _gm_call(gm_token or user_token, "list_entitlements", {
+                    "action": {"name": action},
+                    "resource": {"type": "account"}})
+                if not isinstance(ans, dict):
+                    ans = {"guidance": str(ans)}
+                wire = ans.pop("_wire", None)
+                err = ans.get("error")
+                permitted = ans.get("permitted")
+                if not isinstance(permitted, list):
+                    permitted = []
+                yield {"type": "entitlements_list", "action": action,
+                       "permitted": permitted, "count": ans.get("count"),
+                       "error": err, "wire": wire, "response": ans,
+                       "guidance": (ans.get("guidance")
+                                    or (f"Entitlement search unavailable ({err})" if err else None)),
+                       "detail": f"Asked the authorization server: which accounts may I {action} on?"}
+                tool_results.append({"type": "tool_result", "tool_use_id": tu.id,
+                                     "content": json.dumps(ans)})
+                continue
+
             route = skill_route.get(tu.name)
             if not route:
                 text = json.dumps({"error": f"no task agent advertises '{tu.name}'"})
@@ -402,13 +589,14 @@ async def agent_events(prompt: str, session_id: str = "demo",
 
 async def run_agent(prompt: str, session_id: str = "demo",
                     user_token: str | None = None,
+                    gm_token: str | None = None,
                     customer_id: str | None = None) -> dict[str, Any]:
     """Non-streaming wrapper (AgentCore /invocations contract): collect the
     streamed events into a full transcript + final answer."""
     transcript: list[dict[str, Any]] = []
     final = "Done."
     async for ev in agent_events(prompt, session_id, user_token=user_token,
-                                 customer_id=customer_id):
+                                 gm_token=gm_token, customer_id=customer_id):
         if ev.get("type") == "final":
             final = ev.get("final", final)
         else:

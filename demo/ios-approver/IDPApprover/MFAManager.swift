@@ -5,6 +5,311 @@ import LocalAuthentication
 import AuthenticationServices   // native passkey (WebAuthn) sign-in
 import PingOneSDK   // github.com/pingidentity/pingone-mobile-sdk-ios (SPM), v2.3.2
 
+/// The evidence a PingOne Recognize check produces: WHO approved, not just that a paired
+/// device did. `verified` alone drives the assurance ladder in demo/app/app.py
+/// (ASSURANCE_RECOGNIZE_VERIFIED); `assertion`, when present, is a signed token the BFF can
+/// verify server-side instead of trusting the phone's word for it (see RECOGNIZE_SIMULATE /
+/// _recognize_verdict in app.py — this mirrors that SIMULATE-vs-REAL split on the client).
+struct RecognizeResult {
+    let verified: Bool
+    let assertion: String?
+}
+
+/// Outcome of a one-off face enrolment. A plain enum rather than `Result`, because the failure
+/// side here is a message meant for a human on screen, not an `Error` anyone catches or rethrows.
+enum RecognizeEnrolOutcome {
+    /// `clientState` is the NEW-DEVICE RECOVERY material. Produced only when the enrolment asks
+    /// for it (generatingClientState). Without it, losing this phone means re-enrolling from
+    /// scratch — with it, the person can prove themselves onto a new device with their face.
+    case enrolled(keylessId: String, clientState: String?)
+    case failed(String)
+}
+
+/// The instruction a biometric check is bound to. This is the PSD2 *dynamic linking* payload:
+/// without it a face match only proves someone was present, not what they agreed to — the exact
+/// gap demo/TRANSACTION-AUTHORIZATION.md argues a browser passkey can never close.
+///
+/// Recognize requires a very specific shape: "`dynamicLinkingInfo` must be a JSON array containing
+/// JSON objects (key/value pairs)" — an array of SINGLE-pair objects, NOT one object with many
+/// keys. It renders these labels to the user on its own screen, then signs them into the `td`
+/// claim of the result JWT. Order is display order, so it reads amount-first like a payment sheet.
+struct RecognizeTransaction {
+    var amount: String
+    var currency: String
+    var payee: String
+    var payer: String
+    var reference: String
+
+    /// The documented array-of-single-pair-objects form. Empty values are dropped rather than
+    /// shown as blank rows — the user is being asked to vouch for this text.
+    var transactionDataJSON: String {
+        let pairs: [(String, String)] = [
+            ("Amount", "\(currency) \(amount)"),
+            ("To", payee),
+            ("From", payer),
+            ("Reference", reference),
+        ].filter { !$0.1.trimmingCharacters(in: .whitespaces).isEmpty }
+        let objects = pairs.map { [$0.0: $0.1] }
+        guard let data = try? JSONSerialization.data(withJSONObject: objects),
+              let s = String(data: data, encoding: .utf8) else { return "[]" }
+        return s
+    }
+}
+
+/// Seam for PingOne Recognize / Keyless biometric verification. Two conformers below: the
+/// simulated one (device-local, no server-verifiable evidence) and the real Mobile SDK one.
+/// The call site in MFAManager.approve() is unaffected by which is installed.
+protocol RecognizeVerifier {
+    /// Runs a face-match/liveness check bound to `transaction`, which Recognize both DISPLAYS to
+    /// the user and signs into the result JWT's `td` claim.
+    func verify(reason: String, transaction: RecognizeTransaction?) async -> RecognizeResult
+
+    /// Enrols this device's user. Returns the `keylessId` on success, or a message to show.
+    /// You cannot authenticate against a template that does not exist, so this must run once
+    /// before the first `verify` — the SDK reports "not enrolled" as a generic server error,
+    /// which reads like an outage rather than a missing enrolment.
+    func enrol(username: String) async -> RecognizeEnrolOutcome
+
+    /// Clears this DEVICE's Recognize state without destroying the enrolment at the tenant.
+    /// Sign-out semantics: the person keeps their enrolment, this handset just stops holding it.
+    /// Contrast deEnrol(), which destroys the template for everyone.
+    func resetLocal()
+
+    /// The keylessId currently enrolled ON THIS DEVICE, or nil. Lets the UI say "already
+    /// enrolled" instead of offering an action that will fail.
+    func enrolledUserId() -> String?
+
+    /// Removes this user's enrolment. Returns nil on success, else a message.
+    /// Note the SDK requires a LIVE FACE MATCH to de-enrol — you must prove you are the enrolled
+    /// person before their template can be destroyed, so this is not a silent wipe.
+    func deEnrol() async -> String?
+}
+
+/// SIMULATED verifier: stands in for the real SDK the same way `SIMULATE=1` stands in for a
+/// real CIBA push elsewhere in this demo (see demo/autonomous-agent/agent.py). It reuses the
+/// device's OWN LocalAuthentication prompt as a stand-in UX beat — this is NOT what makes the
+/// result trustworthy (it's exactly the weak, on-device-only check TRANSACTION-AUTHORIZATION.md
+/// warns about), it's only there so tapping through the demo feels like something happened.
+/// The `assertion` is always nil: a simulated verdict has nothing a server could verify, so
+/// app.py's REAL mode (RECOGNIZE_SIMULATE=0) correctly refuses it rather than trusting a bare
+/// boolean from the network.
+struct SimulatedRecognizeVerifier: RecognizeVerifier {
+    /// `transaction` is deliberately IGNORED here, and that is the point: LocalAuthentication has
+    /// nowhere to put it. A device unlock cannot be bound to an instruction, so the simulated path
+    /// structurally cannot do dynamic linking — only the real SDK below can.
+    func verify(reason: String, transaction: RecognizeTransaction?) async -> RecognizeResult {
+        await withCheckedContinuation { cont in
+            let c = LAContext()
+            c.evaluatePolicy(.deviceOwnerAuthentication, localizedReason: reason) { ok, _ in
+                cont.resume(returning: RecognizeResult(verified: ok, assertion: nil))
+            }
+        }
+    }
+
+    /// There is nothing to enrol INTO without a tenant, and pretending otherwise would leave
+    /// someone believing a biometric template exists when none does.
+    func enrol(username: String) async -> RecognizeEnrolOutcome {
+        .failed("Recognize isn't configured on this build — nothing to enrol into.")
+    }
+
+    func deEnrol() async -> String? { "Recognize isn't configured on this build." }
+    func resetLocal() {}
+    func enrolledUserId() -> String? { nil }
+}
+
+/// Where the Recognize Mobile SDK gets its configuration. Unlike the Web SDK — which needs a
+/// `customer.name` plus a regional `service.url` pointing at an Authentication Service — the
+/// Mobile SDK takes ONLY an API key and a list of node hosts. It does not go through the
+/// Authentication Service at all (the docs scope that to "IDV Bridge SaaS and WebSDK"), which is
+/// why this path is viable on a tenant whose region has no Authentication Service deployed.
+///
+/// Both values come from Info.plist so no credential is compiled into the binary:
+///   RecognizeApiKey    — the dashboard's **Mobile** API Key (NOT the Secret API Key, which is
+///                        for backend REST calls, and NOT the Download Key, which is Cloudsmith)
+///   RecognizeHosts     — comma-separated node URLs, **no trailing slashes** (an explicit
+///                        requirement in the docs; a trailing "/" is a silent misconfiguration)
+struct RecognizeConfig {
+    let apiKey: String
+    let hosts: [String]
+    /// `aud` stamped into the signed assertion. Without it the JWT carries no audience and the
+    /// server must skip that check — meaning an assertion minted for a DIFFERENT relying party
+    /// on the same tenant would verify here. Pinning it closes that gap. Must match the
+    /// server's RECOGNIZE_JWT_AUDIENCE exactly.
+    let jwtAudience: String
+
+    static func fromBundle() -> RecognizeConfig? {
+        let info = Bundle.main.infoDictionary
+        let key = (info?["RecognizeApiKey"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let aud = ((info?["RecognizeJwtAudience"] as? String) ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let raw = (info?["RecognizeHosts"] as? String) ?? ""
+        let hosts = raw.split(separator: ",")
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .map { $0.hasSuffix("/") ? String($0.dropLast()) : $0 }
+            .filter { !$0.isEmpty }
+        // Refuse to half-configure. A key with no hosts (or vice versa) cannot authenticate, and
+        // falling back to the simulated verifier while the UI says "verified by PingOne Recognize"
+        // is the overstatement the assurance ladder exists to prevent.
+        guard !key.isEmpty, !hosts.isEmpty else { return nil }
+        return RecognizeConfig(apiKey: key, hosts: hosts, jwtAudience: aud)
+    }
+}
+
+// ⚠ The module is KeylessSDK, NOT Keyless — verified against the shipped
+// KeylessSDK.xcframework's .swiftinterface (`-module-name KeylessSDK`, v6.0.1). The vendor docs
+// show `import Keyless` in every iOS sample and that is simply wrong; guarding on
+// canImport(Keyless) silently compiles this whole file section OUT, so the app keeps using the
+// simulated verifier while looking correctly wired. Nothing warns you.
+// Package identity (`keyless.mobile-sdk`) is a third distinct name — don't conflate the three.
+#if canImport(KeylessSDK)
+import KeylessSDK
+
+/// REAL verifier: a server-verified face match with liveness, bound to the payment.
+///
+/// This is the substantive upgrade over `SimulatedRecognizeVerifier`. That one calls
+/// `LAContext.deviceOwnerAuthentication`, which proves only that SOMEONE unlocked this handset —
+/// it would pass for anyone holding the phone who knows the passcode, it produces nothing a
+/// server can check, and it cannot be tied to the instruction. This one performs a biometric
+/// match against the enrolled user server-side and returns a signed JWT whose `td` claim contains
+/// the transaction we displayed, which app.py verifies in REAL mode (RECOGNIZE_SIMULATE=0).
+///
+/// ⚠ API SURFACE IS VERSION-SENSITIVE — verify against the SDK headers you actually pull.
+/// Written for the 5.2/6.0 shape: `JwtSigningInfo(claimTransactionData:)` +
+/// `BiomAuthConfig(jwtSigningInfo:)`. The 4.6-era docs show `DynamicLinkingInfo(transactionData:)`
+/// passed as `BiomAuthConfig(dynamicLinkingInfo:)` instead, and the published iOS snippet for it
+/// is not even valid Swift (it uses a Kotlin `=` in the initialiser), so treat those pages as
+/// stale. `Keyless.configure` is idempotent-guarded here because it is documented as an
+/// app-launch call and this verifier may be constructed per approval.
+struct KeylessRecognizeVerifier: RecognizeVerifier {
+    let config: RecognizeConfig
+
+    /// `Keyless.configure` is a launch-time call, so it runs once per process. Pinned to the main
+    /// actor rather than a bare `static var` so the flag is not shared mutable state.
+    @MainActor private static var configured = false
+
+    /// NOTE: configure is COMPLETION-BASED, not the synchronous `if let error = …` form the docs
+    /// show. Real signature: `configure(setupConfiguration:onCompletion:)`.
+    @MainActor private func configureIfNeeded() async -> String? {
+        guard !Self.configured else { return nil }
+        let setup = SetupConfig(apiKey: config.apiKey, hosts: config.hosts)
+        let err: String? = await withCheckedContinuation { cont in
+            Keyless.configure(setupConfiguration: setup) { error in
+                cont.resume(returning: error.map { "configure failed: \($0)" })
+            }
+        }
+        if err == nil { Self.configured = true }
+        return err
+    }
+
+    /// Captures a face and creates the template server-side. `keylessId` is derived from the
+    /// user's own random seed — it identifies the USER, not this handset — so the same identity
+    /// can later be activated on another device rather than re-enrolled.
+    func enrol(username: String) async -> RecognizeEnrolOutcome {
+        if let err = await configureIfNeeded() { return .failed(err) }
+        // OperationInfo.externalUserId binds the biometric to OUR identity AS PART OF the
+        // ceremony. If the tenant honours it, the separate Server-API bind becomes redundant —
+        // /recognize/bind then returns 409 "already bound", which is how we detect it worked.
+        // Kept alongside the bind rather than replacing it: unproven, and failing to bind at all
+        // would leave an unattributable template.
+        let op = Keyless.OperationInfo(id: "enrol-" + UUID().uuidString, externalUserId: username)
+        // .backup (not .temporary): this is meant to outlive the handset that made it — it is
+        // the thing that turns "I lost my phone" into a face capture rather than a call centre.
+        return await withCheckedContinuation { cont in
+            Keyless.enroll(configuration: BiomEnrollConfig(
+                operationInfo: op, generatingClientState: .backup)) { result in
+                switch result {
+                case .success(let ok):
+                    guard let id = ok.keylessId, !id.isEmpty else {
+                        cont.resume(returning: .failed("Enrolled, but no keylessId came back."))
+                        return
+                    }
+                    if ok.clientState == nil {
+                        Task { @MainActor in MFAManager.phoneLog("recognize_enrol",
+                            "WARNING no clientState returned — new-device recovery unavailable") }
+                    }
+                    cont.resume(returning: .enrolled(keylessId: id, clientState: ok.clientState))
+                case .failure(let error):
+                    Task { @MainActor in MFAManager.phoneLog("recognize_enrol", "failed: \(error)") }
+                    cont.resume(returning: .failed(String(describing: error)))
+                }
+            }
+        }
+    }
+
+    /// Local-only. `Keyless.reset()` is SYNCHRONOUS and returns an error directly — unlike
+    /// deEnroll, which is async, needs a live face match, and reaches the tenant. That shape is
+    /// the evidence it clears device state rather than the enrolment itself.
+    func resetLocal() {
+        if let err = Keyless.reset() {
+            Task { @MainActor in MFAManager.phoneLog("recognize_reset", "failed: \(err)") }
+        } else {
+            Task { @MainActor in MFAManager.phoneLog("recognize_reset", "device state cleared") }
+        }
+    }
+
+    func enrolledUserId() -> String? {
+        switch Keyless.getUserId() {
+        case .success(let id): return id.isEmpty ? nil : id
+        case .failure: return nil
+        }
+    }
+
+    func deEnrol() async -> String? {
+        if let err = await configureIfNeeded() { return err }
+        return await withCheckedContinuation { cont in
+            Keyless.deEnroll(deEnrollmentConfiguration: BiomDeEnrollConfig()) { error in
+                cont.resume(returning: error.map { String(describing: $0) })
+            }
+        }
+    }
+
+    func verify(reason: String, transaction: RecognizeTransaction?) async -> RecognizeResult {
+        if let err = await configureIfNeeded() {
+            await MainActor.run { MFAManager.phoneLog("recognize_sdk", err) }
+            return RecognizeResult(verified: false, assertion: nil)
+        }
+        // jwtSigningInfo (NOT dynamicLinkingInfo) is what produces the signed `td` claim. Both
+        // fields exist on BiomAuthConfig in 6.x; dynamicLinkingInfo only drives the on-screen
+        // display, so signing is the one that yields server-verifiable evidence.
+        //
+        // No transaction → still a real face match, just not dynamically linked. Deliberately
+        // allowed: agent-entitlement approval has no amount to bind, but is still worth a match.
+        let signing = transaction.map {
+            JwtSigningInfo(claimTransactionData: $0.transactionDataJSON,
+                           audience: config.jwtAudience)
+        }
+        let authConfig = BiomAuthConfig(jwtSigningInfo: signing)
+
+        return await withCheckedContinuation { cont in
+            Keyless.authenticate(configuration: authConfig) { result in
+                switch result {
+                case .success(let success):
+                    // `signedJwt` is the real accessor (Keyless.AuthenticationSuccess). It is
+                    // Optional and nil unless jwtSigningInfo was supplied — so an unbound check
+                    // yields verified-without-assertion, which app.py's REAL mode refuses rather
+                    // than trusting a bare boolean from a phone.
+                    //
+                    // Report which we got. A pass with NO jwt is the case that silently costs
+                    // hours: the face genuinely matched, the phone is happy, and the server
+                    // correctly refuses it — with nothing on either side saying why.
+                    let jwt = success.signedJwt
+                    Task { @MainActor in
+                        MFAManager.phoneLog("recognize_jwt",
+                            jwt == nil ? "MISSING (signing requested: \(signing != nil))"
+                                       : "present len=\(jwt!.count)")
+                    }
+                    cont.resume(returning: RecognizeResult(verified: true, assertion: jwt))
+                case .failure(let error):
+                    Task { @MainActor in MFAManager.phoneLog("recognize_sdk", "auth failed: \(error)") }
+                    cont.resume(returning: RecognizeResult(verified: false, assertion: nil))
+                }
+            }
+        }
+    }
+}
+#endif
+
 /// Wraps the PingOne MFA iOS SDK. Isolates every SDK call so the branded UI (ApprovalView)
 /// stays independent. Push-approval flow (verified against the 2.3.2 swiftinterface):
 ///   configure(geo:) → pair(pairingKey) → setDeviceToken(APNs)
@@ -20,6 +325,133 @@ final class MFAManager: ObservableObject {
     @Published var state: State = .unpaired
     @Published var pending: PendingPayment?
     @Published var lastError: String?
+
+    /// Real Recognize when the SDK is linked AND Info.plist carries a Mobile API Key + hosts;
+    /// simulated otherwise. Everything downstream (the /stepup/approve report) is unaffected by
+    /// which conformer is installed. Selection is deliberately automatic and fails CLOSED to the
+    /// simulated verifier — which produces no assertion, so app.py's REAL mode refuses it rather
+    /// than a half-configured build silently claiming a biometric that never happened.
+    var recognizeVerifier: RecognizeVerifier = MFAManager.makeRecognizeVerifier()
+
+    /// True when THIS DEVICE currently holds an enrolment. Read from the SDK rather than
+    /// remembered in our own state, so it cannot drift out of sync with reality — which is the
+    /// failure mode that makes "Enrol my face" behave unpredictably.
+    var recognizeEnrolledOnDevice: Bool { recognizeVerifier.enrolledUserId() != nil }
+
+    /// UI state for the one-off face enrolment (ProfileView).
+    @Published var recognizeEnrolling = false
+    @Published var recognizeStatus: String?
+
+    /// Enrol this device's user, then BIND the resulting keylessId to their bank identity.
+    /// Both halves matter: the SDK enrols a biometric that knows nothing about "alice", and the
+    /// binding is what makes a later match mean "alice approved" rather than "somebody enrolled
+    /// on this tenant approved". A failed bind is therefore reported as a failure, not a success
+    /// with a caveat — a template nobody can attribute is not useful evidence.
+    func enrolRecognize() {
+        guard !recognizeEnrolling else { return }
+        // Refuse without a signed-in identity AND a device token. Enrolling while signed out
+        // captures a real face and creates a real template that can never be bound — the bind
+        // call has no Authorization header, 401s, and leaves an UNATTRIBUTABLE template on the
+        // tenant that no username can reach. Fail before the camera, not after.
+        guard !activeUser.isEmpty, Self.deviceToken(for: activeUser) != nil else {
+            recognizeStatus = "Sign in first — a face enrolment has to be linked to an account."
+            Self.phoneLog("recognize_enrol", "refused: not signed in")
+            return
+        }
+        recognizeEnrolling = true
+        recognizeStatus = "Starting…"
+        let who = activeUser
+        Task { [weak self] in
+            guard let self else { return }
+            Self.phoneLog("recognize_enrol", "start user=\(who)")
+            switch await self.recognizeVerifier.enrol(username: who) {
+            case .failed(let msg):
+                self.recognizeStatus = "Enrolment failed: \(msg)"
+                Self.phoneLog("recognize_enrol", "failed: \(msg)")
+            case .enrolled(let keylessId, let clientState):
+                self.recognizeStatus = "Face captured — linking to \(who)…"
+                var req = Self.deviceRequest("recognize/bind", user: who, method: "POST")
+                req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                var payload: [String: Any] = ["keylessId": keylessId]
+                if let cs = clientState { payload["clientState"] = cs }
+                req.httpBody = try? JSONSerialization.data(withJSONObject: payload)
+                do {
+                    let (data, resp) = try await URLSession.shared.data(for: req)
+                    let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+                    if code == 200 {
+                        // "already bound" means OperationInfo.externalUserId did the binding
+                        // during the ceremony and this Server-API call was redundant — which is
+                        // exactly what we are trying to find out.
+                        let note = String(data: data, encoding: .utf8) ?? ""
+                        let viaOp = note.contains("already bound")
+                        self.recognizeStatus = "✓ Enrolled and linked to \(who)."
+                        Self.phoneLog("recognize_enrol",
+                            "bound ok user=\(who) via=\(viaOp ? "OperationInfo (bind redundant)" : "server bind")")
+                    } else {
+                        let detail = String(data: data, encoding: .utf8) ?? ""
+                        self.recognizeStatus = "Face captured, but linking failed (\(code)). "
+                            + "Not usable for approvals yet."
+                        Self.phoneLog("recognize_enrol", "bind failed \(code): \(detail.prefix(120))")
+                    }
+                } catch {
+                    self.recognizeStatus = "Face captured, but linking failed: \(error.localizedDescription)"
+                    Self.phoneLog("recognize_enrol", "bind error: \(error.localizedDescription)")
+                }
+            }
+            self.recognizeEnrolling = false
+        }
+    }
+
+    /// Remove this user's face enrolment. Needed to re-run the demo from scratch, and the only
+    /// clean way to test whether OperationInfo.externalUserId binds on its own (an existing
+    /// binding masks the answer). Destroys the template at the tenant — not just local state.
+    func deEnrolRecognize() {
+        guard !recognizeEnrolling else { return }
+        recognizeEnrolling = true
+        recognizeStatus = "Removing enrolment (verify your face first)…"
+        let who = activeUser
+        Task { [weak self] in
+            guard let self else { return }
+            Self.phoneLog("recognize_deenrol", "start user=\(who)")
+            if let err = await self.recognizeVerifier.deEnrol() {
+                // The SDK can only de-enrol while THIS DEVICE still holds state. After a sign-out
+                // (which clears it) the tenant-side template is unreachable from here and would
+                // survive invisibly — then a re-enrolment silently creates a SECOND template for
+                // the same face. Fall back to the server, which deletes by username via the
+                // Server API and does not care what this handset remembers.
+                Self.phoneLog("recognize_deenrol", "sdk failed (\(err)) — falling back to server")
+                var req = Self.deviceRequest("recognize/unenrol", user: who, method: "POST")
+                req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                req.httpBody = Data("{}".utf8)
+                let code = (try? await URLSession.shared.data(for: req))
+                    .map { ($0.1 as? HTTPURLResponse)?.statusCode ?? 0 } ?? 0
+                if code == 200 {
+                    self.recognizeStatus = "✓ Enrolment removed for \(who) (server-side)."
+                    Self.phoneLog("recognize_deenrol", "server unenrol ok user=\(who)")
+                } else {
+                    self.recognizeStatus = "De-enrolment failed: \(err)"
+                    Self.phoneLog("recognize_deenrol", "server unenrol failed http=\(code)")
+                }
+            } else {
+                self.recognizeStatus = "✓ Enrolment removed for \(who). You can enrol again."
+                Self.phoneLog("recognize_deenrol", "ok user=\(who)")
+            }
+            self.recognizeEnrolling = false
+        }
+    }
+
+    static func makeRecognizeVerifier() -> RecognizeVerifier {
+        #if canImport(KeylessSDK)
+        if let cfg = RecognizeConfig.fromBundle() {
+            phoneLog("recognize_mode", "real (hosts=\(cfg.hosts.count))")
+            return KeylessRecognizeVerifier(config: cfg)
+        }
+        phoneLog("recognize_mode", "simulated (SDK linked but RecognizeApiKey/RecognizeHosts unset)")
+        #else
+        phoneLog("recognize_mode", "simulated (KeylessSDK not linked)")
+        #endif
+        return SimulatedRecognizeVerifier()
+    }
 
     /// mDL identity-proofing request pushed via CIBA — the approver opens the wallet
     /// app2app (openid4vp://) so the customer presents their mobile Driver's Licence.
@@ -266,19 +698,37 @@ final class MFAManager: ObservableObject {
         } catch { return nil }
     }
 
-    /// Approve after Face ID, then report the approval to PingOne on the NotificationObject.
-    /// This is what completes the device authentication → PF's CIBA poll returns Bob's elevated
-    /// token → the orchestrator resumes the chain and the dashboard progresses.
+    /// Approve after a Recognize check, then report the approval to PingOne on the
+    /// NotificationObject. That PingOne round-trip is what completes the device authentication
+    /// → PF's CIBA poll returns the elevated token → the orchestrator resumes the chain.
+    ///
+    /// Separately, the Recognize VERDICT is reported to the northwind BFF's /stepup/approve —
+    /// that is what elevates demo/app/app.py's assurance ladder to recognize-verified, since
+    /// the PingOne MFA round-trip only proves a paired device tapped approve (device-approved),
+    /// never more than that on its own. Best-effort: a failed report degrades this payment to
+    /// device-approved rather than blocking the approval outright — the PDP still sees a real,
+    /// non-overstated assurance level either way.
     func approve() {
         let code = pending?.reference
         Self.phoneLog("approve_tapped", "code=\(code ?? "-")")
-        biometric { [weak self] ok in
-            Self.phoneLog("biometric", ok ? "passed" : "failed/cancelled")
-            guard let self, ok, let n = self.pendingNotification else {
-                Task { @MainActor in
-                    await Self.report(code: code, decision: "biometric_failed", error: nil, deviceReq: nil)
-                    self?.reset()
-                }
+        Task { [weak self] in
+            guard let self else { return }
+            let amountStr = self.pending.map { String(format: "%.2f", $0.amount) } ?? ""
+            let reason = self.pending.map { "Approve \($0.currency) \(amountStr) to \($0.toAccount)" }
+                ?? "Approve this payment"
+            // Bind the check to THIS payment. Sourced from `pending`, which came from the CIBA
+            // push — never from anything the phone's user can edit, or the signed `td` claim
+            // would attest to a transaction different from the one the PDP later evaluates.
+            let txn = self.pending.map {
+                RecognizeTransaction(amount: amountStr, currency: $0.currency,
+                                     payee: $0.toAccount, payer: $0.fromAccount,
+                                     reference: $0.reference)
+            }
+            let recognized = await self.recognizeVerifier.verify(reason: reason, transaction: txn)
+            Self.phoneLog("recognize", recognized.verified ? "passed" : "failed/cancelled")
+            guard recognized.verified, let n = self.pendingNotification else {
+                await Self.report(code: code, decision: "biometric_failed", error: nil, deviceReq: nil)
+                self.reset()
                 return
             }
             Self.phoneLog("sdk_approve_call", "sending to PingOne")
@@ -288,17 +738,35 @@ final class MFAManager: ObservableObject {
             n.approve(withAuthenticationMethod: nil, numberMatchingPickedValue: nil,
                       completion: { [weak self] info, error in
                 Task { @MainActor in
+                    guard let self else { return }
                     let status = (info?["deviceRequirementsEvaluation"] as? [String: Any])?["status"] as? String
-                    if let error { self?.lastError = "Approve failed: \(error.localizedDescription)" }
+                    if let error { self.lastError = "Approve failed: \(error.localizedDescription)" }
                     else if let status, status.caseInsensitiveCompare("Passed") != .orderedSame {
-                        self?.lastError = "Approve rejected by device requirements: \(status)"
+                        self.lastError = "Approve rejected by device requirements: \(status)"
+                    }
+                    if error == nil, let code {
+                        await self.reportRecognizeVerdict(code: code, recognized: recognized)
                     }
                     await Self.report(code: code, decision: "approve",
                                       error: error?.localizedDescription, deviceReq: status)
-                    self?.reset()
+                    self.reset()
                 }
             })
         }
+    }
+
+    /// POST the Recognize verdict to /stepup/approve (northwind BFF) so app.py's assurance
+    /// ladder records recognize-verified instead of defaulting to device-approved. See
+    /// _recognize_verdict in app.py: RECOGNIZE_SIMULATE (the demo default) trusts
+    /// recognizeVerified as-is; a real tenant would populate `assertion` and app.py would
+    /// verify it against RECOGNIZE_JWKS_URL instead of trusting the client's word for it.
+    private func reportRecognizeVerdict(code: String, recognized: RecognizeResult) async {
+        var req = Self.deviceRequest("stepup/approve", user: activeUser, method: "POST")
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        var body: [String: Any] = ["code": code, "recognizeVerified": recognized.verified]
+        if let assertion = recognized.assertion { body["recognizeAssertion"] = assertion }
+        req.httpBody = try? JSONSerialization.data(withJSONObject: body)
+        _ = try? await URLSession.shared.data(for: req)
     }
 
     func deny() {
@@ -678,6 +1146,13 @@ final class MFAManager: ObservableObject {
     /// list as available. The PingOne pairing is left intact.
     func signOut(user: String) {
         Self.phoneLog("sign_out", user)
+        // Clear the Recognize state with the session. The Mobile SDK has NO username concept —
+        // one device holds ONE enrolment — so leaving it behind means the next person to sign in
+        // on this handset inherits the previous user's biometric state, and "Enrol my face"
+        // then behaves incoherently. Local only: their enrolment at the tenant survives, so
+        // signing out is not the same as destroying their face template.
+        recognizeVerifier.resetLocal()
+        recognizeStatus = nil
         Task { @MainActor in
             await Self.reportPairing(user: user, paired: false)
             if activeUser == user { activeUser = "" }

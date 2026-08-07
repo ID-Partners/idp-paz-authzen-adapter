@@ -37,31 +37,5 @@
         "alg": "ES256"
       }
     ]
-  },
-  "urn:agent:entra-gateway:v1": {
-    "keys": [
-      {
-        "kty": "EC",
-        "kid": "6xlwYqoTkAey4GeoVcf1eHHo-cVAM28N-3jLUUmJbeQ",
-        "crv": "P-256",
-        "x": "Q-QrDhQmGnYbMrp2wmUKhhlCwTxOUJlxEjo5Ydv78Ig",
-        "y": "-jGBjIy4O458BuXU2E3rTA12O6MNzkJsR1f6aIcZX_A",
-        "use": "sig",
-        "alg": "ES256"
-      }
-    ]
-  },
-  "urn:agent:entra:d7c5a2b1-0000-4000-8000-copilot0demo": {
-    "keys": [
-      {
-        "kty": "EC",
-        "kid": "R9vi4RLgnHQKJuLYc4h-x-cM9sSaqXLv-svAeEE8TNo",
-        "crv": "P-256",
-        "x": "dlOTwZ6FwEnvnMq1Z3sI1DBG3YnFYWno5U2sD6MUytU",
-        "y": "XrXEXIQ0ya9UQMUA9EnAW-sWyUMMrRGKl4NpMwyQseg",
-        "use": "sig",
-        "alg": "ES256"
-      }
-    ]
   }
 }

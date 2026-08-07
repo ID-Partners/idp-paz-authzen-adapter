@@ -7,6 +7,7 @@ skill, `references/api-authoring.md`).
 | File | Flow | Tenant id |
 |---|---|---|
 | `payment-consent-rar.flow.json` | Payment Consent (RAR) - Demo Bank | `e58cea11d8a5c6239060b1d2f7e0ab6f` |
+| `recognize-signon.flow.json` | Recognize Sign-On (simulated) | `dde392a8046c8787211f886afe44e848` |
 
 Environment: **P1AS** (`fe8ab8dc-0dbb-4da4-8ee5-004cb3a6f21d`), app
 `PingOne SSO Connection` (`74e432a9f7c4aaa657332b1a10282b61`).
@@ -22,6 +23,7 @@ happened on 2026-07-20). Keep this table current and snapshot before any PUT.
 | `5eccfe79c581a8890d07cb7a217b25bd` | Bank Signup Passkey Registration | `21d1edd60400b6a2ad87b398fe65f3e0` |
 | `f0245209d0fed91c282fb1396f06fd2e` | Bank Signup Passkey Live (BFF `DAVINCI_POLICY_ID`) | `774001f77c9b2e470fa0b6bce9fe3931` |
 | `122354553b1301f114619a576c4e57fc` | Payment Consent (RAR) | `e58cea11d8a5c6239060b1d2f7e0ab6f` |
+| `8376b8aadec32fcdaa4ccdb2911b6c4c` | Recognize Sign-On (BFF `DAVINCI_RECOGNIZE_SIGNIN_POLICY_ID`) | `dde392a8046c8787211f886afe44e848` |
 
 ## Re-applying
 

@@ -705,6 +705,35 @@ def admin_reset():
 
 
 # ---------------------------------------------------------------------------
+# mDL origination-gate switch. Moved here from the Go authzen-adapter's
+# /admin/proofing-gate when the adapter was retired from the wire path
+# (2026-08-08): the PDP reads this via a ProofingGate REST PIP, and the
+# Northwind BFF's demo toggle writes it. Gate state is DATA — the decision
+# that uses it lives in the PingAuthorize policy, not here. In-memory on
+# purpose: it is a demo control-plane switch, and the PDP's attribute
+# defaults to enforcing when this service is unreachable (fail closed).
+# ---------------------------------------------------------------------------
+_gate_enabled = False
+
+
+class GateBody(BaseModel):
+    enabled: bool = False
+
+
+@app.get("/gate")
+def gate_get():
+    return {"enabled": _gate_enabled}
+
+
+@app.post("/gate")
+def gate_set(body: GateBody):
+    global _gate_enabled
+    _gate_enabled = bool(body.enabled)
+    logger.info("mDL origination gate set to %s", _gate_enabled)
+    return {"enabled": _gate_enabled}
+
+
+# ---------------------------------------------------------------------------
 # SCIM 2.0 Users — the bank's identities (alice, bob), persisted in Postgres.
 # The iOS approver's identity switcher and the BFF's enrolment flow read/write
 # these records: userName/displayName plus a bank extension carrying the PingOne
@@ -783,6 +812,50 @@ def store_passkey(user_name: str, body: dict):
     row["updated_at"] = _now()
     user_store.upsert(row)
     return {"user": user_name, "credentials": len(creds)}
+
+
+@app.post("/recognize-recovery/{user_name}")
+def put_recognize_recovery(user_name: str, body: dict):
+    """Store the Recognize CLIENT STATE that lets this person recover onto a NEW device.
+
+    This is recovery material, not a credential: it does not authenticate anyone by itself.
+    Presenting it to the SDK only opens a face capture that must match the ORIGINALLY enrolled
+    person — so a leak lets an attacker start a recovery they cannot finish. It still lives
+    behind the BFF (which gates release on a verified mDL) rather than being readable by a
+    browser, because "useless without a face" is not a reason to hand it out.
+
+    Kept beside the passkeys in the same attributes bag: both are per-user authenticator state,
+    and a device-loss story needs them in one place."""
+    row = user_store.by_username(user_name)
+    if row is None:
+        now = _now()
+        row = {"id": f"usr_{uuid.uuid4().hex[:12]}", "user_name": user_name.lower(),
+               "display_name": user_name.title(), "active": True, "pingone_user_id": None,
+               "device_paired": False, "paired_at": None, "attributes": {},
+               "created_at": now, "updated_at": now}
+    attrs = dict(row.get("attributes") or {})
+    attrs["recognizeRecovery"] = {
+        "keylessId": body.get("keylessId"),
+        "clientState": body.get("clientState"),
+        # ISO string, NOT the datetime _now() returns: `attributes` is serialised to JSONB by
+        # psycopg, which cannot encode a datetime ("Object of type datetime is not JSON
+        # serializable" → 500). The row's own created_at/updated_at are real columns and take
+        # the datetime directly — the difference is easy to miss.
+        "storedAt": _now().isoformat(),
+    }
+    row["attributes"] = attrs
+    row["updated_at"] = _now()
+    user_store.upsert(row)
+    return {"user": user_name, "stored": bool(body.get("clientState"))}
+
+
+@app.get("/recognize-recovery/{user_name}")
+def get_recognize_recovery(user_name: str):
+    row = user_store.by_username(user_name)
+    rec = ((row.get("attributes") or {}).get("recognizeRecovery") or {}) if row else {}
+    return {"user": user_name, "exists": bool(rec.get("clientState")),
+            "keylessId": rec.get("keylessId"), "clientState": rec.get("clientState"),
+            "storedAt": rec.get("storedAt")}
 
 
 @app.get("/passkey/{user_name}")
@@ -987,6 +1060,9 @@ def check_consent(subject: str = Query(...), creditor: str = Query(default=""),
 
     # The assurance ACTUALLY ACHIEVED for this consent — not a fixed label. The policy reads
     # it so a weak path cannot silently stand in for a strong one:
+    #   recognize-verified  PingOne Recognize confirmed WHO is present (liveness + face
+    #                    match), independent of which device or channel was used — evidence
+    #                    about the person, not just the device. Treated as non-repudiable.
     #   device-signed    a paired device signed over the transaction hash → dynamically
     #                    linked, the artefact is retained, defensible in a dispute
     #   device-approved  a paired device approved, but sent no signature → the tap is
@@ -1012,7 +1088,7 @@ def check_consent(subject: str = Query(...), creditor: str = Query(default=""),
         "creditorAccount": (newest or {}).get("creditor_account"),
         "channel": (newest or {}).get("channel"),
         "assurance": assurance,                   # the level achieved, carried to the policy
-        "nonRepudiable": assurance == "device-signed",
+        "nonRepudiable": assurance in ("device-signed", "recognize-verified"),
     }
 
 

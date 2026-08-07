@@ -59,6 +59,12 @@ variable "attestation_utils_class" {
   default     = "com.pingidentity.ps.oidf.servlet.clientregistration.utils.ClientAttestationUtils"
 }
 
+variable "oidf_federation_utils_class" {
+  description = "Fully-qualified pf-oidf-modules class whose validateTrustChain(#this) OGNL entry point checks a private_key_jwt client_assertion's pushed trust_chain header against the configured OpenID Federation trust anchor — Option B (federation-native, no attestation/DPoP)."
+  type        = string
+  default     = "com.pingidentity.ps.oidf.servlet.clientregistration.utils.OIDFederationUtils"
+}
+
 variable "webapp_client_secret" {
   description = "northwind-webapp (BFF) client secret — demo value, same as demo/app/app.py's OIDC_CLIENT_SECRET default. Override with TF_VAR_webapp_client_secret for a real deployment."
   type        = string
