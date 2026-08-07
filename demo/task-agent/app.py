@@ -279,9 +279,22 @@ async def a2a(request: Request):
                          "policy_reason": outcome.get("policy_reason"), "steps": steps}}})
 
 
-if __name__ == "__main__":
+def _serve(fastapi_app, port: int) -> None:
+    """Dual-stack listener: one IPv6 socket with V6ONLY off, so BOTH Railway's
+    public edge (IPv4 upstream) and private networking (IPv6) reach us. Plain
+    uvicorn.run(host="::") forces V6ONLY on, which is why this agent answered
+    private calls fine but 502'd the moment it got a public domain."""
+    import socket
     import uvicorn
+    sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+    sock.bind(("::", port))
+    sock.listen(2048)
+    uvicorn.Server(uvicorn.Config(fastapi_app, log_level="info")).run(sockets=[sock])
+
+
+if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8100"))
-    host = os.environ.get("HOST", "::")   # IPv6 for Railway private networking
-    logger.info("Starting %s (%s) on %s:%s → MCP %s", CFG["label"], CFG["id"], host, port, MCP_SERVER_URL)
-    uvicorn.run(app, host=host, port=port)
+    logger.info("Starting %s (%s) on [::]:%s dual-stack → MCP %s", CFG["label"], CFG["id"], port, MCP_SERVER_URL)
+    _serve(app, port)

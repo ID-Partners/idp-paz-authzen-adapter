@@ -173,8 +173,15 @@ resource "pingfederate_oauth_client" "agent_account" {
   restrict_to_default_access_token_manager             = true
   restricted_response_types                            = []
   restricted_scopes                                    = []
+  # Alice's subject token is now genuinely Entra-issued (real mydigitalid tenant, not mock) --
+  # userToAgentTE's subjectJwtProc only trusts PF-native tokens, so it rejects hers. Repointed at
+  # entraUserToAgentTE (entra-user-subject.tf), same policy already proven for the bridge's own
+  # clients. Payments-agent's client is deliberately NOT repointed the same way: it also does a
+  # second, unrelated token exchange (exchange_for_events(), see task-agent/identity.py) whose
+  # subject IS a PF-native token -- that would break under entraUserToAgentTE. Needs its own fix
+  # (a separate client identity for the two exchanges), not this one-line change.
   token_exchange_processor_policy_ref = {
-    id = "userToAgentTE"
+    id = "entraUserToAgentTE"
   }
   token_introspection_content_encryption_algorithm = null
   token_introspection_encryption_algorithm         = null

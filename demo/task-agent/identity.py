@@ -182,6 +182,31 @@ class PFExchangeError(Exception):
         super().__init__(diagnostic.get("summary", "token exchange failed"))
 
 
+ENTRA_ISSUER_HINT = os.environ.get("ENTRA_ISSUER_HINT", "login.microsoftonline.com")
+
+
+def _subject_token_type(subject_token: str | None) -> str:
+    """RFC 8693 subject_token_type, chosen by who ISSUED the subject token.
+
+    One PF token-exchange policy (userToAgentTE) now serves both flows, and PF selects
+    the token processor by subject_token_type — it refuses two mappings sharing a type.
+    So the two issuers must declare different types:
+
+      * Alice's PF login token   -> …:access_token -> subjectJwtProc      (concierge flow)
+      * Alice's Entra token      -> …:jwt          -> entraSubjectJwtProc (Copilot flow)
+
+    Sending access_token for an Entra-issued subject is what produced PF's
+    "Invalid Issuer" — subjectJwtProc only trusts PF's own issuer.
+    """
+    try:
+        iss = jwt.decode(subject_token, options={"verify_signature": False}).get("iss", "")
+    except Exception:  # noqa: BLE001 - undecodable: fall back to the historical default
+        return "urn:ietf:params:oauth:token-type:access_token"
+    if ENTRA_ISSUER_HINT and ENTRA_ISSUER_HINT in str(iss):
+        return "urn:ietf:params:oauth:token-type:jwt"
+    return "urn:ietf:params:oauth:token-type:access_token"
+
+
 def _decode_jwt(token: str | None) -> dict[str, Any]:
     """Decode a JWT WITHOUT verifying (for display/diagnosis) → header + key claims."""
     if not token:
@@ -296,7 +321,7 @@ def _establish_pf(*, agent_id: str, agent_type: str, agent_label: str, role: str
             grant = "urn:ietf:params:oauth:grant-type:token-exchange"
             data = {"grant_type": grant,
                     "subject_token": subject_token,
-                    "subject_token_type": "urn:ietf:params:oauth:token-type:access_token",
+                    "subject_token_type": _subject_token_type(subject_token),
                     "client_id": agent_id}
         else:
             grant = "client_credentials"

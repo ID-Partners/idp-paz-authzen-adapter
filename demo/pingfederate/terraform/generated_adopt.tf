@@ -82,6 +82,12 @@ resource "pingfederate_oauth_client" "agent_payments" {
   restrict_to_default_access_token_manager             = false # allow the audience-selected events (flatten) ATM
   restricted_response_types                            = []
   restricted_scopes                                    = []
+  # userToAgentTE now carries BOTH subject-token processors, selected by
+  # subject_token_type (PF refuses two mappings sharing a type):
+  #   …:access_token → subjectJwtProc      (Alice's PF login — concierge flow)
+  #   …:jwt          → entraSubjectJwtProc (Alice's Entra token — Copilot flow)
+  # task-agent/identity.py picks the type from the subject token's issuer, so one
+  # client and one policy serve both flows.
   token_exchange_processor_policy_ref = {
     id = "userToAgentTE"
   }
