@@ -5,10 +5,10 @@
     "httpConnector",
     "annotationConnector"
   ],
-  "createdDate": 1784529458811,
-  "currentVersion": 1,
+  "createdDate": 1785887605923,
+  "currentVersion": 7,
   "customerId": "cb91427eaab45d386b5b97272b6f2e29",
-  "deployedDate": 1784529737553,
+  "deployedDate": 1785887614867,
   "description": "Payment consent screen rendered by DaVinci. Shows amount/payee/debtor and captures approve or decline.",
   "enabledGraphData": {
     "boxSelectionEnabled": true,
@@ -16,26 +16,89 @@
     "elements": {
       "edges": [
         {
+          "classes": "",
           "data": {
-            "id": "e_consent_eval",
+            "id": "pu2wtsbaa0",
             "source": "m2cqade30o",
             "target": "ogbbt786t6"
-          }
+          },
+          "grabbable": true,
+          "group": "edges",
+          "locked": false,
+          "pannable": true,
+          "position": {
+            "x": 0,
+            "y": 0
+          },
+          "removed": false,
+          "selectable": true,
+          "selected": false
         },
         {
+          "classes": "",
           "data": {
-            "id": "e_eval_success",
+            "id": "is2535k1vs",
             "source": "ogbbt786t6",
+            "target": "rcgscr01ab"
+          },
+          "grabbable": true,
+          "group": "edges",
+          "locked": false,
+          "pannable": true,
+          "position": {
+            "x": 0,
+            "y": 0
+          },
+          "removed": false,
+          "selectable": true,
+          "selected": false
+        },
+        {
+          "classes": "",
+          "data": {
+            "id": "rcgedgea1e",
+            "source": "rcgscr01ab",
+            "target": "rcgeval02c"
+          },
+          "grabbable": true,
+          "group": "edges",
+          "locked": false,
+          "pannable": true,
+          "position": {
+            "x": 0,
+            "y": 0
+          },
+          "removed": false,
+          "selectable": true,
+          "selected": false
+        },
+        {
+          "classes": "",
+          "data": {
+            "id": "rcgedgeb2f",
+            "source": "rcgeval02c",
             "target": "yu2b6z8ze1"
-          }
+          },
+          "grabbable": true,
+          "group": "edges",
+          "locked": false,
+          "pannable": true,
+          "position": {
+            "x": 0,
+            "y": 0
+          },
+          "removed": false,
+          "selectable": true,
+          "selected": false
         }
       ],
       "nodes": [
         {
           "classes": "",
           "data": {
+            "capabilityClass": "render",
             "capabilityName": "customHTMLTemplate",
-            "connectionId": "85df94bd3dce5c306da60c3b4bbc5de1",
+            "connectionId": "867ed4363b2bc21c860085ad2baa817d",
             "connectorId": "httpConnector",
             "id": "m2cqade30o",
             "idUnique": "5wlsg34sfg",
@@ -49,9 +112,6 @@
               "customHTML": {
                 "value": "[{\"children\": [{\"text\": \"<div class=\\\"registration\\\" id=\\\"primary\\\">\\n  <div>\\n    <div class=\\\"registration-content flex-content\\\">\\n      <div class=\\\"registration-body flex-content__scroller\\\" style=\\\"opacity: 1;\\\">\\n        <div class=\\\"registration-title\\\">Approve this payment</div>\\n        <div class=\\\"registration-body-txt\\\">\\n          <div style=\\\"font-size:34px;font-weight:600;color:#2b2b2b;margin:18px 0 6px;\\\">{{global.parameters.currency}} {{global.parameters.amount}}</div>\\n          <div style=\\\"margin-bottom:4px;\\\">to <b>{{global.parameters.creditor}}</b></div>\\n          <div style=\\\"color:#8a8a8a;font-size:15px;\\\">from {{global.parameters.debtor}}</div>\\n          <div style=\\\"margin-top:22px;font-size:14px;color:#8a8a8a;line-height:1.4;\\\">Approving authorises this specific payment. Check the amount and the payee before you continue.</div>\\n        </div>\\n        <div class=\\\"registration-buttons\\\">\\n          <button class=\\\"button\\\" type=\\\"button\\\" data-skcomponent=\\\"skbutton\\\" data-skbuttonvalue=\\\"approve\\\" id=\\\"approve\\\" data-skform=\\\"consent\\\" data-skbuttontype=\\\"next-event\\\">APPROVE</button>\\n          <button class=\\\"button\\\" type=\\\"button\\\" data-skcomponent=\\\"skbutton\\\" data-skbuttonvalue=\\\"decline\\\" id=\\\"decline\\\" data-skform=\\\"consent\\\" data-skbuttontype=\\\"next-event\\\" style=\\\"background:transparent;color:#6b6b6b;border:1px solid #c9c9c9;margin-top:10px;\\\">DECLINE</button>\\n        </div>\\n      </div>\\n    </div>\\n  </div>\\n</div>\"}]}]"
               },
-              "customScript": {
-                "value": "function getThemeByName(templateName, themes) {\n  return themes.find(theme => theme.name === templateName) || null;\n}\n\nfunction setBodyBackgroundColor(color) {\n  const styleSheet = document.createElement(\"style\");\n  styleSheet.innerHTML = `body { background-color: ${color} !important; }`;\n  document.head.appendChild(styleSheet);\n}\n\n// Apply styles\nfunction applyStyles(theme, themes) {\n  const config = JSON.parse(theme);\n  const configuration = config?.configuration;\n  const templateName = config?.template;\n  const allThemes = JSON.parse(themes);\n  const template = allThemes.find(theme => theme.name === templateName) || null;\n  if (configuration && template)\n  {\n    const backgroundImageUrl = configuration.backgroundImage?.href || template.image?.background;\n    const logo = configuration.logo?.href;\n\n    // Change backgroung image\n    if (backgroundImageUrl) {\n      document.body.style.backgroundImage = `url('${backgroundImageUrl}')`;\n      document.body.style.backgroundRepeat = \"repeat\";\n    }\n\n    if (configuration.backgroundType === \"COLOR\") {\n      document.body.style.backgroundImage = \"none\";\n      setBodyBackgroundColor(configuration.backgroundColor);\n    }\n\n    if (configuration.backgroundType === \"NONE\") {\n      document.body.style.backgroundImage = \"none\";\n    }\n\n    // Find an image element inside an element with class 'registration-logo' and change its src to logo.href\n    const registrationLogoContainer = document.querySelector('.registration-logo');\n    if (registrationLogoContainer) {\n      const imgElement = registrationLogoContainer.querySelector('img');\n        if (logo && imgElement) {\n          imgElement.src = logo;\n        }\n    }\n\n    // Change all button styles\n    const buttons = document.querySelectorAll('button');\n    buttons.forEach(btn => {\n      btn.style.color = configuration.buttonTextColor || template.color?.buttonText;\n      btn.style.backgroundColor = configuration.buttonColor || template.color?.button;\n    });\n\n    // Change card color\n    const registrationContainer = document.querySelector('.registration-body');\n    if (registrationContainer) {\n      registrationContainer.style.backgroundColor = configuration.cardColor || template.color?.card;\n    }\n\n    // Change title color\n    const registrationTitle = document.querySelector('.registration-title');\n    if (registrationTitle) {\n      registrationTitle.style.color = configuration.headingTextColor || template.color?.headingText;\n    }\n\n    // Change text color\n    const registrationText = document.querySelector('.registration-body-txt');\n    if (registrationText) {\n      registrationText.style.color = configuration.bodyTextColor || template.color?.bodyText;\n    }\n\n  }\n}\n\n// Run the function to apply styles\napplyStyles('{{{skjson theme}}}', '{{{skjson themes}}}');\n"
-              },
               "formFieldsList": {
                 "value": [
                   {
@@ -61,23 +121,8 @@
                   }
                 ]
               },
-              "inputSchema": {
-                "value": "{\n\"type\": \"object\",\n   \"properties\": {\n      \"theme\": {\n        \"displayName\": \"theme\",\n\t\t\t\"preferedControlType\": \"textField\",\n            \"enableParameters\": true\n      },\n      \"themes\": {\n        \"displayName\": \"themes\",\n\t\t\t\"preferedControlType\": \"textField\",\n            \"enableParameters\": true\n      }\n   }\n}"
-              },
               "nodeTitle": {
                 "value": "Payment Consent"
-              },
-              "theme": {
-                "displayName": "theme",
-                "enableParameters": true,
-                "preferedControlType": "textField",
-                "value": "[\n  {\n    \"children\": [\n      {\n        \"text\": \"\"\n      },\n      {\n        \"text\": \"\"\n      },\n      {\n        \"type\": \"link\",\n        \"src\": \"auth.svg\",\n        \"url\": \"theme\",\n        \"data\": \"{{global.parameters.theme}}\",\n        \"tooltip\": \"{{global.parameters.theme}}\",\n        \"children\": [\n          {\n            \"text\": \"theme\"\n          }\n        ]\n      },\n      {\n        \"text\": \"\"\n      }\n    ]\n  }\n]"
-              },
-              "themes": {
-                "displayName": "themes",
-                "enableParameters": true,
-                "preferedControlType": "textField",
-                "value": "[\n  {\n    \"children\": [\n      {\n        \"text\": \"\"\n      },\n      {\n        \"text\": \"\"\n      },\n      {\n        \"type\": \"link\",\n        \"src\": \"auth.svg\",\n        \"url\": \"themes\",\n        \"data\": \"{{global.parameters.themes}}\",\n        \"tooltip\": \"{{global.parameters.themes}}\",\n        \"children\": [\n          {\n            \"text\": \"themes\"\n          }\n        ]\n      },\n      {\n        \"text\": \"\"\n      }\n    ]\n  }\n]"
               }
             },
             "status": "configured",
@@ -117,8 +162,9 @@
         {
           "classes": "",
           "data": {
+            "capabilityClass": "backend",
             "capabilityName": "createSuccessResponse",
-            "connectionId": "85df94bd3dce5c306da60c3b4bbc5de1",
+            "connectionId": "867ed4363b2bc21c860085ad2baa817d",
             "connectorId": "httpConnector",
             "id": "yu2b6z8ze1",
             "idUnique": "i16ww2qvdf",
@@ -300,6 +346,120 @@
           "removed": false,
           "selectable": true,
           "selected": false
+        },
+        {
+          "classes": "",
+          "data": {
+            "capabilityClass": "render",
+            "capabilityName": "customHTMLTemplate",
+            "connectionId": "867ed4363b2bc21c860085ad2baa817d",
+            "connectorId": "httpConnector",
+            "id": "rcgscr01ab",
+            "idUnique": "rcgscru1iq",
+            "label": "Http",
+            "name": "Trust Score API",
+            "nodeType": "CONNECTION",
+            "properties": {
+              "customCSS": {
+                "value": ".registration-body { box-sizing: border-box; width: 600px; background-color: rgba(255, 255, 255, 0.97); max-width: 100%; border-radius: 7px; box-shadow: 1px 1px 1px 1px rgba(0, 0, 0, 0.1); padding: 30px 70px 35px; transition: opacity 0.5s; }\n\n.registration-logo { text-align: center; }\n.registration-logo img { max-width: 450px; max-height: 100px; }\n\n.registration-title { margin-bottom: 25px; text-align: center; color: #6b6b6b; font-size: 32px; line-height: 1em; font-family: \"ProximaNovaRegular\", helvetica, arial, sans-serif; padding: 50px 0 0; }\n\n.registration-body-txt { font-size: 18px; line-height: 1.3em; color: #6b6b6b; }\n\n.registration-buttons { margin: 30px auto 0 auto; text-align: center; }\n.registration-buttons .button { margin: 0; }\n.registration-buttons .skip-btn { margin-top: 25px; }\n\n.registration .footer { position: fixed; bottom: 10px; right: 0; left: 0; text-align: center; }\n\n.registration .footer .pingid_logo { display: block; width: 70px; height: 27px; background-image: url(../images/pingid/ping-logo.sm.2x.png); background-size: 70px 27px; margin: 40px auto 15px auto; }\n\n.registration .footer .copyright { font-size: 12px; color: #999999; }\n\n.flex-content__scroller {\n    max-width: 100%;\n    max-height: 100%;\n    overflow-y: auto;\n}\n.flex-content {\n    position: fixed;\n    top: 0;\n    bottom: 0;\n    left: 0;\n    right: 0;\n    z-index: 1000;\n    min-height: 100%;\n    align-items: center;\n    justify-content: center;\n    display: -webkit-box;\n    display: -webkit-flex;\n    display: -moz-flex;\n    display: -ms-flexbox;\n    display: flex;\n}\n.button {\n    padding: 0 25px;\n    margin-right: 10px;\n    height: 36px;\n    line-height: 36px;\n    box-sizing: border-box;\n    -webkit-border-radius: 2px;\n    -moz-border-radius: 2px;\n    -ms-border-radius: 2px;\n    border-radius: 2px;\n    font-size: 15px;\n    font-family: \"ProximaNovaRegular\", helvetica, arial, sans-serif;\n    position: relative;\n    display: inline-block;\n    text-align: center;\n    vertical-align: middle;\n    cursor: pointer;\n    outline: none;\n    white-space: nowrap;\n    color: #fff;\n    border: none;\n    background: none;\n    background-color: #2996cc;\n    width: auto;\n}\n\n.button:hover {\n    color: #fff;\n    background-color: #3ea1d1;\n}\n.flex-content__scroller {\n    animation: fadeInAnimation ease 2s;\n    animation-iteration-count: 1;\n    animation-fill-mode: forwards;\n        \n }\n @keyframes fadeInAnimation {\n    0% {\n        opacity: 0;\n    }\n    100% {\n        opacity: 1;\n    }\n}\n\nbody {\n background-size: cover !important;\n}"
+              },
+              "customHTML": {
+                "value": "[{\"children\": [{\"text\": \"<div class=\\\"registration\\\" id=\\\"primary\\\"><div><div class=\\\"registration-content flex-content\\\"><div class=\\\"registration-body flex-content__scroller\\\" style=\\\"opacity: 1;\\\"><div class=\\\"registration-title\\\">Verify it's you</div><div class=\\\"registration-body-txt\\\"><div style=\\\"margin-bottom:6px;\\\">PingOne Recognize confirms the payer with a live face match bound to this specific transaction:</div><div style=\\\"font-size:28px;font-weight:600;color:#2b2b2b;margin:14px 0 6px;\\\">{{global.parameters.currency}} {{global.parameters.amount}}</div><div style=\\\"margin-bottom:14px;\\\">to <b>{{global.parameters.creditor}}</b></div><div style=\\\"margin-top:18px;padding:12px 14px;background:#fff6e0;border:1px solid #f0d78c;border-radius:6px;color:#7a5c00;font-size:13px;line-height:1.4;\\\">Real face matching runs on the paired phone (Recognize Mobile SDK). This browser screen SIMULATES it &mdash; the Web SDK needs a regional Authentication Service this tenant does not have.</div></div><div class=\\\"registration-buttons\\\"><button class=\\\"button\\\" type=\\\"button\\\" data-skcomponent=\\\"skbutton\\\" data-skbuttonvalue=\\\"true\\\" id=\\\"recognize-pass\\\" data-skform=\\\"recognize\\\" data-skbuttontype=\\\"next-event\\\">&#10003; SIMULATE FACE MATCH</button><button class=\\\"button\\\" type=\\\"button\\\" data-skcomponent=\\\"skbutton\\\" data-skbuttonvalue=\\\"false\\\" id=\\\"recognize-skip\\\" data-skform=\\\"recognize\\\" data-skbuttontype=\\\"next-event\\\" style=\\\"background:transparent;color:#6b6b6b;border:1px solid #c9c9c9;margin-top:10px;\\\">Skip verification</button></div></div></div></div></div>\"}]}]"
+              },
+              "formFieldsList": {
+                "value": [
+                  {
+                    "preferredControlType": "textField",
+                    "preferredDataType": "string",
+                    "propertyName": "recognizeVerified"
+                  }
+                ]
+              },
+              "nodeTitle": {
+                "value": "Recognize Verification (simulated)"
+              }
+            },
+            "status": "configured",
+            "type": "trigger"
+          },
+          "grabbable": true,
+          "group": "nodes",
+          "locked": false,
+          "pannable": false,
+          "position": {
+            "x": 0,
+            "y": 0
+          },
+          "removed": false,
+          "selectable": true,
+          "selected": false
+        },
+        {
+          "classes": "",
+          "data": {
+            "id": "rcgeval02c",
+            "idUnique": "rcgevalu2r",
+            "nodeType": "EVAL"
+          },
+          "grabbable": true,
+          "group": "nodes",
+          "locked": false,
+          "pannable": false,
+          "position": {
+            "x": 0,
+            "y": 0
+          },
+          "removed": false,
+          "selectable": true,
+          "selected": false
+        },
+        {
+          "classes": "",
+          "data": {
+            "capabilityName": "updateAnnotationProperties",
+            "connectionId": "921bfae85c38ed45045e07be703d86b8",
+            "connectorId": "annotationConnector",
+            "id": "rcgnote03d",
+            "idUnique": "rcgnoteu3s",
+            "name": "Annotation",
+            "nodeType": "ANNOTATION",
+            "properties": {
+              "annotation": {
+                "value": "Simulated PingOne Recognize check \u2014 pending a real Keyless/Recognize DaVinci connector + tenant. Keep the recognizeVerified output field name: a FastAPI app deep-searches the flow's success response for that boolean."
+              },
+              "annotationTextColor": {
+                "value": "#5c4400"
+              },
+              "backgroundColor": {
+                "value": "#fff3cdff"
+              },
+              "cornerRadius": {
+                "value": 8
+              },
+              "fontFamily": {
+                "value": "sans-serif"
+              },
+              "height": {
+                "value": 110
+              },
+              "width": {
+                "value": 340
+              }
+            },
+            "status": "configured",
+            "type": "action"
+          },
+          "grabbable": true,
+          "group": "nodes",
+          "locked": false,
+          "pannable": false,
+          "position": {
+            "x": 0,
+            "y": 0
+          },
+          "removed": false,
+          "selectable": true,
+          "selected": false
         }
       ]
     },
@@ -327,26 +487,89 @@
     "elements": {
       "edges": [
         {
+          "classes": "",
           "data": {
-            "id": "e_consent_eval",
+            "id": "pu2wtsbaa0",
             "source": "m2cqade30o",
             "target": "ogbbt786t6"
-          }
+          },
+          "grabbable": true,
+          "group": "edges",
+          "locked": false,
+          "pannable": true,
+          "position": {
+            "x": 0,
+            "y": 0
+          },
+          "removed": false,
+          "selectable": true,
+          "selected": false
         },
         {
+          "classes": "",
           "data": {
-            "id": "e_eval_success",
+            "id": "is2535k1vs",
             "source": "ogbbt786t6",
+            "target": "rcgscr01ab"
+          },
+          "grabbable": true,
+          "group": "edges",
+          "locked": false,
+          "pannable": true,
+          "position": {
+            "x": 0,
+            "y": 0
+          },
+          "removed": false,
+          "selectable": true,
+          "selected": false
+        },
+        {
+          "classes": "",
+          "data": {
+            "id": "rcgedgea1e",
+            "source": "rcgscr01ab",
+            "target": "rcgeval02c"
+          },
+          "grabbable": true,
+          "group": "edges",
+          "locked": false,
+          "pannable": true,
+          "position": {
+            "x": 0,
+            "y": 0
+          },
+          "removed": false,
+          "selectable": true,
+          "selected": false
+        },
+        {
+          "classes": "",
+          "data": {
+            "id": "rcgedgeb2f",
+            "source": "rcgeval02c",
             "target": "yu2b6z8ze1"
-          }
+          },
+          "grabbable": true,
+          "group": "edges",
+          "locked": false,
+          "pannable": true,
+          "position": {
+            "x": 0,
+            "y": 0
+          },
+          "removed": false,
+          "selectable": true,
+          "selected": false
         }
       ],
       "nodes": [
         {
           "classes": "",
           "data": {
+            "capabilityClass": "render",
             "capabilityName": "customHTMLTemplate",
-            "connectionId": "85df94bd3dce5c306da60c3b4bbc5de1",
+            "connectionId": "867ed4363b2bc21c860085ad2baa817d",
             "connectorId": "httpConnector",
             "id": "m2cqade30o",
             "idUnique": "5wlsg34sfg",
@@ -360,9 +583,6 @@
               "customHTML": {
                 "value": "[{\"children\": [{\"text\": \"<div class=\\\"registration\\\" id=\\\"primary\\\">\\n  <div>\\n    <div class=\\\"registration-content flex-content\\\">\\n      <div class=\\\"registration-body flex-content__scroller\\\" style=\\\"opacity: 1;\\\">\\n        <div class=\\\"registration-title\\\">Approve this payment</div>\\n        <div class=\\\"registration-body-txt\\\">\\n          <div style=\\\"font-size:34px;font-weight:600;color:#2b2b2b;margin:18px 0 6px;\\\">{{global.parameters.currency}} {{global.parameters.amount}}</div>\\n          <div style=\\\"margin-bottom:4px;\\\">to <b>{{global.parameters.creditor}}</b></div>\\n          <div style=\\\"color:#8a8a8a;font-size:15px;\\\">from {{global.parameters.debtor}}</div>\\n          <div style=\\\"margin-top:22px;font-size:14px;color:#8a8a8a;line-height:1.4;\\\">Approving authorises this specific payment. Check the amount and the payee before you continue.</div>\\n        </div>\\n        <div class=\\\"registration-buttons\\\">\\n          <button class=\\\"button\\\" type=\\\"button\\\" data-skcomponent=\\\"skbutton\\\" data-skbuttonvalue=\\\"approve\\\" id=\\\"approve\\\" data-skform=\\\"consent\\\" data-skbuttontype=\\\"next-event\\\">APPROVE</button>\\n          <button class=\\\"button\\\" type=\\\"button\\\" data-skcomponent=\\\"skbutton\\\" data-skbuttonvalue=\\\"decline\\\" id=\\\"decline\\\" data-skform=\\\"consent\\\" data-skbuttontype=\\\"next-event\\\" style=\\\"background:transparent;color:#6b6b6b;border:1px solid #c9c9c9;margin-top:10px;\\\">DECLINE</button>\\n        </div>\\n      </div>\\n    </div>\\n  </div>\\n</div>\"}]}]"
               },
-              "customScript": {
-                "value": "function getThemeByName(templateName, themes) {\n  return themes.find(theme => theme.name === templateName) || null;\n}\n\nfunction setBodyBackgroundColor(color) {\n  const styleSheet = document.createElement(\"style\");\n  styleSheet.innerHTML = `body { background-color: ${color} !important; }`;\n  document.head.appendChild(styleSheet);\n}\n\n// Apply styles\nfunction applyStyles(theme, themes) {\n  const config = JSON.parse(theme);\n  const configuration = config?.configuration;\n  const templateName = config?.template;\n  const allThemes = JSON.parse(themes);\n  const template = allThemes.find(theme => theme.name === templateName) || null;\n  if (configuration && template)\n  {\n    const backgroundImageUrl = configuration.backgroundImage?.href || template.image?.background;\n    const logo = configuration.logo?.href;\n\n    // Change backgroung image\n    if (backgroundImageUrl) {\n      document.body.style.backgroundImage = `url('${backgroundImageUrl}')`;\n      document.body.style.backgroundRepeat = \"repeat\";\n    }\n\n    if (configuration.backgroundType === \"COLOR\") {\n      document.body.style.backgroundImage = \"none\";\n      setBodyBackgroundColor(configuration.backgroundColor);\n    }\n\n    if (configuration.backgroundType === \"NONE\") {\n      document.body.style.backgroundImage = \"none\";\n    }\n\n    // Find an image element inside an element with class 'registration-logo' and change its src to logo.href\n    const registrationLogoContainer = document.querySelector('.registration-logo');\n    if (registrationLogoContainer) {\n      const imgElement = registrationLogoContainer.querySelector('img');\n        if (logo && imgElement) {\n          imgElement.src = logo;\n        }\n    }\n\n    // Change all button styles\n    const buttons = document.querySelectorAll('button');\n    buttons.forEach(btn => {\n      btn.style.color = configuration.buttonTextColor || template.color?.buttonText;\n      btn.style.backgroundColor = configuration.buttonColor || template.color?.button;\n    });\n\n    // Change card color\n    const registrationContainer = document.querySelector('.registration-body');\n    if (registrationContainer) {\n      registrationContainer.style.backgroundColor = configuration.cardColor || template.color?.card;\n    }\n\n    // Change title color\n    const registrationTitle = document.querySelector('.registration-title');\n    if (registrationTitle) {\n      registrationTitle.style.color = configuration.headingTextColor || template.color?.headingText;\n    }\n\n    // Change text color\n    const registrationText = document.querySelector('.registration-body-txt');\n    if (registrationText) {\n      registrationText.style.color = configuration.bodyTextColor || template.color?.bodyText;\n    }\n\n  }\n}\n\n// Run the function to apply styles\napplyStyles('{{{skjson theme}}}', '{{{skjson themes}}}');\n"
-              },
               "formFieldsList": {
                 "value": [
                   {
@@ -372,23 +592,8 @@
                   }
                 ]
               },
-              "inputSchema": {
-                "value": "{\n\"type\": \"object\",\n   \"properties\": {\n      \"theme\": {\n        \"displayName\": \"theme\",\n\t\t\t\"preferedControlType\": \"textField\",\n            \"enableParameters\": true\n      },\n      \"themes\": {\n        \"displayName\": \"themes\",\n\t\t\t\"preferedControlType\": \"textField\",\n            \"enableParameters\": true\n      }\n   }\n}"
-              },
               "nodeTitle": {
                 "value": "Payment Consent"
-              },
-              "theme": {
-                "displayName": "theme",
-                "enableParameters": true,
-                "preferedControlType": "textField",
-                "value": "[\n  {\n    \"children\": [\n      {\n        \"text\": \"\"\n      },\n      {\n        \"text\": \"\"\n      },\n      {\n        \"type\": \"link\",\n        \"src\": \"auth.svg\",\n        \"url\": \"theme\",\n        \"data\": \"{{global.parameters.theme}}\",\n        \"tooltip\": \"{{global.parameters.theme}}\",\n        \"children\": [\n          {\n            \"text\": \"theme\"\n          }\n        ]\n      },\n      {\n        \"text\": \"\"\n      }\n    ]\n  }\n]"
-              },
-              "themes": {
-                "displayName": "themes",
-                "enableParameters": true,
-                "preferedControlType": "textField",
-                "value": "[\n  {\n    \"children\": [\n      {\n        \"text\": \"\"\n      },\n      {\n        \"text\": \"\"\n      },\n      {\n        \"type\": \"link\",\n        \"src\": \"auth.svg\",\n        \"url\": \"themes\",\n        \"data\": \"{{global.parameters.themes}}\",\n        \"tooltip\": \"{{global.parameters.themes}}\",\n        \"children\": [\n          {\n            \"text\": \"themes\"\n          }\n        ]\n      },\n      {\n        \"text\": \"\"\n      }\n    ]\n  }\n]"
               }
             },
             "status": "configured",
@@ -428,8 +633,9 @@
         {
           "classes": "",
           "data": {
+            "capabilityClass": "backend",
             "capabilityName": "createSuccessResponse",
-            "connectionId": "85df94bd3dce5c306da60c3b4bbc5de1",
+            "connectionId": "867ed4363b2bc21c860085ad2baa817d",
             "connectorId": "httpConnector",
             "id": "yu2b6z8ze1",
             "idUnique": "i16ww2qvdf",
@@ -611,6 +817,120 @@
           "removed": false,
           "selectable": true,
           "selected": false
+        },
+        {
+          "classes": "",
+          "data": {
+            "capabilityClass": "render",
+            "capabilityName": "customHTMLTemplate",
+            "connectionId": "867ed4363b2bc21c860085ad2baa817d",
+            "connectorId": "httpConnector",
+            "id": "rcgscr01ab",
+            "idUnique": "rcgscru1iq",
+            "label": "Http",
+            "name": "Trust Score API",
+            "nodeType": "CONNECTION",
+            "properties": {
+              "customCSS": {
+                "value": ".registration-body { box-sizing: border-box; width: 600px; background-color: rgba(255, 255, 255, 0.97); max-width: 100%; border-radius: 7px; box-shadow: 1px 1px 1px 1px rgba(0, 0, 0, 0.1); padding: 30px 70px 35px; transition: opacity 0.5s; }\n\n.registration-logo { text-align: center; }\n.registration-logo img { max-width: 450px; max-height: 100px; }\n\n.registration-title { margin-bottom: 25px; text-align: center; color: #6b6b6b; font-size: 32px; line-height: 1em; font-family: \"ProximaNovaRegular\", helvetica, arial, sans-serif; padding: 50px 0 0; }\n\n.registration-body-txt { font-size: 18px; line-height: 1.3em; color: #6b6b6b; }\n\n.registration-buttons { margin: 30px auto 0 auto; text-align: center; }\n.registration-buttons .button { margin: 0; }\n.registration-buttons .skip-btn { margin-top: 25px; }\n\n.registration .footer { position: fixed; bottom: 10px; right: 0; left: 0; text-align: center; }\n\n.registration .footer .pingid_logo { display: block; width: 70px; height: 27px; background-image: url(../images/pingid/ping-logo.sm.2x.png); background-size: 70px 27px; margin: 40px auto 15px auto; }\n\n.registration .footer .copyright { font-size: 12px; color: #999999; }\n\n.flex-content__scroller {\n    max-width: 100%;\n    max-height: 100%;\n    overflow-y: auto;\n}\n.flex-content {\n    position: fixed;\n    top: 0;\n    bottom: 0;\n    left: 0;\n    right: 0;\n    z-index: 1000;\n    min-height: 100%;\n    align-items: center;\n    justify-content: center;\n    display: -webkit-box;\n    display: -webkit-flex;\n    display: -moz-flex;\n    display: -ms-flexbox;\n    display: flex;\n}\n.button {\n    padding: 0 25px;\n    margin-right: 10px;\n    height: 36px;\n    line-height: 36px;\n    box-sizing: border-box;\n    -webkit-border-radius: 2px;\n    -moz-border-radius: 2px;\n    -ms-border-radius: 2px;\n    border-radius: 2px;\n    font-size: 15px;\n    font-family: \"ProximaNovaRegular\", helvetica, arial, sans-serif;\n    position: relative;\n    display: inline-block;\n    text-align: center;\n    vertical-align: middle;\n    cursor: pointer;\n    outline: none;\n    white-space: nowrap;\n    color: #fff;\n    border: none;\n    background: none;\n    background-color: #2996cc;\n    width: auto;\n}\n\n.button:hover {\n    color: #fff;\n    background-color: #3ea1d1;\n}\n.flex-content__scroller {\n    animation: fadeInAnimation ease 2s;\n    animation-iteration-count: 1;\n    animation-fill-mode: forwards;\n        \n }\n @keyframes fadeInAnimation {\n    0% {\n        opacity: 0;\n    }\n    100% {\n        opacity: 1;\n    }\n}\n\nbody {\n background-size: cover !important;\n}"
+              },
+              "customHTML": {
+                "value": "[{\"children\": [{\"text\": \"<div class=\\\"registration\\\" id=\\\"primary\\\"><div><div class=\\\"registration-content flex-content\\\"><div class=\\\"registration-body flex-content__scroller\\\" style=\\\"opacity: 1;\\\"><div class=\\\"registration-title\\\">Verify it's you</div><div class=\\\"registration-body-txt\\\"><div style=\\\"margin-bottom:6px;\\\">PingOne Recognize confirms the payer with a live face match bound to this specific transaction:</div><div style=\\\"font-size:28px;font-weight:600;color:#2b2b2b;margin:14px 0 6px;\\\">{{global.parameters.currency}} {{global.parameters.amount}}</div><div style=\\\"margin-bottom:14px;\\\">to <b>{{global.parameters.creditor}}</b></div><div style=\\\"margin-top:18px;padding:12px 14px;background:#fff6e0;border:1px solid #f0d78c;border-radius:6px;color:#7a5c00;font-size:13px;line-height:1.4;\\\">Real face matching runs on the paired phone (Recognize Mobile SDK). This browser screen SIMULATES it &mdash; the Web SDK needs a regional Authentication Service this tenant does not have.</div></div><div class=\\\"registration-buttons\\\"><button class=\\\"button\\\" type=\\\"button\\\" data-skcomponent=\\\"skbutton\\\" data-skbuttonvalue=\\\"true\\\" id=\\\"recognize-pass\\\" data-skform=\\\"recognize\\\" data-skbuttontype=\\\"next-event\\\">&#10003; SIMULATE FACE MATCH</button><button class=\\\"button\\\" type=\\\"button\\\" data-skcomponent=\\\"skbutton\\\" data-skbuttonvalue=\\\"false\\\" id=\\\"recognize-skip\\\" data-skform=\\\"recognize\\\" data-skbuttontype=\\\"next-event\\\" style=\\\"background:transparent;color:#6b6b6b;border:1px solid #c9c9c9;margin-top:10px;\\\">Skip verification</button></div></div></div></div></div>\"}]}]"
+              },
+              "formFieldsList": {
+                "value": [
+                  {
+                    "preferredControlType": "textField",
+                    "preferredDataType": "string",
+                    "propertyName": "recognizeVerified"
+                  }
+                ]
+              },
+              "nodeTitle": {
+                "value": "Recognize Verification (simulated)"
+              }
+            },
+            "status": "configured",
+            "type": "trigger"
+          },
+          "grabbable": true,
+          "group": "nodes",
+          "locked": false,
+          "pannable": false,
+          "position": {
+            "x": 950,
+            "y": 390
+          },
+          "removed": false,
+          "selectable": true,
+          "selected": false
+        },
+        {
+          "classes": "",
+          "data": {
+            "id": "rcgeval02c",
+            "idUnique": "rcgevalu2r",
+            "nodeType": "EVAL"
+          },
+          "grabbable": true,
+          "group": "nodes",
+          "locked": false,
+          "pannable": false,
+          "position": {
+            "x": 1120,
+            "y": 390
+          },
+          "removed": false,
+          "selectable": true,
+          "selected": false
+        },
+        {
+          "classes": "",
+          "data": {
+            "capabilityName": "updateAnnotationProperties",
+            "connectionId": "921bfae85c38ed45045e07be703d86b8",
+            "connectorId": "annotationConnector",
+            "id": "rcgnote03d",
+            "idUnique": "rcgnoteu3s",
+            "name": "Annotation",
+            "nodeType": "ANNOTATION",
+            "properties": {
+              "annotation": {
+                "value": "Simulated PingOne Recognize check \u2014 pending a real Keyless/Recognize DaVinci connector + tenant. Keep the recognizeVerified output field name: a FastAPI app deep-searches the flow's success response for that boolean."
+              },
+              "annotationTextColor": {
+                "value": "#5c4400"
+              },
+              "backgroundColor": {
+                "value": "#fff3cdff"
+              },
+              "cornerRadius": {
+                "value": 8
+              },
+              "fontFamily": {
+                "value": "sans-serif"
+              },
+              "height": {
+                "value": 110
+              },
+              "width": {
+                "value": 340
+              }
+            },
+            "status": "configured",
+            "type": "action"
+          },
+          "grabbable": true,
+          "group": "nodes",
+          "locked": false,
+          "pannable": false,
+          "position": {
+            "x": 860,
+            "y": 250
+          },
+          "removed": false,
+          "selectable": true,
+          "selected": false
         }
       ]
     },
@@ -631,11 +951,11 @@
   },
   "isOutputSchemaSaved": false,
   "name": "Payment Consent (RAR) - Demo Bank",
-  "publishedVersion": 1,
-  "savedDate": 1784529458795,
+  "publishedVersion": 7,
+  "savedDate": 1785887605878,
   "settings": {
     "logLevel": 4
   },
   "timeouts": "null",
-  "updatedDate": 1784529737553
+  "updatedDate": 1785887614867
 }

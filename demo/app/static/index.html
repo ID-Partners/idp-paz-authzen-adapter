@@ -443,6 +443,16 @@
     <button data-prompt="Please open a savings account and transfer $9,000 from my checking account into it.">Open savings + fund $9,000</button>
     <button data-prompt="What accounts do I have and what are their balances?">List my accounts</button>
   </div>
+  <!-- Drives the CIBA step-up directly, skipping the agent conversation. Same endpoint the
+       agent redirects to (/login?stepup=…) — this is not a second code path, just a shortcut
+       into the existing one, so what it exercises is exactly what the demo exercises.
+       $9,000 is deliberately over the $500 PAZ threshold so the rule actually engages. -->
+  <div class="examples">
+    <button type="button" id="phoneapprove"
+            title="Pushes a payment approval to the paired phone (face match if enrolled)">
+      📲 Approve $9,000 on my phone
+    </button>
+  </div>
 
   <form id="chat">
     <input id="prompt" type="text" autocomplete="off"
@@ -471,9 +481,9 @@
               <td><a href="https://modelcontextprotocol.io" target="_blank">MCP</a> (JSON-RPC over streamable HTTP)</td></tr>
           <tr><td class="c1">🏦 Bank API</td><td class="role">Resource Server. Executes the banking operation; records the sub/act delegation chain for audit.</td>
               <td>REST/HTTP · consumes the delegated token</td></tr>
-          <tr><td class="c1">⚖️ AuthZEN adapter</td><td class="role">PDP proxy (Go). Translates AuthZEN eval requests into Ping Authorize decision requests.</td>
+          <tr><td class="c1">⚖️ AuthZEN adapter</td><td class="role">PDP proxy (Go) — and an <b>enricher</b>, not just a translator. Alongside mapping AuthZEN→Ping Authorize it resolves what the embedded PDP cannot compute itself: the mDL proofing-directory lookup (<code>identity_proofing_present</code>) and the RFC 9396 consent-coverage booleans (<code>rar_amount_ok</code>, <code>rar_creditor_ok</code>). Ping Authorize also ships an AuthZEN servlet that speaks the same API, but it does none of this enrichment, so it cannot replace this hop.</td>
               <td><a href="https://openid.github.io/authzen/" target="_blank">AuthZEN Authorization API</a></td></tr>
-          <tr><td class="c1">🧠 Ping Authorize</td><td class="role">Policy Decision Point. Evaluates policy and returns PERMIT/DENY (+ reason).</td>
+          <tr><td class="c1">🧠 Ping Authorize</td><td class="role">Policy Decision Point. Evaluates policy and returns PERMIT/DENY (+ step-up advice). Cannot compare two attributes to each other or call out to the proofing directory — hence the adapter's precomputed booleans.</td>
               <td>PingAuthorize JSON PDP API (<code>/governance-engine</code>)</td></tr>
         </tbody>
       </table>
@@ -826,7 +836,24 @@ document.addEventListener('keydown', (e)=>{ if(e.key==='Escape') closeCoaz(); })
 ensureAuth();
 
 document.querySelectorAll('.examples button').forEach(b => {
+  // Guard on data-prompt: this selector also catches the phone-approval button below, which
+  // is an action rather than a prompt and would otherwise stuff "undefined" into the input.
+  if (!b.dataset.prompt) return;
   b.addEventListener('click', () => { input.value = b.dataset.prompt; input.focus(); });
+});
+
+// Push a payment approval straight to the paired phone. Navigates to the SAME /login?stepup=…
+// the agent flow uses, so this exercises the real path (CIBA push → approve on device →
+// /stepup/approve), not a test-only shortcut. Values match the $9,000 example above so the
+// PAZ over-$500 rule engages and, once a face is enrolled, the signed `td` has something to
+// bind to.
+document.getElementById('phoneapprove')?.addEventListener('click', () => {
+  const q = new URLSearchParams({
+    stepup: 'banking:payments:transfer',
+    amount: '9000.00', cur: 'AUD',
+    from: 'Everyday Account', to: 'ACME Pty Ltd',
+  });
+  location.href = '/login?' + q.toString();
 });
 
 function el(cls, html) { const d = document.createElement('div'); d.className = cls; d.innerHTML = html; return d; }
@@ -885,7 +912,7 @@ const GN = {
   pmcp:      {x:520, y:300, ic:'🧰', t:'Payments MCP',    s:'make_payment'},
   ppep2:     {x:520, y:404, ic:'🛡️', t:'Payments PEP #2', s:'__GATEWAY__ · API edge'},
   papi:      {x:520, y:520, ic:'💸', t:'Payments API',    s:'debits accounts (direct)'},
-  adapter:   {x:188, y:486, ic:'🔌', t:'AuthZEN adapter',  s:'ext_authz → AuthZEN'},
+  adapter:   {x:188, y:486, ic:'🔌', t:'AuthZEN adapter',  s:'ext_authz → AuthZEN (in PAZ)'},
   pdp:       {x:30,  y:562, ic:'⚖️', t:'Ping Authorize',  s:'policy decision point'},
   eventsink: {x:186, y:562, ic:'📮', t:'Event sink',      s:'flattened token · aud=events'},
 };
@@ -959,7 +986,7 @@ const GMETA = {
               sdks:['<code>fastapi</code> + <code>uvicorn</code>', '<code>httpx</code> — calls the Accounts API /transfers'],
               links:[HUB_PY, ['source · demo/payments-api', REPO+'/payments-api']]},
   adapter:   {sw:'AuthZEN adapter — ext_authz → PingAuthorize',
-              cfg:'translates the AuthZEN Authorization API → PingAuthorize governance-engine · maps subject/action/resource/context · fails closed if the PDP is unreachable'},
+              cfg:'translates the AuthZEN Authorization API → PingAuthorize governance-engine · maps subject/action/resource/context · fails closed if the PDP is unreachable. ALSO enriches: resolves identity_proofing_present from the proofing directory (mDL gate) and precomputes rar_amount_ok / rar_creditor_ok, because the embedded PDP can neither call out nor compare two attributes. PingAuthorize ships its own AuthZEN servlet, but it is a plain translator with none of this enrichment — bypassing this hop silently drops every step-up input.'},
   pdp:       {sw:'PingAuthorize 11.0.0.2 (Symphonic)', img:'pingidentity/pingauthorize:11.0.0.2-latest',
               cfg:'Policy Decision Point · Trust Framework policy · make_payment: ≤ AUD 500 permit · > AUD 500 to 2,000 requires step-up (banking:payments:transfer, RFC 9470) · > 2,000 deny · governs BOTH token issuance (RAR) and the gateway calls (AuthZEN)',
               links:[['Docker Hub · pingauthorize','https://hub.docker.com/r/pingidentity/pingauthorize'], ['policy repo · idp-paz-simplifid-policy','https://github.com/dphhyland/idp-paz-simplifid-policy']]},
@@ -977,8 +1004,12 @@ const GW_META = {
   },
   agentgateway: {
     pep:     {img:'ghcr.io/agentgateway/agentgateway:v1.3.1', links:[['agentgateway (GitHub)','https://github.com/agentgateway/agentgateway']]},
-    adapter: {sw:'Go coaz-pep — Envoy ext_authz → AuthZEN (MCP profile)', img:'golang:1.26-alpine → alpine:3.20',
-              links:[['source · demo/coaz-pep', REPO+'/coaz-pep'], AUTHZEN_SPEC]},
+    adapter: {sw:'Go coaz-pep (Envoy ext_authz) → Go authzen-adapter (PDP proxy + enricher)',
+              img:'golang:1.26-alpine → alpine:3.20',
+              cfg:'coaz-pep speaks AuthZEN to the Go authzen-adapter, which enriches the request (mDL proofing lookup, RAR coverage booleans) before calling PingAuthorize’s governance-engine. PingAuthorize also hosts an AuthZEN servlet on /access/v1/evaluation — installed and working, but a plain translator, so it is deliberately NOT in the enforcement path: routing ext_authz straight at it drops identity_proofing_present and rar_*_ok, and every step-up rule silently stops firing.',
+              links:[['source · demo/coaz-pep', REPO+'/coaz-pep'],
+                     ['source · authzen-adapter', 'https://github.com/ID-Partners/idp-paz-authzen-adapter/tree/main/authzen-adapter'],
+                     AUTHZEN_SPEC]},
   },
 };
 const GE = [
@@ -1078,6 +1109,9 @@ function applyGateway(g){
   gateway = g;
   GN.apep1.s = g + ' · MCP edge'; GN.apep2.s = g + ' · API edge';
   GN.ppep1.s = g + ' · MCP edge'; GN.ppep2.s = g + ' · API edge';
+  // Kong: the adapter is a Lua plugin in-process in Kong.
+  // agentgateway: the adapter is a servlet INSIDE PingAuthorize — ext_authz calls the
+  // PDP's own AuthZEN endpoint directly, with no standalone proxy container between them.
   GN.adapter.s = (g === 'Kong') ? 'Lua plugin → AuthZEN' : 'ext_authz → AuthZEN';
   document.querySelectorAll('.gw-name').forEach(e => e.textContent = g);
   document.querySelectorAll('#gwtoggle button').forEach(b => b.classList.toggle('on', b.dataset.gw === g));

@@ -86,6 +86,7 @@
 			name = IDPApprover;
 			packageProductDependencies = (
 				80C890C51DE54285A3C8C0FE /* PingOneSDK */,
+				A1B2C3D40001KEYLESS0001 /* KeylessBridge */,
 			);
 			productName = IDPApprover;
 			productReference = CD839567CAEE4425065CE8D6 /* IDPApprover.app */;
@@ -116,6 +117,7 @@
 			minimizedProjectReferenceProxies = 1;
 			packageReferences = (
 				BA9A7BF0D488F3E431817659 /* XCRemoteSwiftPackageReference "pingone-mobile-sdk-ios" */,
+				A1B2C3D40002BRIDGE0002 /* XCLocalSwiftPackageReference "KeylessBridge" */,
 			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = E5F50D7903D0673E40AE4881 /* Products */;
@@ -345,6 +347,13 @@
 		};
 /* End XCConfigurationList section */
 
+/* Begin XCLocalSwiftPackageReference section */
+		A1B2C3D40002BRIDGE0002 /* XCLocalSwiftPackageReference "KeylessBridge" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = KeylessBridge;
+		};
+/* End XCLocalSwiftPackageReference section */
+
 /* Begin XCRemoteSwiftPackageReference section */
 		BA9A7BF0D488F3E431817659 /* XCRemoteSwiftPackageReference "pingone-mobile-sdk-ios" */ = {
 			isa = XCRemoteSwiftPackageReference;
@@ -361,6 +370,11 @@
 			isa = XCSwiftPackageProductDependency;
 			package = BA9A7BF0D488F3E431817659 /* XCRemoteSwiftPackageReference "pingone-mobile-sdk-ios" */;
 			productName = PingOneSDK;
+		};
+		A1B2C3D40001KEYLESS0001 /* KeylessBridge */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = A1B2C3D40002BRIDGE0002 /* XCLocalSwiftPackageReference "KeylessBridge" */;
+			productName = KeylessBridge;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};

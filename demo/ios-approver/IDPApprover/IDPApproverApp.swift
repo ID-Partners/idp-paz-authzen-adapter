@@ -97,7 +97,6 @@ struct ProofingView: View {
         VStack(spacing: 0) {
             HStack(spacing: 6) {
                 IDPWordmark(size: 20)
-                Text("Bank").font(.system(size: 15, weight: .semibold)).foregroundColor(Brand.muted)
                 Spacer()
             }
             .padding(.horizontal, 22).padding(.top, 16).padding(.bottom, 12)
@@ -158,7 +157,6 @@ struct HomeView: View {
         VStack(spacing: 0) {
             HStack(spacing: 6) {
                 IDPWordmark(size: 20)
-                Text("Bank").font(.system(size: 15, weight: .semibold)).foregroundColor(Brand.muted)
                 Spacer()
                 Button { showProfile = true } label: {
                     Image(systemName: "person.crop.circle")
@@ -229,7 +227,7 @@ struct ProfileView: View {
                             .displayName ?? mfa.activeUser.capitalized)
                         row("Role", mfa.activeUser == "bob" ? "Bank staff" : "Customer")
                     }
-                    row("Bank", Brand.bankName)
+                    row("Provider", Brand.bankName)
                 }
                 // Accounts THIS phone has been paired to — held on-device. The app has no
                 // directory read, so it can only ever show accounts it was explicitly paired
@@ -290,6 +288,45 @@ struct ProfileView: View {
                         Text(scanError).font(.footnote).foregroundColor(.red)
                     }
                 }
+                // One-off face enrolment. Separate from pairing on purpose: pairing binds the
+                // DEVICE, this binds the PERSON. Without it the first approval fails with a
+                // generic server error that reads like an outage rather than "no template yet".
+                Section("Face verification") {
+                    if mfa.recognizeEnrolledOnDevice {
+                        HStack(spacing: 10) {
+                            Image(systemName: "checkmark.shield.fill").foregroundColor(Brand.orange)
+                            Text("Face enrolled on this device").foregroundColor(Brand.ink)
+                        }
+                    } else if mfa.activeUser.isEmpty {
+                        // No signed-in identity to link the biometric to, so don't offer it.
+                        Text("Sign in to set up face verification.")
+                            .font(.footnote).foregroundColor(Brand.muted)
+                    } else {
+                        Button {
+                            mfa.enrolRecognize()
+                        } label: {
+                            Label(mfa.recognizeEnrolling ? "Enrolling…" : "Enrol my face",
+                                  systemImage: "faceid").fontWeight(.semibold)
+                        }
+                        .disabled(mfa.recognizeEnrolling)
+                    }
+                    if let status = mfa.recognizeStatus {
+                        Text(status).font(.footnote)
+                            .foregroundColor(status.hasPrefix("✓") ? Brand.muted : .red)
+                    }
+                    Text("Links your face to \(mfa.activeUser) so approvals can prove who approved, "
+                         + "not just which phone tapped approve.")
+                        .font(.footnote).foregroundColor(Brand.muted)
+                    // Destructive, so it carries the red role — this removes the template at the
+                    // tenant, not just local state. The SDK makes you pass a live face match
+                    // first, so it cannot be triggered by someone who just picked up the phone.
+                    Button(role: .destructive) {
+                        mfa.deEnrolRecognize()
+                    } label: {
+                        Label("Remove my face enrolment", systemImage: "trash")
+                    }
+                    .disabled(mfa.recognizeEnrolling)
+                }
                 Section("Device") {
                     if mfa.isPaired && !repairing {
                         HStack(spacing: 10) {
@@ -299,7 +336,7 @@ struct ProfileView: View {
                         Button("Re-pair this device") { repairing = true }
                             .foregroundColor(Brand.orange)
                     } else {
-                        Text("Enter the pairing key from ID Partners Bank.")
+                        Text("Enter the pairing key from ID Partners.")
                             .font(.footnote).foregroundColor(Brand.muted)
                         TextField("Pairing key", text: $pairingKey).textFieldStyle(.roundedBorder)
                         Button {

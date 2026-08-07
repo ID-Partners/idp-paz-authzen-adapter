@@ -11,7 +11,7 @@ enum Brand {
     static let hair        = Color(hex: 0xE7E3DC)
     static let money       = Color(hex: 0x0F7A4F)   // semantic (amount), not the accent
 
-    static let bankName    = "ID Partners Bank"
+    static let bankName    = "ID Partners"
 }
 
 extension Color {
@@ -63,15 +63,17 @@ private struct IDPeye: View {
 struct IDPWordmark: View {
     var size: CGFloat = 20
     var tone: IDPTone = .primary
+    /// The real ID Partners artwork (branding/assets/idp-monogram-onlight.png), not a
+    /// SwiftUI approximation. `tone` is kept so existing call sites compile unchanged; the
+    /// supplied asset is the on-light lockup (black ink + orange dot) and the app renders on
+    /// Brand.paper (#FFFFFF), so every current call site wants exactly that. An on-dark
+    /// variant exists in branding/assets if a dark surface is ever introduced.
     var body: some View {
-        HStack(alignment: .firstTextBaseline, spacing: size * 0.14) {
-            IDPeye(size: size, tone: tone)
-            (Text("D").foregroundColor(tone.letter)
-             + Text("PARTNERS").foregroundColor(tone.partners))
-                .font(.system(size: size, weight: .heavy)).kerning(size * 0.015)
-        }
-        .accessibilityElement()
-        .accessibilityLabel("ID Partners")
+        Image("IDPMark")
+            .resizable()
+            .aspectRatio(contentMode: .fit)
+            .frame(height: size)
+            .accessibilityLabel("ID Partners")
     }
 }
 
@@ -80,26 +82,11 @@ struct IDPWordmark: View {
 struct IDPMonogram: View {
     var size: CGFloat = 64
     var onOrange: Bool = true
-    private var mark: Color { onOrange ? .white : Brand.ink }
-    private var dot: Color { onOrange ? .white : Brand.orange }
     var body: some View {
-        ZStack {
-            RoundedRectangle(cornerRadius: size * 0.22)
-                .fill(onOrange ? Brand.orange : Brand.panel)
-            HStack(alignment: .firstTextBaseline, spacing: size * 0.03) {
-                VStack(alignment: .leading, spacing: size * 0.05) {
-                    RoundedRectangle(cornerRadius: size * 0.02)
-                        .fill(dot).frame(width: size * 0.11, height: size * 0.11)
-                    RoundedRectangle(cornerRadius: size * 0.01)
-                        .fill(mark).frame(width: size * 0.11, height: size * 0.24)
-                }
-                .alignmentGuide(.firstTextBaseline) { $0.height }
-                Text("DP").font(.system(size: size * 0.46, weight: .heavy))
-                    .foregroundColor(mark).kerning(size * 0.005)
-            }
-        }
-        .frame(width: size, height: size)
-        .accessibilityElement()
-        .accessibilityLabel("ID Partners")
+        Image("IDPMark")
+            .resizable()
+            .aspectRatio(contentMode: .fit)
+            .frame(width: size)
+            .accessibilityLabel("ID Partners")
     }
 }
