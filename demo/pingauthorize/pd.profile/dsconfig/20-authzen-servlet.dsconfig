@@ -7,15 +7,26 @@
 # Endpoints published: POST /access/v1/evaluation, /evaluations,
 # /access/v1/search/{subject,resource,action}, GET /.well-known/authzen-configuration.
 #
-# The decision envelope (domain/service/action) and attribute prefix match what the Go
-# adapter has been sending in production, so the policy sees an identical request.
+# The decision envelope (domain/service/action) matches what the Go adapter has been
+# sending in production, so the policy sees an identical request.
 #
-# flat-tuple=true: ALSO send the tuple's scalars as flat, dot-free attributes
-# (actionName / agentId / resourceType / resourceId). The banking policy binds request
-# attributes directly — a PingAuthorize attribute name cannot contain a dot, so
-# 'AuthZEN.subject' is only reachable via json-path — and every rule keys off the flat
-# names. Without this the rules would silently never bind. The JSON attributes are still
-# sent alongside, so a policy can use either shape.
+# attribute-prefix is deliberately NOT set (2026-08-07). A PingAuthorize request key is
+# always the attribute's name, and an attribute name cannot contain a dot, so a request
+# key of 'AuthZEN.subject' binds to NOTHING — the trust framework's subject / action /
+# resource / context attributes never resolved on this path. AdapterConfig.attr() returns
+# the bare suffix when no prefix is set, so unsetting it makes the servlet send
+# 'subject', 'action', 'resource' and 'context', which is what those attributes expect.
+#
+# That is what lets the Go adapter go. The banking policy's flat attributes (amount,
+# currency, onBehalfOf, to_account, user_scope, user_acr, token_aud) each now carry an
+# 'attribute' resolver that derives the value from one of those four JSON blobs by
+# json-path — the same derivation the adapter used to do in Go. Their 'request' resolver
+# is still first, so the adapter's flat attributes keep working unchanged while both
+# paths coexist.
+#
+# flat-tuple=true: ALSO send the tuple's scalars as flat attributes (actionName /
+# agentId / resourceType / resourceId). Redundant now that the blobs bind — those four
+# have their own attribute resolvers — but harmless and one less thing to change at once.
 #
 # pdp-secret is deliberately NOT set: this demo's governance-engine JSON API does not
 # enforce a shared secret (the Go adapter has run with a placeholder value throughout). A
@@ -23,6 +34,15 @@
 #
 # api-key: inbound AuthZEN callers must present 'Authorization: Bearer <api-key>'. Same
 # demo value the Go adapter used, so the GM API servlet's existing pdpToken keeps working.
+#
+# ssf-issuer / ssf-shared-secret: this servlet is also an OpenID Shared Signals Framework
+# (SSF) 1.0 Transmitter — it publishes one Security Event Token per decision, replacing
+# the Go adapter's bespoke in-memory SSE feed. ssf-shared-secret enables the surface
+# (well-known config + stream management + publishing); it is unset means no SSF at all.
+# demo/app/app.py is the (only) Receiver and holds the matching secret as
+# SSF_SHARED_SECRET — a distinct value from api-key above: one authenticates callers INTO
+# this servlet, the other signs events OUT of it, and conflating them would let a caller
+# that may only ask questions also forge the answers.
 
 dsconfig create-http-servlet-extension \
     --extension-name "AuthZEN Adapter" \
@@ -33,11 +53,12 @@ dsconfig create-http-servlet-extension \
     --set "extension-argument:pdp-secret-header=CLIENT_TOKEN" \
     --set "extension-argument:pdp-service=AuthZEN" \
     --set "extension-argument:pdp-action=authorize" \
-    --set "extension-argument:attribute-prefix=AuthZEN" \
     --set "extension-argument:domain-prefix=idpartners" \
     --set "extension-argument:flat-tuple=true" \
     --set "extension-argument:trust-any-server-cert=true" \
-    --set "extension-argument:api-key=Password1"
+    --set "extension-argument:api-key=Password1" \
+    --set "extension-argument:ssf-issuer=http://pingauthorize.railway.internal:1080" \
+    --set "extension-argument:ssf-shared-secret=Password1-ssf-shared-signals-transmitter"
 
 dsconfig set-connection-handler-prop \
     --handler-name "HTTPS Connection Handler" \
