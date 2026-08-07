@@ -497,8 +497,7 @@ The deployed package is `banking-mdl-gate`
 `Global Decision Point`.
 
 The previous package is `banking-staff-approval`
-(`banking.deploymentpackage.pre-mdl-gate.bak`, snapshot `e37ad2da-...`), whose root entity
-is `Agentic Banking Authorization`.
+(snapshot `e37ad2da-...`), whose root entity is `Agentic Banking Authorization`.
 
 The source snapshot is checked in as `demo/pingauthorize/banking-mdl-gate.snapshot`.
 
