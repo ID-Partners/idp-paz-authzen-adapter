@@ -420,7 +420,7 @@
  <div class="layout">
   <div class="col-left">
   <h2 class="section">How the agents &amp; services interact
-    <span id="gwtoggle" title="Swap the gateway — same architecture (AuthZEN adapter + Ping Authorize), either PEP"><button data-gw="Kong">Kong</button><button data-gw="agentgateway">agentgateway</button></span><button id="coazbtn" title="How MCP tool calls are authorized per the OpenID AuthZEN MCP profile">🧩 MCP·COAZ</button><label id="mdlgate" title="Toggle the mDL identity-proofing gate on account origination — when on, Ping Authorize requires a verified mobile Driver's Licence before an account can be opened"><input type="checkbox" id="mdlgateChk"><span id="mdlgateLbl">🪪 mDL gate: <b>off</b></span></label></h2>
+    <span id="gwtoggle" title="Swap the gateway — same architecture (AuthZEN → Ping Authorize), either PEP"><button data-gw="Kong">Kong</button><button data-gw="agentgateway">agentgateway</button></span><button id="coazbtn" title="How MCP tool calls are authorized per the OpenID AuthZEN MCP profile">🧩 MCP·COAZ</button><label id="mdlgate" title="Toggle the mDL identity-proofing gate on account origination — when on, Ping Authorize requires a verified mobile Driver's Licence before an account can be opened"><input type="checkbox" id="mdlgateChk"><span id="mdlgateLbl">🪪 mDL gate: <b>off</b></span></label></h2>
   <div class="graphwrap">
     <svg id="graph" viewBox="0 0 700 624" preserveAspectRatio="xMinYMin meet" role="img"
          aria-label="Interaction graph: Alice delegates to a principal agent, which delegates to an account agent and a payments agent. Each domain has its OWN vertical stack — a separate MCP server, __GATEWAY__ gateway with two policy enforcement points, and REST service — both backed by Ping Authorize. A payment is authorized at the payments gateway and then debits the accounts system-of-record."></svg>
@@ -481,9 +481,9 @@
               <td><a href="https://modelcontextprotocol.io" target="_blank">MCP</a> (JSON-RPC over streamable HTTP)</td></tr>
           <tr><td class="c1">🏦 Bank API</td><td class="role">Resource Server. Executes the banking operation; records the sub/act delegation chain for audit.</td>
               <td>REST/HTTP · consumes the delegated token</td></tr>
-          <tr><td class="c1">⚖️ AuthZEN adapter</td><td class="role">PDP proxy (Go) — and an <b>enricher</b>, not just a translator. Alongside mapping AuthZEN→Ping Authorize it resolves what the embedded PDP cannot compute itself: the mDL proofing-directory lookup (<code>identity_proofing_present</code>) and the RFC 9396 consent-coverage booleans (<code>rar_amount_ok</code>, <code>rar_creditor_ok</code>). Ping Authorize also ships an AuthZEN servlet that speaks the same API, but it does none of this enrichment, so it cannot replace this hop.</td>
+          <tr><td class="c1">⚖️ AuthZEN endpoint</td><td class="role"><b>Retired the Go adapter from the staging wire path (8 Aug 2026).</b> The PEP now speaks the <a href="https://openid.github.io/authzen/" target="_blank">AuthZEN API</a> straight to Ping Authorize's in-process AuthZEN servlet. The enrichment the Go adapter used to pre-compute — the mDL proofing lookup and the RFC 9396 consent-coverage check — moved <em>into the PDP</em>: <code>identity_proofing_present</code> and <code>consent_covered</code> are resolved by ProofingDirectory / ConsentDirectory PIP callouts, and the flat decision inputs (<code>amount</code>, <code>currency</code>, <code>onBehalfOf</code>, <code>to_account</code>…) derive from the raw AuthZEN subject/action/resource/context by json-path. The Go adapter stays deployed as rollback (and still fronts production's Kong path).</td>
               <td><a href="https://openid.github.io/authzen/" target="_blank">AuthZEN Authorization API</a></td></tr>
-          <tr><td class="c1">🧠 Ping Authorize</td><td class="role">Policy Decision Point. Evaluates policy and returns PERMIT/DENY (+ step-up advice). Cannot compare two attributes to each other or call out to the proofing directory — hence the adapter's precomputed booleans.</td>
+          <tr><td class="c1">🧠 Ping Authorize</td><td class="role">Policy Decision Point. Evaluates policy and returns PERMIT/DENY (+ step-up / identity-proofing advice) — and resolves its own decision inputs: REST PIP callouts to the proofing and consent directories, plus json-path attribute resolvers over the AuthZEN request. No proxy pre-computes its booleans any more, so bypassing a PEP can no longer bypass a step-up.</td>
               <td>PingAuthorize JSON PDP API (<code>/governance-engine</code>)</td></tr>
         </tbody>
       </table>
@@ -912,7 +912,7 @@ const GN = {
   pmcp:      {x:520, y:300, ic:'🧰', t:'Payments MCP',    s:'make_payment'},
   ppep2:     {x:520, y:404, ic:'🛡️', t:'Payments PEP #2', s:'__GATEWAY__ · API edge'},
   papi:      {x:520, y:520, ic:'💸', t:'Payments API',    s:'debits accounts (direct)'},
-  adapter:   {x:188, y:486, ic:'🔌', t:'AuthZEN adapter',  s:'ext_authz → AuthZEN (in PAZ)'},
+  adapter:   {x:188, y:486, ic:'🔌', t:'AuthZEN endpoint', s:'ext_authz → AuthZEN (in PAZ)'},
   pdp:       {x:30,  y:562, ic:'⚖️', t:'Ping Authorize',  s:'policy decision point'},
   eventsink: {x:186, y:562, ic:'📮', t:'Event sink',      s:'flattened token · aud=events'},
 };
@@ -985,8 +985,8 @@ const GMETA = {
               cfg:'owns make_payment · holds no account state · debits the accounts system-of-record directly (the payment was already authorized at the payments gateway)',
               sdks:['<code>fastapi</code> + <code>uvicorn</code>', '<code>httpx</code> — calls the Accounts API /transfers'],
               links:[HUB_PY, ['source · demo/payments-api', REPO+'/payments-api']]},
-  adapter:   {sw:'AuthZEN adapter — ext_authz → PingAuthorize',
-              cfg:'translates the AuthZEN Authorization API → PingAuthorize governance-engine · maps subject/action/resource/context · fails closed if the PDP is unreachable. ALSO enriches: resolves identity_proofing_present from the proofing directory (mDL gate) and precomputes rar_amount_ok / rar_creditor_ok, because the embedded PDP can neither call out nor compare two attributes. PingAuthorize ships its own AuthZEN servlet, but it is a plain translator with none of this enrichment — bypassing this hop silently drops every step-up input.'},
+  adapter:   {sw:'AuthZEN endpoint — ext_authz → PingAuthorize',
+              cfg:'translates the AuthZEN Authorization API → PingAuthorize governance-engine · maps subject/action/resource/context · fails closed if the PDP is unreachable. Since 8 Aug 2026 this is PingAuthorize’s own in-process AuthZEN servlet: the PDP resolves its own inputs (ProofingDirectory and ConsentDirectory PIP callouts, json-path derivation of the flat attributes from the AuthZEN request), so no proxy pre-computes decision inputs and bypassing a hop cannot drop a step-up. The old Go authzen-adapter remains deployed, out of the path, as rollback.'},
   pdp:       {sw:'PingAuthorize 11.0.0.2 (Symphonic)', img:'pingidentity/pingauthorize:11.0.0.2-latest',
               cfg:'Policy Decision Point · Trust Framework policy · make_payment: ≤ AUD 500 permit · > AUD 500 to 2,000 requires step-up (banking:payments:transfer, RFC 9470) · > 2,000 deny · governs BOTH token issuance (RAR) and the gateway calls (AuthZEN)',
               links:[['Docker Hub · pingauthorize','https://hub.docker.com/r/pingidentity/pingauthorize'], ['policy repo · idp-paz-simplifid-policy','https://github.com/dphhyland/idp-paz-simplifid-policy']]},
@@ -995,7 +995,7 @@ const GMETA = {
               sdks:['<code>fastapi</code> + <code>uvicorn</code>', 'validates the flattened at+jwt (aud/sub/no-act)'],
               links:[['source · demo/event-sink', REPO+'/event-sink'], ['flatten deep-dive','/static/docs-act-flatten.html']]},
 };
-// Gateway-dependent image + links for the two PEPs and the AuthZEN adapter node.
+// Gateway-dependent image + links for the two PEPs and the AuthZEN endpoint node.
 const GW_META = {
   Kong: {
     pep:     {img:'kong:3.7', links:[['Docker Hub · kong','https://hub.docker.com/_/kong']]},
@@ -1004,11 +1004,11 @@ const GW_META = {
   },
   agentgateway: {
     pep:     {img:'ghcr.io/agentgateway/agentgateway:v1.3.1', links:[['agentgateway (GitHub)','https://github.com/agentgateway/agentgateway']]},
-    adapter: {sw:'Go coaz-pep (Envoy ext_authz) → Go authzen-adapter (PDP proxy + enricher)',
-              img:'golang:1.26-alpine → alpine:3.20',
-              cfg:'coaz-pep speaks AuthZEN to the Go authzen-adapter, which enriches the request (mDL proofing lookup, RAR coverage booleans) before calling PingAuthorize’s governance-engine. PingAuthorize also hosts an AuthZEN servlet on /access/v1/evaluation — installed and working, but a plain translator, so it is deliberately NOT in the enforcement path: routing ext_authz straight at it drops identity_proofing_present and rar_*_ok, and every step-up rule silently stops firing.',
+    adapter: {sw:'Go coaz-pep (Envoy ext_authz) → PingAuthorize AuthZEN servlet (in-process with the PDP)',
+              img:'golang:1.26-alpine → pingauthorize:11.1',
+              cfg:'coaz-pep speaks AuthZEN directly to PingAuthorize’s AuthZEN servlet on /access/v1/evaluation — the Go authzen-adapter was retired from this path on 8 Aug 2026. Its enrichment moved into the PDP: identity_proofing_present and consent_covered resolve via ProofingDirectory/ConsentDirectory PIP callouts, and the flat decision inputs derive from the AuthZEN subject/action/resource/context by json-path (the rar_*_ok booleans were removed from policy outright). The adapter remains deployed, out of the wire path, as one-env-var rollback.',
               links:[['source · demo/coaz-pep', REPO+'/coaz-pep'],
-                     ['source · authzen-adapter', 'https://github.com/ID-Partners/idp-paz-authzen-adapter/tree/main/authzen-adapter'],
+                     ['source · authzen servlet', 'https://github.com/dphhyland/idp-authzen-paz-servlet'],
                      AUTHZEN_SPEC]},
   },
 };
@@ -1103,7 +1103,7 @@ function stackOf(s){
 
 // ---- gateway toggle (Kong ⇄ agentgateway; same architecture, either PEP) ----
 // The deployed default is injected server-side; the toggle is a presentation aid showing the
-// architecture is gateway-agnostic — the AuthZEN adapter + Ping Authorize are identical either way.
+// architecture is gateway-agnostic — the AuthZEN endpoint + Ping Authorize are identical either way.
 let gateway = "__GATEWAY__";
 function applyGateway(g){
   gateway = g;
@@ -1375,7 +1375,7 @@ function render(steps) {
           json:{ headers:{ Authorization: p.authorization || 'DPoP <token>', DPoP: p.dpop_proof || '<proof>' },
                  body:{ jsonrpc:'2.0', id:0, method:'initialize',
                         params:{ protocolVersion:'2025-11-25', capabilities:{}, clientInfo:{ name:'bank-agent', version:'1' } } } } },
-        { label:'2 · AuthZEN evaluation @ PEP #1', desc:gateway+' → AuthZEN adapter asks Ping Authorize: may this agent open an MCP session?',
+        { label:'2 · AuthZEN evaluation @ PEP #1', desc:gateway+' → AuthZEN endpoint asks Ping Authorize: may this agent open an MCP session?',
           http:'POST /access/v1/evaluation', json: authzenRequest('access_mcp','mcp-service','northwind-bank') },
         { label:'3 · PDP decision', desc:'the session opened, so Ping Authorize returned PERMIT for access_mcp',
           json:{ decision:true } },
@@ -1383,7 +1383,7 @@ function render(steps) {
       out.appendChild(el('step connect',
         `<div class="label">③ Gateway connect · PEP #1 (MCP edge)${s.agent_label ? ' · ' + esc(s.agent_label) : ''}</div>${esc(s.detail)}
          ${presentedChip(p)}
-         <div class="explain">${gateway} authenticated the real DPoP-bound token and (via the AuthZEN adapter) asked the PDP to permit MCP access before the session opened.</div>${wire}`));
+         <div class="explain">${gateway} authenticated the real DPoP-bound token and (via the AuthZEN endpoint) asked the PDP to permit MCP access before the session opened.</div>${wire}`));
     } else if (s.type === 'connect_error') {
       { const d = stackOf(s); setNode(d+'pep1','deny','deny'); } setNode('pdp','deny','DENY');
       out.appendChild(el('step tool_result',
@@ -1402,7 +1402,7 @@ function render(steps) {
           http:`POST ${url}`,
           json:{ headers:{ Authorization: p.authorization || 'DPoP <token>', DPoP: p.dpop_proof || '<proof>' },
                  body:{ jsonrpc:'2.0', id:1, method:'tools/call', params:{ name:s.name, arguments:s.input } } } },
-        { label:'2 · AuthZEN evaluation @ PEP #2', desc:gateway+' maps the Bank API call to an AuthZEN request (via the adapter) for the PDP',
+        { label:'2 · AuthZEN evaluation @ PEP #2', desc:gateway+' maps the Bank API call to an AuthZEN request for the PDP',
           http:'POST /access/v1/evaluation', json: toolToAuthzen(s.name, s.input) },
       ]);
       out.appendChild(el('step tool_call',
@@ -1498,7 +1498,7 @@ function render(steps) {
       else if (allowed === false) { badge = `<span class="decision deny">✘ DENY</span>${pep}`; setNode(_d+'pep2','deny','deny'); setNode('pdp','deny','DENY'); }
       const reason = s.policy_reason ? `<div class="reason">Policy reason: ${esc(s.policy_reason)}</div>` : '';
       const wire = (allowed === true || allowed === false) ? wireDetails('wire detail — PDP decision', [
-        { label:'AuthZEN decision response', desc:'from Ping Authorize via the AuthZEN adapter; '+gateway+' enforces it',
+        { label:'AuthZEN decision response', desc:'from Ping Authorize via the AuthZEN endpoint; '+gateway+' enforces it',
           json:{ decision: allowed, context:{ reason: s.policy_reason || (allowed ? 'Permitted by policy.' : 'Denied by policy.') } } },
         { label:'Gateway headers', desc:'surfaced by '+gateway+' on the proxied response',
           json:{ 'X-PDP-PEP': s.pep || '', 'X-PDP-Decision': allowed ? 'PERMIT' : 'DENY', 'X-PDP-Action': s.pep_action || '' } },
