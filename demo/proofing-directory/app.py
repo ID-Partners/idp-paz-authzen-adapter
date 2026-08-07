@@ -705,6 +705,35 @@ def admin_reset():
 
 
 # ---------------------------------------------------------------------------
+# mDL origination-gate switch. Moved here from the Go authzen-adapter's
+# /admin/proofing-gate when the adapter was retired from the wire path
+# (2026-08-08): the PDP reads this via a ProofingGate REST PIP, and the
+# Northwind BFF's demo toggle writes it. Gate state is DATA — the decision
+# that uses it lives in the PingAuthorize policy, not here. In-memory on
+# purpose: it is a demo control-plane switch, and the PDP's attribute
+# defaults to enforcing when this service is unreachable (fail closed).
+# ---------------------------------------------------------------------------
+_gate_enabled = False
+
+
+class GateBody(BaseModel):
+    enabled: bool = False
+
+
+@app.get("/gate")
+def gate_get():
+    return {"enabled": _gate_enabled}
+
+
+@app.post("/gate")
+def gate_set(body: GateBody):
+    global _gate_enabled
+    _gate_enabled = bool(body.enabled)
+    logger.info("mDL origination gate set to %s", _gate_enabled)
+    return {"enabled": _gate_enabled}
+
+
+# ---------------------------------------------------------------------------
 # SCIM 2.0 Users — the bank's identities (alice, bob), persisted in Postgres.
 # The iOS approver's identity switcher and the BFF's enrolment flow read/write
 # these records: userName/displayName plus a bank extension carrying the PingOne

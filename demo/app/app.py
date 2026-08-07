@@ -175,31 +175,35 @@ AUTHZEN_ADAPTER_URL = os.environ.get(
 
 @app.get("/proofing/gate")
 async def proofing_gate_get():
-    """Read the mDL identity-proofing gate switch state (proxies the adapter)."""
+    """Read the mDL origination-gate switch (proxies the proofing directory).
+
+    Moved off the Go authzen-adapter's /admin/proofing-gate on 2026-08-08 when the
+    adapter left the wire path: the switch now lives in the proofing directory, the
+    PDP reads it via a ProofingGate REST PIP, and this proxy only serves the UI."""
     try:
         async with httpx.AsyncClient(timeout=8.0) as c:
-            r = await c.get(f"{AUTHZEN_ADAPTER_URL}/admin/proofing-gate")
+            r = await c.get(f"{PROOFING_DIRECTORY_URL}/gate")
             return r.json()
     except Exception as e:
         return JSONResponse(status_code=502,
-                            content={"error": "adapter_unreachable", "detail": str(e)})
+                            content={"error": "directory_unreachable", "detail": str(e)})
 
 
 @app.post("/proofing/gate")
 async def proofing_gate_set(request: Request):
-    """Flip the mDL identity-proofing gate on/off (proxies the adapter). Demo control plane."""
+    """Flip the mDL origination gate on/off (proxies the proofing directory)."""
     try:
         body = await request.json()
     except Exception:
         body = {}
     try:
         async with httpx.AsyncClient(timeout=8.0) as c:
-            r = await c.post(f"{AUTHZEN_ADAPTER_URL}/admin/proofing-gate",
+            r = await c.post(f"{PROOFING_DIRECTORY_URL}/gate",
                              json={"enabled": bool(body.get("enabled"))})
             return r.json()
     except Exception as e:
         return JSONResponse(status_code=502,
-                            content={"error": "adapter_unreachable", "detail": str(e)})
+                            content={"error": "directory_unreachable", "detail": str(e)})
 
 
 @app.post("/proofing/start")
