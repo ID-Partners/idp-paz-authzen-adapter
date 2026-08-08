@@ -1,6 +1,0 @@
-<urn:UserKeyToAccessTokenMapping contextId="urn:ietf:params:oauth:grant-type:token-exchange|signupTE" tokenManagerId="recognizeUserAuthATM">
-        <urn1:AttributeMap Name="sub" Type="Processor Policy" xmlns:urn1="urn:sourceid.org:saml2:metadata-extension:v2">
-            <urn1:ValueText>tepp.subject</urn1:ValueText>
-        </urn1:AttributeMap>
-        <urn1:TokenAuthorizationIssuanceCriteria xmlns:urn1="urn:sourceid.org:saml2:metadata-extension:v2"/>
-    </urn:UserKeyToAccessTokenMapping>

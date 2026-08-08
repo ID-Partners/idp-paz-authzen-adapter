@@ -1,2 +1,0 @@
-<con:item name="recognizeUserAuthATM">525856</con:item>
-<con:item name="recognizeUserAuthATM">com.pingidentity.pf.access.token.management.plugins.JwtBearerAccessTokenManagementPlugin</con:item>
