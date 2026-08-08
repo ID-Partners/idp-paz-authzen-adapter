@@ -3482,27 +3482,56 @@ def _pdp_publish(event: dict) -> None:
             pass
 
 
-@app.on_event("startup")
-async def _register_ssf_stream():
-    """Registers this app as the PDP's one SSF Receiver (SSF 1.0 section 8.1.1). Without
-    SSF_SHARED_SECRET the PDP's SSF surface does not exist at all, so there is nothing to
-    register against — the sidebar simply stays empty rather than erroring."""
-    if not SSF_SHARED_SECRET:
-        logger.info("SSF_SHARED_SECRET not set; the PDP-decisions sidebar will stay empty")
-        return
+SSF_KEEPALIVE_SECONDS = int(os.environ.get("SSF_KEEPALIVE_SECONDS", "30"))
+
+
+async def _ssf_keepalive_loop():
+    """Keeps this app registered as the PDP's one SSF Receiver (SSF 1.0 section 8.1.1).
+
+    The Transmitter's stream registry is IN-MEMORY and single-stream by design — its own
+    contract is "restarts drop it; the Receiver simply re-registers". A one-shot startup
+    registration therefore dies the first time PingAuthorize redeploys after this app
+    (observed 2026-08-08: stream registered 23:03, PAZ restarted 23:08, sidebar silent).
+    So: every SSF_KEEPALIVE_SECONDS, GET /ssf/stream?stream_id=<ours>; on anything but a
+    200 (fresh PAZ, wiped registry, first run), POST a new registration. Registration
+    REPLACES the Transmitter's single stream, so re-registering is idempotent — no
+    duplicate streams, no duplicate events."""
+    stream_id: str | None = None
     body = {
         "aud": SSF_RECEIVER_URL,
         "events_requested": [SSF_EVENT_TYPE],
         "delivery": {"method": "urn:ietf:rfc:8935", "endpoint_url": SSF_RECEIVER_URL},
     }
-    try:
-        async with httpx.AsyncClient(timeout=8) as c:
-            r = await c.post(PDP_URL + "/ssf/stream", json=body,
-                             headers={"Authorization": f"Bearer {PDP_API_KEY}"})
-            r.raise_for_status()
-            logger.info("SSF stream registered: stream_id=%s", r.json().get("stream_id"))
-    except Exception as exc:  # noqa: BLE001 - the sidebar is informational, never fatal to boot
-        logger.warning("SSF stream registration failed (sidebar will stay empty): %s", exc)
+    headers = {"Authorization": f"Bearer {PDP_API_KEY}"}
+    while True:
+        try:
+            async with httpx.AsyncClient(timeout=8) as c:
+                alive = False
+                if stream_id:
+                    r = await c.get(PDP_URL + "/ssf/stream",
+                                    params={"stream_id": stream_id}, headers=headers)
+                    alive = r.status_code == 200
+                if not alive:
+                    r = await c.post(PDP_URL + "/ssf/stream", json=body, headers=headers)
+                    r.raise_for_status()
+                    stream_id = r.json().get("stream_id")
+                    logger.info("SSF stream registered: stream_id=%s", stream_id)
+        except Exception as exc:  # noqa: BLE001 - the sidebar is informational; retry next tick
+            logger.warning("SSF keepalive failed (will retry in %ss): %s",
+                           SSF_KEEPALIVE_SECONDS, exc)
+            stream_id = None
+        await asyncio.sleep(SSF_KEEPALIVE_SECONDS)
+
+
+@app.on_event("startup")
+async def _register_ssf_stream():
+    """Starts the SSF Receiver keepalive. Without SSF_SHARED_SECRET the PDP's SSF surface
+    does not exist at all, so there is nothing to register against — the sidebar simply
+    stays empty rather than erroring."""
+    if not SSF_SHARED_SECRET:
+        logger.info("SSF_SHARED_SECRET not set; the PDP-decisions sidebar will stay empty")
+        return
+    asyncio.get_running_loop().create_task(_ssf_keepalive_loop())
 
 
 @app.post("/ssf/receiver")
