@@ -1,4 +1,0 @@
-# Extra dependency for deploying to AWS Bedrock AgentCore Runtime
-# (used by agentcore_entrypoint.py, not needed for the Railway/HTTP host).
--r requirements.txt
-bedrock-agentcore>=0.1.0
